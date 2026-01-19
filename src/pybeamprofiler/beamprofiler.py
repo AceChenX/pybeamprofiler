@@ -1114,7 +1114,7 @@ if __name__ == "__main__":
             traceback.print_exc()
     finally:
         # Ensure camera is properly closed
-        if hasattr(bp, "_camera") and bp.camera:
+        if hasattr(bp, "camera") and bp.camera:
             try:
                 if bp.camera.is_acquiring:
                     bp.camera.stop_acquisition()
