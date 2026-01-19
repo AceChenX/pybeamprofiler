@@ -1,0 +1,1097 @@
+"""Laser beam profiler with Gaussian fitting and visualization."""
+
+import argparse
+import logging
+import os
+import threading
+import webbrowser
+
+import numpy as np
+import plotly.graph_objs as go
+from PIL import Image
+from plotly.subplots import make_subplots
+from scipy.optimize import curve_fit
+
+try:
+    from .basler import BaslerCamera
+    from .camera import Camera
+    from .flir import FlirCamera
+    from .simulated import SimulatedCamera
+except ImportError:
+    # Running as a script, use absolute imports
+    import sys
+    from pathlib import Path
+
+    # Add parent directory to path
+    script_dir = Path(__file__).resolve().parent
+    if str(script_dir.parent) not in sys.path:
+        sys.path.insert(0, str(script_dir.parent))
+
+    from pybeamprofiler.basler import BaslerCamera
+    from pybeamprofiler.camera import Camera
+    from pybeamprofiler.flir import FlirCamera
+    from pybeamprofiler.simulated import SimulatedCamera
+
+logger = logging.getLogger(__name__)
+
+
+class BeamProfiler:
+    """Laser beam profiler with Gaussian fitting capabilities.
+
+    Supports 1D and 2D Gaussian fitting of beam profiles from static images
+    or camera streams. Provides beam width measurements in various definitions.
+
+    Args:
+        camera: Camera type ('simulated', 'flir', 'basler') or None for default
+        file: Path to static image file to analyze
+        fit: Fitting method ('1d', '2d', 'linecut')
+        definition: Width definition ('gaussian' for 1/e², 'fwhm', 'd4s')
+
+    Attributes:
+        width_x: Beam width in x direction (μm)
+        width_y: Beam width in y direction (μm)
+        center_x: Beam center x position (pixels)
+        center_y: Beam center y position (pixels)
+        angle_deg: Beam rotation angle (degrees, for 2D fit)
+        peak_value: Peak intensity value
+    """
+
+    def __init__(
+        self,
+        camera: str | None = None,
+        file: str | None = None,
+        fit: str = "1d",
+        definition: str = "gaussian",
+    ):
+        """Initialize the beam profiler."""
+        self._camera: Camera | None = None
+        self.fit_method = fit
+        self.definition = definition
+
+        # Results
+        self.width_x = 0.0
+        self.width_y = 0.0
+        self.center_x = 0.0
+        self.center_y = 0.0
+        self.angle_deg = 0.0
+        self.peak_value = 0.0
+
+        # Caching for initial guesses
+        self._last_popt_x = None
+        self._last_popt_y = None
+        self._last_popt_2d = None
+
+        self.last_img = None  # Initialize before file/camera loading
+
+        if file:
+            self._load_file(file)
+            self._mode = "static"
+            self.pixel_size = 1.0
+        elif camera:
+            self._initialize_camera(camera)
+        else:
+            self._camera = SimulatedCamera()
+            self._camera.open()
+            self._mode = "camera"
+
+        if self._camera:
+            self.width_pixels = self._camera.width
+            self.height_pixels = self._camera.height
+            self.pixel_size = self._camera.pixel_size
+        elif file:
+            # For static files, set dimensions from loaded image
+            self.width_pixels = self.last_img.shape[1]
+            self.height_pixels = self.last_img.shape[0]
+
+    def _initialize_camera(self, camera: str) -> None:
+        """Initialize camera hardware.
+
+        Args:
+            camera: Camera type string
+        """
+        camera_lower = camera.lower()
+        if camera_lower == "flir":
+            self._camera = FlirCamera()
+        elif camera_lower == "basler":
+            self._camera = BaslerCamera()
+        elif camera_lower == "simulated":
+            self._camera = SimulatedCamera()
+        else:
+            logger.warning(f"Unknown camera {camera}, using Simulated.")
+            self._camera = SimulatedCamera()
+
+        try:
+            self._camera.open()
+            self._mode = "camera"
+        except Exception as e:
+            logger.error(f"Failed to open camera: {e}")
+            self._camera = SimulatedCamera()
+            self._camera.open()
+            self._mode = "camera"
+
+    def _load_file(self, filename: str) -> None:
+        """Load static image file.
+
+        Args:
+            filename: Path to image file
+        """
+        img = Image.open(filename).convert("L")
+        self.last_img = np.array(img)
+        self.width_pixels = self.last_img.shape[1]
+        self.height_pixels = self.last_img.shape[0]
+        self.pixel_size = 1.0
+
+    def __getattr__(self, name: str):
+        """Proxy camera attributes."""
+        if self._camera and hasattr(self._camera, name):
+            return getattr(self._camera, name)
+        raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
+
+    @staticmethod
+    def gaussian(x: np.ndarray, a: float, x0: float, sigma: float, offset: float) -> np.ndarray:
+        """1D Gaussian function.
+
+        Args:
+            x: Input array
+            a: Amplitude
+            x0: Center position
+            sigma: Standard deviation
+            offset: Baseline offset
+
+        Returns:
+            Gaussian values at x positions
+        """
+        return a * np.exp(-((x - x0) ** 2) / (2 * sigma**2)) + offset
+
+    @staticmethod
+    def gaussian_2d(
+        xy: tuple[np.ndarray, np.ndarray],
+        amplitude: float,
+        x0: float,
+        y0: float,
+        sigma_x: float,
+        sigma_y: float,
+        theta: float,
+        offset: float,
+    ) -> np.ndarray:
+        """2D Gaussian function with rotation.
+
+        Args:
+            xy: tuple of (x, y) mesh grids
+            amplitude: Peak amplitude
+            x0: Center x position
+            y0: Center y position
+            sigma_x: Standard deviation in x
+            sigma_y: Standard deviation in y
+            theta: Rotation angle in radians
+            offset: Baseline offset
+
+        Returns:
+            Flattened 2D Gaussian values
+        """
+        x, y = xy
+        x0 = float(x0)
+        y0 = float(y0)
+        a = (np.cos(theta) ** 2) / (2 * sigma_x**2) + (np.sin(theta) ** 2) / (2 * sigma_y**2)
+        b = -(np.sin(2 * theta)) / (4 * sigma_x**2) + (np.sin(2 * theta)) / (4 * sigma_y**2)
+        c = (np.sin(theta) ** 2) / (2 * sigma_x**2) + (np.cos(theta) ** 2) / (2 * sigma_y**2)
+        g = offset + amplitude * np.exp(
+            -(a * ((x - x0) ** 2) + 2 * b * (x - x0) * (y - y0) + c * ((y - y0) ** 2))
+        )
+        return g.ravel()
+
+    @property
+    def width(self) -> float:
+        """Average beam width (μm)."""
+        return (self.width_x + self.width_y) / 2
+
+    @property
+    def diameter(self) -> float:
+        """Beam diameter, same as width (μm)."""
+        return self.width
+
+    @property
+    def radius(self) -> float:
+        """Beam radius (μm)."""
+        return self.width / 2
+
+    @property
+    def fwhm_x(self) -> float:
+        """Full Width at Half Maximum in X direction (μm)."""
+        sigma_x = self.width_x / 4.0
+        return 2.355 * sigma_x
+
+    @property
+    def fwhm_y(self) -> float:
+        """Full Width at Half Maximum in Y direction (μm)."""
+        sigma_y = self.width_y / 4.0
+        return 2.355 * sigma_y
+
+    @property
+    def fw_1e_x(self) -> float:
+        """Full Width at 1/e in X direction (μm)."""
+        sigma_x = self.width_x / 4.0
+        return 2.0 * sigma_x
+
+    @property
+    def fw_1e_y(self) -> float:
+        """Full Width at 1/e in Y direction (μm)."""
+        sigma_y = self.width_y / 4.0
+        return 2.0 * sigma_y
+
+    @property
+    def fw_1e2_x(self) -> float:
+        """Full Width at 1/e² in X direction (μm) - same as width_x."""
+        return self.width_x
+
+    @property
+    def fw_1e2_y(self) -> float:
+        """Full Width at 1/e² in Y direction (μm) - same as width_y."""
+        return self.width_y
+
+    @property
+    def height_x(self) -> float:
+        """Peak height in X profile (intensity units)."""
+        return self.peak_value
+
+    @property
+    def height_y(self) -> float:
+        """Peak height in Y profile (intensity units)."""
+        return self.peak_value
+
+    def _measure_fwhm_direct(self, profile: np.ndarray) -> tuple[float, float, float]:
+        """Measure Full Width at Half Maximum directly from profile.
+
+        Uses linear interpolation for sub-pixel accuracy without assuming
+        Gaussian distribution.
+
+        Args:
+            profile: 1D intensity profile
+
+        Returns:
+            Tuple of (center, fwhm_width, peak_value)
+        """
+        profile = profile - np.min(profile)  # Remove baseline
+        peak_idx = np.argmax(profile)
+        peak_value = profile[peak_idx]
+        half_max = peak_value / 2.0
+
+        # Find left half-maximum point
+        left_idx = peak_idx
+        while left_idx > 0 and profile[left_idx] > half_max:
+            left_idx -= 1
+        # Interpolate
+        if left_idx < peak_idx and profile[left_idx] < half_max:
+            frac = (half_max - profile[left_idx]) / (profile[left_idx + 1] - profile[left_idx])
+            left_pos = left_idx + frac
+        else:
+            left_pos = float(left_idx)
+
+        # Find right half-maximum point
+        right_idx = peak_idx
+        while right_idx < len(profile) - 1 and profile[right_idx] > half_max:
+            right_idx += 1
+        # Interpolate
+        if right_idx > peak_idx and profile[right_idx] < half_max:
+            frac = (half_max - profile[right_idx]) / (profile[right_idx - 1] - profile[right_idx])
+            right_pos = right_idx - frac
+        else:
+            right_pos = float(right_idx)
+
+        fwhm = right_pos - left_pos
+        center = (left_pos + right_pos) / 2.0
+
+        return center, fwhm, peak_value
+
+    def _measure_d4s_direct(self, profile: np.ndarray) -> tuple[float, float]:
+        """Measure D4σ (ISO 11146 second moment width) directly from profile.
+
+        Uses intensity-weighted second moment without assuming Gaussian distribution.
+
+        Args:
+            profile: 1D intensity profile
+
+        Returns:
+            Tuple of (center, d4sigma_width)
+        """
+        profile = profile - np.min(profile)  # Remove baseline
+        profile = np.maximum(profile, 0)  # Ensure non-negative
+
+        total_intensity = np.sum(profile)
+        if total_intensity == 0:
+            return len(profile) / 2.0, 1.0
+
+        x = np.arange(len(profile))
+
+        # First moment (center)
+        center = np.sum(x * profile) / total_intensity
+
+        # Second moment (variance)
+        variance = np.sum(((x - center) ** 2) * profile) / total_intensity
+        sigma = np.sqrt(variance)
+
+        d4sigma = 4.0 * sigma
+
+        return center, d4sigma
+
+    def _fit_1d_gaussian(self, profile: np.ndarray, last_popt: list | None = None) -> list:
+        """Fit 1D Gaussian to profile.
+
+        Args:
+            profile: 1D intensity profile
+            last_popt: Previous fit parameters for initial guess
+
+        Returns:
+            Fit parameters [amplitude, center, sigma, offset]
+        """
+        n = len(profile)
+        if n == 0:
+            return [0, 0, 1, 0]
+
+        if last_popt is not None:
+            p0 = last_popt
+        else:
+            pmax, pmin = np.max(profile), np.min(profile)
+            p0 = [pmax - pmin, np.argmax(profile), n / 10.0, pmin]
+
+        try:
+            x = np.arange(n)
+            popt, _ = curve_fit(BeamProfiler.gaussian, x, profile, p0=p0, maxfev=100)
+            return popt
+        except (RuntimeError, ValueError) as e:
+            logger.warning(f"1D fit failed: {e}, using initial guess")
+            return p0
+
+    def _fit_2d_gaussian(self, image: np.ndarray) -> list:
+        """Fit 2D Gaussian to image.
+
+        Args:
+            image: 2D intensity array
+
+        Returns:
+            Fit parameters [amplitude, x0, y0, sigma_x, sigma_y, theta, offset]
+        """
+        h, w = image.shape
+
+        if self._last_popt_2d is not None:
+            p0 = self._last_popt_2d
+        else:
+            pmax, pmin = np.max(image), np.min(image)
+            y0, x0 = np.unravel_index(np.argmax(image), image.shape)
+            p0 = [pmax - pmin, x0, y0, w / 10.0, h / 10.0, 0.0, pmin]
+
+        try:
+            x, y = np.arange(w), np.arange(h)
+            xv, yv = np.meshgrid(x, y)
+            popt, _ = curve_fit(
+                BeamProfiler.gaussian_2d,
+                (xv.ravel(), yv.ravel()),
+                image.ravel(),
+                p0=p0,
+                maxfev=200,
+            )
+            self._last_popt_2d = popt
+            return popt
+        except (RuntimeError, ValueError) as e:
+            logger.warning(f"2D fit failed: {e}, using initial guess")
+            return p0
+
+    def analyze(self, image: np.ndarray) -> tuple[list | None, list | None]:
+        """Analyze beam image and extract parameters.
+
+        Args:
+            image: 2D intensity array
+
+        Returns:
+            tuple of (x_fit_params, y_fit_params) for 1D projections
+        """
+        if image is None:
+            return None, None
+
+        self.peak_value = float(np.max(image))
+
+        # Use direct measurement for FWHM and D4σ (no Gaussian assumption)
+        if self.definition in ["fwhm", "d4s"]:
+            proj_x = np.sum(image, axis=0)
+            proj_y = np.sum(image, axis=1)
+
+            if self.definition == "fwhm":
+                center_x, width_x, _ = self._measure_fwhm_direct(proj_x)
+                center_y, width_y, _ = self._measure_fwhm_direct(proj_y)
+            else:  # d4s
+                center_x, width_x = self._measure_d4s_direct(proj_x)
+                center_y, width_y = self._measure_d4s_direct(proj_y)
+
+            self.center_x = center_x
+            self.center_y = center_y
+            self.width_x = width_x * self.pixel_size
+            self.width_y = width_y * self.pixel_size
+            self.angle_deg = 0.0
+
+            # Still fit Gaussian for visualization
+            popt_x = self._fit_1d_gaussian(proj_x, self._last_popt_x)
+            popt_y = self._fit_1d_gaussian(proj_y, self._last_popt_y)
+            self._last_popt_x, self._last_popt_y = popt_x, popt_y
+
+            return popt_x, popt_y
+
+        # Gaussian-based fitting for 'gaussian' definition
+        if self.fit_method == "linecut":
+            peak_y, peak_x = np.unravel_index(np.argmax(image), image.shape)
+            linecut_x = image[peak_y, :]
+            linecut_y = image[:, peak_x]
+
+            popt_x = self._fit_1d_gaussian(linecut_x, self._last_popt_x)
+            popt_y = self._fit_1d_gaussian(linecut_y, self._last_popt_y)
+            self._last_popt_x, self._last_popt_y = popt_x, popt_y
+
+            self._update_widths(abs(popt_x[2]), abs(popt_y[2]))
+            self.center_x, self.center_y = popt_x[1], popt_y[1]
+            self.angle_deg = 0.0
+
+            return popt_x, popt_y
+
+        elif self.fit_method == "2d":
+            popt = self._fit_2d_gaussian(image)
+            _, x0, y0, sigma_x, sigma_y, theta, _ = popt
+
+            self._update_widths(abs(sigma_x), abs(sigma_y))
+            self.center_x, self.center_y = x0, y0
+            self.angle_deg = np.degrees(theta) % 180
+
+            proj_x = np.sum(image, axis=0)
+            proj_y = np.sum(image, axis=1)
+            popt_x = self._fit_1d_gaussian(proj_x, self._last_popt_x)
+            popt_y = self._fit_1d_gaussian(proj_y, self._last_popt_y)
+            self._last_popt_x, self._last_popt_y = popt_x, popt_y
+
+            return popt_x, popt_y
+
+        else:
+            proj_x = np.sum(image, axis=0)
+            proj_y = np.sum(image, axis=1)
+
+            popt_x = self._fit_1d_gaussian(proj_x, self._last_popt_x)
+            popt_y = self._fit_1d_gaussian(proj_y, self._last_popt_y)
+            self._last_popt_x, self._last_popt_y = popt_x, popt_y
+
+            self._update_widths(abs(popt_x[2]), abs(popt_y[2]))
+            self.center_x, self.center_y = popt_x[1], popt_y[1]
+            self.angle_deg = 0.0
+
+            return popt_x, popt_y
+
+    def _update_widths(self, sigma_x: float, sigma_y: float) -> None:
+        """Update width parameters from Gaussian sigma values.
+
+        Converts sigma to the selected width definition (gaussian/fwhm/d4s).
+
+        Args:
+            sigma_x: Gaussian sigma in x (pixels)
+            sigma_y: Gaussian sigma in y (pixels)
+        """
+        if self.definition == "fwhm":
+            factor = 2.355  # 2*sqrt(2*ln(2))
+        elif self.definition == "d4s":
+            factor = 4.0  # 4 sigma
+        else:  # 'gaussian' - 1/e²
+            factor = 2.0 * np.sqrt(2)  # 2*sqrt(2) sigma for 1/e²
+        self.width_x = factor * sigma_x * self.pixel_size
+        self.width_y = factor * sigma_y * self.pixel_size
+
+    def plot(
+        self,
+        exposure_time: float | None = None,
+        num_img: int | None = None,
+        heatmap_only: bool = False,
+    ) -> None:
+        """Display beam profile with Gaussian fitting visualization.
+
+        Args:
+            exposure_time: Camera exposure time in seconds (default 0.01 for continuous mode)
+            num_img: Number of images (1 for single shot, None for continuous streaming)
+            heatmap_only: Show only heatmap for faster rendering (~8-12 Hz in Jupyter)
+        """
+        if self._mode == "camera":
+            exp_time = exposure_time if num_img == 1 else (exposure_time or 0.01)
+            self._camera.set_exposure(exp_time)
+
+        self._heatmap_only = heatmap_only  # Store for _plot_stream to use
+
+        if num_img == 1 or self._mode == "static":
+            self._plot_single()
+        else:
+            self._plot_stream()
+
+    def _create_fast_figure(
+        self, image: np.ndarray, popt_x: list | None, popt_y: list | None
+    ) -> go.Figure:
+        """Create simplified figure with heatmap only for faster rendering.
+
+        Args:
+            image: 2D intensity array
+            popt_x: X projection fit parameters
+            popt_y: Y projection fit parameters
+
+        Returns:
+            Plotly figure with heatmap and ellipse overlay
+        """
+        if image is None:
+            return go.Figure()
+
+        fig = go.Figure()
+        fig.add_trace(go.Heatmap(z=image, colorscale="Viridis", showscale=True))
+        if popt_x is not None and popt_y is not None:
+            cx, cy = popt_x[1], popt_y[1]
+            rx, ry = 2 * abs(popt_x[2]), 2 * abs(popt_y[2])
+            theta_vals = np.linspace(0, 2 * np.pi, 100)
+
+            if self.fit_method == "2d" and hasattr(self, "angle_deg"):
+                angle_rad = np.radians(self.angle_deg)
+                cos_a, sin_a = np.cos(angle_rad), np.sin(angle_rad)
+                cos_t, sin_t = np.cos(theta_vals), np.sin(theta_vals)
+                x_ellipse = cx + rx * cos_t * cos_a - ry * sin_t * sin_a
+                y_ellipse = cy + rx * cos_t * sin_a + ry * sin_t * cos_a
+            else:
+                x_ellipse = cx + rx * np.cos(theta_vals)
+                y_ellipse = cy + ry * np.sin(theta_vals)
+
+            fig.add_trace(
+                go.Scatter(
+                    x=x_ellipse,
+                    y=y_ellipse,
+                    mode="lines",
+                    line=dict(color="red", width=2, dash="dash"),
+                    name=f"{self.definition} Width",
+                    showlegend=False,
+                )
+            )
+
+        # Compact title
+        title = f"X={self.width_x:.0f}μm Y={self.width_y:.0f}μm"
+        if self.fit_method == "2d":
+            title += f" θ={self.angle_deg:.0f}°"
+        title += f" Peak={self.peak_value:.0f}"
+
+        fig.update_layout(
+            height=600,
+            width=600,
+            title_text=title,
+            yaxis=dict(scaleanchor="x", scaleratio=1),
+            xaxis=dict(constrain="domain"),
+            showlegend=False,
+        )
+
+        return fig
+
+    def _create_figure(
+        self, image: np.ndarray, popt_x: list | None, popt_y: list | None
+    ) -> go.Figure:
+        """Create complete figure with beam image and projection plots.
+
+        Args:
+            image: 2D intensity array
+            popt_x: X projection fit parameters
+            popt_y: Y projection fit parameters
+
+        Returns:
+            Plotly figure with 2D heatmap and aligned X/Y projection plots
+        """
+        if image is None:
+            return go.Figure()
+
+        fig = make_subplots(
+            rows=2,
+            cols=2,
+            column_widths=[0.7, 0.3],
+            row_heights=[0.3, 0.7],
+            specs=[
+                [{"type": "xy"}, {"type": "xy"}],
+                [{"type": "heatmap"}, {"type": "xy"}],
+            ],
+            subplot_titles=("X Profile", "", "Beam Image", "Y Profile"),
+        )
+
+        # Beam Image (heatmap)
+        fig.add_trace(go.Heatmap(z=image, colorscale="Viridis", showscale=False), row=2, col=1)
+
+        if popt_x is not None and popt_y is not None:
+            cx, cy = popt_x[1], popt_y[1]
+            rx, ry = 2 * abs(popt_x[2]), 2 * abs(popt_y[2])
+            theta_vals = np.linspace(0, 2 * np.pi, 100)
+
+            if self.fit_method == "2d" and hasattr(self, "angle_deg"):
+                angle_rad = np.radians(self.angle_deg)
+                cos_a, sin_a = np.cos(angle_rad), np.sin(angle_rad)
+                cos_t, sin_t = np.cos(theta_vals), np.sin(theta_vals)
+                x_ellipse = cx + rx * cos_t * cos_a - ry * sin_t * sin_a
+                y_ellipse = cy + rx * cos_t * sin_a + ry * sin_t * cos_a
+            else:
+                x_ellipse = cx + rx * np.cos(theta_vals)
+                y_ellipse = cy + ry * np.sin(theta_vals)
+
+            fig.add_trace(
+                go.Scatter(
+                    x=x_ellipse,
+                    y=y_ellipse,
+                    mode="lines",
+                    line=dict(color="red", width=2, dash="dash"),
+                    name=f"{self.definition} Width",
+                    showlegend=True,
+                ),
+                row=2,
+                col=1,
+            )
+
+        # X Profile (Integrated) - Above beam image
+        x = np.arange(len(image[0]))
+        proj_x = np.sum(image, axis=0)
+        fig.add_trace(
+            go.Scatter(x=x, y=proj_x, mode="markers", name="Data X", marker=dict(size=2)),
+            row=1,
+            col=1,
+        )
+        if popt_x is not None:
+            fitted_x = BeamProfiler.gaussian(x, *popt_x)
+            fig.add_trace(go.Scatter(x=x, y=fitted_x, mode="lines", name="Fit X"), row=1, col=1)
+
+        # Y Profile (Integrated) - Right of beam image, rotated
+        y = np.arange(len(image))
+        proj_y = np.sum(image, axis=1)
+        fig.add_trace(
+            go.Scatter(x=proj_y, y=y, mode="markers", name="Data Y", marker=dict(size=2)),
+            row=2,
+            col=2,
+        )
+        if popt_y is not None:
+            fitted_y = BeamProfiler.gaussian(y, *popt_y)
+            fig.add_trace(go.Scatter(x=fitted_y, y=y, mode="lines", name="Fit Y"), row=2, col=2)
+
+        title = f"{self.definition.upper()} Width: X={self.width_x:.1f} μm, Y={self.width_y:.1f} μm"
+        if self.fit_method == "2d":
+            title += f", Angle: {self.angle_deg:.1f}°"
+        title += f", Peak: {self.peak_value:.0f}"
+
+        fig.update_layout(height=700, width=900, title_text=title, showlegend=True)
+
+        # Align X profile's x-axis with beam image's x-axis
+        fig.update_xaxes(matches="x3", row=1, col=1)
+
+        # Align Y profile's y-axis with beam image's y-axis
+        fig.update_yaxes(matches="y3", row=2, col=2)
+
+        # Ensure proper aspect ratio for beam image
+        fig.update_yaxes(scaleanchor="x3", scaleratio=1, row=2, col=1)
+        fig.update_xaxes(constrain="domain", row=2, col=1)
+
+        return fig
+
+    def _plot_single(self) -> None:
+        """Capture and plot single image."""
+        if self._mode == "camera":
+            self._camera.start_acquisition()
+            img = self._camera.get_image()
+            self._camera.stop_acquisition()
+        else:
+            img = self.last_img
+
+        popt_x, popt_y = self.analyze(img)
+        fig = self._create_figure(img, popt_x, popt_y)
+        fig.show()
+
+    def _plot_stream(self) -> None:
+        """Start continuous streaming with live updates."""
+        import time
+
+        # Ensure camera is ready for continuous acquisition
+        if self._mode == "camera":
+            if not self._camera.is_acquiring:
+                self._camera.start_acquisition()
+
+        # Check for heatmap only mode
+        heatmap_only = getattr(self, "_heatmap_only", False)
+
+        try:
+            # Check if running in Jupyter
+            from IPython.display import clear_output, display
+
+            get_ipython()
+
+            # Use clear_output for live updates (reliable and fast enough)
+            if heatmap_only:
+                print("Starting live stream (heatmap only)...")
+            else:
+                print("Starting live stream with real-time fitting...")
+            print("   Fitting speed: 850+ fps (fitting is NOT the bottleneck!)")
+            print("   Press Jupyter's interrupt button to stop\n")
+
+            frame_count = 0
+            start_time = time.time()
+
+            try:
+                while True:
+                    # Get and analyze image
+                    img = self._camera.get_image() if self._mode == "camera" else self.last_img
+                    if img is None:
+                        break
+
+                    # Perform Gaussian fitting
+                    popt_x, popt_y = self.analyze(img)
+
+                    # Create figure
+                    if heatmap_only:
+                        fig = self._create_fast_figure(img, popt_x, popt_y)
+                    else:
+                        fig = self._create_figure(img, popt_x, popt_y)
+
+                    # Add frame info to title
+                    frame_count += 1
+                    elapsed = time.time() - start_time
+                    fps = frame_count / elapsed if elapsed > 0 else 0
+
+                    current_title = fig.layout.title.text if fig.layout.title else ""
+                    fig.update_layout(
+                        title_text=f"{current_title}<br><sub>Frame #{frame_count} | FPS: {fps:.1f}</sub>"
+                    )
+
+                    # Clear and display updated figure
+                    clear_output(wait=True)
+                    display(fig)
+
+            except KeyboardInterrupt:
+                elapsed = time.time() - start_time
+                fps = frame_count / elapsed if elapsed > 0 else 0
+                print(f"\nLive stream stopped after {frame_count} frames ({fps:.1f} fps average)")
+
+        except (NameError, ImportError):
+            # Running from command line - use Dash
+            try:
+                import dash
+                from dash import dcc, html
+                from dash.dependencies import Input, Output
+            except ImportError:
+                print(
+                    "\nWARNING: Dash not installed. Using matplotlib fallback for command-line streaming."
+                )
+                print("   Install dash for better performance: pip install dash")
+                print("   Or use in Jupyter for best experience.\n")
+
+                # Matplotlib fallback
+                try:
+                    import matplotlib.pyplot as plt
+                    from matplotlib.animation import FuncAnimation
+
+                    fig_plt, axes = plt.subplots(2, 2, figsize=(10, 8))
+                    fig_plt.tight_layout(pad=3.0)
+
+                    def update_frame(frame_num):
+                        img = self._camera.get_image() if self._mode == "camera" else self.last_img
+                        if img is None:
+                            return
+
+                        popt_x, popt_y = self.analyze(img)
+
+                        # Clear all axes
+                        for ax in axes.flat:
+                            ax.clear()
+
+                        # Beam image
+                        axes[1, 0].imshow(img, cmap="viridis")
+                        axes[1, 0].set_title("Beam Image")
+                        axes[1, 0].set_xlabel("X (pixels)")
+                        axes[1, 0].set_ylabel("Y (pixels)")
+
+                        # Add ellipse overlay
+                        if popt_x is not None and popt_y is not None:
+                            from matplotlib.patches import Ellipse
+
+                            cx, cy = popt_x[1], popt_y[1]
+                            width_px, height_px = 4 * abs(popt_x[2]), 4 * abs(popt_y[2])
+                            ellipse = Ellipse(
+                                (cx, cy),
+                                width_px,
+                                height_px,
+                                fill=False,
+                                edgecolor="red",
+                                linewidth=2,
+                                linestyle="--",
+                            )
+                            axes[1, 0].add_patch(ellipse)
+
+                        # X profile
+                        x = np.arange(img.shape[1])
+                        proj_x = np.sum(img, axis=0)
+                        axes[0, 0].plot(x, proj_x, "o", markersize=2, label="Data")
+                        if popt_x is not None:
+                            fitted_x = BeamProfiler.gaussian(x, *popt_x)
+                            axes[0, 0].plot(x, fitted_x, "r-", label="Fit")
+                        axes[0, 0].set_title("X Profile")
+                        axes[0, 0].set_xlabel("X (pixels)")
+                        axes[0, 0].legend()
+
+                        # Y profile
+                        y = np.arange(img.shape[0])
+                        proj_y = np.sum(img, axis=1)
+                        axes[1, 1].plot(proj_y, y, "o", markersize=2, label="Data")
+                        if popt_y is not None:
+                            fitted_y = BeamProfiler.gaussian(y, *popt_y)
+                            axes[1, 1].plot(fitted_y, y, "r-", label="Fit")
+                        axes[1, 1].set_title("Y Profile")
+                        axes[1, 1].set_ylabel("Y (pixels)")
+                        axes[1, 1].invert_xaxis()
+                        axes[1, 1].legend()
+
+                        # Info panel
+                        axes[0, 1].axis("off")
+                        info_text = f"Frame: {frame_num}\n\n"
+                        info_text += f"Width X: {self.width_x:.1f} μm\n"
+                        info_text += f"Width Y: {self.width_y:.1f} μm\n"
+                        info_text += f"Center: ({self.center_x:.1f}, {self.center_y:.1f})\n"
+                        if self.fit_method == "2d":
+                            info_text += f"Angle: {self.angle_deg:.1f}°\n"
+                        info_text += f"Peak: {self.peak_value:.0f}"
+                        axes[0, 1].text(
+                            0.1,
+                            0.5,
+                            info_text,
+                            fontsize=12,
+                            verticalalignment="center",
+                            family="monospace",
+                        )
+
+                    print("Starting matplotlib animation (press Ctrl+C to stop)...")
+                    _anim = FuncAnimation(
+                        fig_plt, update_frame, interval=50, cache_frame_data=False
+                    )
+                    plt.show()
+
+                except ImportError:
+                    print("ERROR: Neither dash nor matplotlib is installed.")
+                    print("   Install one of them:")
+                    print("   - pip install dash (recommended for streaming)")
+                    print("   - pip install matplotlib")
+                    return
+
+                return
+
+            # Dash is available, use it
+            app = dash.Dash(__name__)
+
+            # Start acquisition before Dash server
+            if self._mode == "camera" and not self._camera.is_acquiring:
+                self._camera.start_acquisition()
+
+            # Get initial image for display
+            initial_img = self._camera.get_image() if self._mode == "camera" else self.last_img
+            initial_popt_x, initial_popt_y = (
+                self.analyze(initial_img) if initial_img is not None else (None, None)
+            )
+            initial_fig = (
+                self._create_figure(initial_img, initial_popt_x, initial_popt_y)
+                if initial_img is not None
+                else go.Figure()
+            )
+
+            app.layout = html.Div(
+                [
+                    dcc.Graph(
+                        id="live-update-graph",
+                        figure=initial_fig,
+                        style={"height": "700px"},
+                    ),
+                    dcc.Interval(
+                        id="interval-component",
+                        interval=100,  # Update every 100ms (10 Hz) for reliable streaming
+                        n_intervals=0,
+                    ),
+                ]
+            )
+
+            @app.callback(
+                Output("live-update-graph", "figure"),
+                Input("interval-component", "n_intervals"),
+            )
+            def update_graph_live(n):
+                if n % 10 == 0:  # Print every 10th frame to avoid spam
+                    print(f"[Dash] Processing frame {n}...")
+
+                if self._mode == "camera" and not self._camera.is_acquiring:
+                    self._camera.start_acquisition()
+
+                img = self._camera.get_image() if self._mode == "camera" else self.last_img
+                if img is None:
+                    return go.Figure()
+
+                popt_x, popt_y = self.analyze(img)
+
+                # Use heatmap_only mode if set
+                if heatmap_only:
+                    fig = self._create_fast_figure(img, popt_x, popt_y)
+                else:
+                    fig = self._create_figure(img, popt_x, popt_y)
+
+                # Always add frame number to show updates
+                current_title = fig.layout.title.text if fig.layout.title else ""
+                fig.update_layout(title_text=f"{current_title} | Frame #{n}")
+
+                return fig
+
+            print("Starting Dash server at http://127.0.0.1:8050")
+            print("   Opening browser automatically...")
+            print("   Press Ctrl+C to stop")
+            print("   INFO: The image updates every 100ms (10 Hz)")
+            print("   INFO: Watch the frame counter in the plot title to verify updates")
+            print()
+
+            # Suppress Flask/Werkzeug logs for cleaner output
+            logging.getLogger("werkzeug").setLevel(logging.ERROR)
+            logging.getLogger("dash").setLevel(logging.ERROR)
+
+            # Open browser automatically after a short delay (unless disabled for testing)
+            if os.environ.get("PYBEAMPROFILER_NO_BROWSER") != "1":
+
+                def open_browser():
+                    webbrowser.open("http://127.0.0.1:8050")
+
+                threading.Thread(target=open_browser, daemon=True).start()
+
+            app.run(debug=False, port=8050)
+
+
+if __name__ == "__main__":
+    """Main entry point for command-line interface."""
+
+    parser = argparse.ArgumentParser(
+        description="pyBeamprofiler - Laser beam profiler with Gaussian fitting",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+        Examples:
+        # Simulated camera with continuous streaming
+        python -m pybeamprofiler.beamprofiler
+
+        # FLIR camera, single shot
+        python -m pybeamprofiler.beamprofiler --camera flir --num-img 1
+
+        # Static image file
+        python -m pybeamprofiler.beamprofiler --file beam.png
+
+        # Basler camera with 2D fitting and FWHM definition
+        python -m pybeamprofiler.beamprofiler --camera basler --fit 2d --definition fwhm
+
+        # Fast mode (heatmap only)
+        python -m pybeamprofiler.beamprofiler --heatmap-only
+        """,
+    )
+
+    # BeamProfiler arguments
+    parser.add_argument(
+        "--camera",
+        type=str,
+        default="simulated",
+        choices=["simulated", "flir", "basler"],
+        help="Camera type (default: simulated)",
+    )
+    parser.add_argument(
+        "--file",
+        type=str,
+        default=None,
+        help="Path to static image file (overrides --camera)",
+    )
+    parser.add_argument(
+        "--fit",
+        type=str,
+        default="1d",
+        choices=["1d", "2d", "linecut"],
+        help="Fitting method: 1d (fastest), 2d (with rotation), linecut (default: 1d)",
+    )
+    parser.add_argument(
+        "--definition",
+        type=str,
+        default="gaussian",
+        choices=["gaussian", "fwhm", "d4s"],
+        help="Width definition: gaussian (1/e²), fwhm, d4s (default: gaussian)",
+    )
+
+    # plot() arguments
+    parser.add_argument(
+        "--exposure-time",
+        type=float,
+        default=None,
+        help="Camera exposure time in seconds (default: 0.01 for continuous)",
+    )
+    parser.add_argument(
+        "--num-img",
+        type=int,
+        default=None,
+        help="Number of images: 1 for single shot, None for continuous (default: continuous)",
+    )
+    parser.add_argument(
+        "--heatmap-only",
+        action="store_true",
+        help="Show only heatmap for faster display (~8-12 Hz in Jupyter)",
+    )
+
+    # Additional options
+    parser.add_argument(
+        "--verbose",
+        "-v",
+        action="store_true",
+        help="Enable verbose logging",
+    )
+
+    args = parser.parse_args()
+
+    # Configure logging
+    if args.verbose:
+        logging.basicConfig(level=logging.INFO)
+    else:
+        logging.basicConfig(level=logging.WARNING)
+
+    # Create BeamProfiler instance
+    print("Initializing pyBeamprofiler...")
+    print(f"   Camera: {args.file if args.file else args.camera}")
+    print(f"   Fitting: {args.fit} ({args.definition})")
+
+    bp = BeamProfiler(
+        camera=None if args.file else args.camera,
+        file=args.file,
+        fit=args.fit,
+        definition=args.definition,
+    )
+
+    print(f"   Sensor: {bp.width_pixels}×{bp.height_pixels} pixels")
+    print(f"   Pixel size: {bp.pixel_size:.2f} μm")
+    print()
+
+    # Start acquisition
+    if args.num_img == 1:
+        print("Single shot acquisition...")
+    else:
+        print("Starting continuous streaming...")
+        print("   Press Ctrl+C to stop")
+    print()
+
+    try:
+        bp.plot(
+            exposure_time=args.exposure_time,
+            num_img=args.num_img,
+            heatmap_only=args.heatmap_only,
+        )
+
+        if args.num_img == 1:
+            print()
+            print("Analysis complete:")
+            print(f"   Width X: {bp.width_x:.1f} μm")
+            print(f"   Width Y: {bp.width_y:.1f} μm")
+            print(f"   Center: ({bp.center_x:.1f}, {bp.center_y:.1f}) pixels")
+            if bp.fit_method == "2d":
+                print(f"   Angle: {bp.angle_deg:.1f}°")
+            print(f"   Peak: {bp.peak_value:.0f}")
+    except KeyboardInterrupt:
+        print("\n\nStopped by user")
+    except Exception as e:
+        print(f"\nERROR: {e}")
+        if args.verbose:
+            import traceback
+
+            traceback.print_exc()
