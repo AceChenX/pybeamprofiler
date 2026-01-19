@@ -969,7 +969,7 @@ class BeamProfiler:
 
             print("Starting Dash server at http://127.0.0.1:8050")
             print("Opening browser automatically...")
-            print("Press Ctrl+C to stop\\n")
+            print("Press Ctrl+C to stop\n")
 
             # Suppress Flask/Werkzeug logs for cleaner output
             logging.getLogger("werkzeug").setLevel(logging.ERROR)
