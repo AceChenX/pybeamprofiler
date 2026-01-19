@@ -220,6 +220,6 @@ class TestPrintCameraInfo:
 
         # Check that both cameras are printed
         calls = [str(call) for call in mock_print.call_args_list]
-        assert any("Found 2 camera" in str(call) for call in calls)
+        assert any("Found 2 cameras" in str(call) for call in calls)
         assert any("FLIR" in str(call) for call in calls)
         assert any("Basler" in str(call) for call in calls)
