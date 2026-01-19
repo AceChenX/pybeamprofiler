@@ -5,14 +5,23 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "pybeamprofiler"
 version = "0.0.1"
-description = "Laser beam profiler using GenICam cameras"
+description = "Real-time laser beam profiler with Gaussian fitting for GenICam cameras"
 readme = "README.md"
 authors = [
   { name = "C.-A. Chen", email = "acechen@cirx.org" },
 ]
 license = { file = "LICENSE" }
+keywords = ["laser", "beam-profiling", "gaussian-fitting", "genicam", "flir", "basler", "camera"]
 classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Physics",
+    "Topic :: Scientific/Engineering :: Image Processing",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
     "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
 ]

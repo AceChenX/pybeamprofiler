@@ -43,7 +43,7 @@ class BaslerCamera(HarvesterCamera):
     def _find_basler_cti() -> str | None:
         """Search for Basler Pylon CTI file in platform-specific paths.
 
-        Prefers USB3 interface over GigE.
+        Prefers GigE interface over USB3 (more common in lab settings).
 
         Returns:
             Path to CTI file if found, None otherwise
@@ -56,21 +56,21 @@ class BaslerCamera(HarvesterCamera):
                 base = rf"C:\Program Files\Basler\pylon {version}\Runtime\x64"
                 search_paths.extend(
                     [
-                        os.path.join(base, "ProducerU3V.cti"),
                         os.path.join(base, "ProducerGEV.cti"),
+                        os.path.join(base, "ProducerU3V.cti"),
                     ]
                 )
         elif system == "Linux":
             search_paths = [
-                "/opt/pylon/lib64/gentlproducer/gtl/ProducerU3V.cti",
                 "/opt/pylon/lib64/gentlproducer/gtl/ProducerGEV.cti",
-                "/opt/pylon5/lib64/gentlproducer/gtl/ProducerU3V.cti",
+                "/opt/pylon/lib64/gentlproducer/gtl/ProducerU3V.cti",
                 "/opt/pylon5/lib64/gentlproducer/gtl/ProducerGEV.cti",
+                "/opt/pylon5/lib64/gentlproducer/gtl/ProducerU3V.cti",
             ]
         elif system == "Darwin":
             search_paths = [
-                "/Library/Frameworks/pylon.framework/Libraries/ProducerU3V.cti",
-                "/Library/Frameworks/pylon.framework/Libraries/ProducerGEV.cti",
+                "/Library/Frameworks/pylon.framework/Libraries/gentlproducer/gtl/ProducerGEV.cti",
+                "/Library/Frameworks/pylon.framework/Libraries/gentlproducer/gtl/ProducerU3V.cti",
             ]
 
         for path in search_paths:

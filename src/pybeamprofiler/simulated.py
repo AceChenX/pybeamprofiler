@@ -36,6 +36,12 @@ class SimulatedCamera(Camera):
         self._amplitude = 250
         self._background = 10
 
+        # Add exposure/gain ranges for compatibility
+        self._exposure_min = 0.001  # 1 ms
+        self._exposure_max = 1.0  # 1 s
+        self._gain_min = 0.0
+        self._gain_max = 24.0
+
     def open(self):
         logger.info("Simulated camera opened.")
 
@@ -66,8 +72,10 @@ class SimulatedCamera(Camera):
         cy = self._center_y + np.random.normal(0, 3)
         sx = self._sigma_x + np.random.normal(0, 2)
         sy = self._sigma_y + np.random.normal(0, 2)
-        amp = self._amplitude + np.random.normal(0, 5)
-        bg = self._background + np.random.normal(0, 1)
+        # Ensure amplitude stays positive
+        amp = max(1.0, self._amplitude + np.random.normal(0, 5))
+        # Ensure background stays positive
+        bg = max(0.0, self._background + np.random.normal(0, 1))
         noise = np.random.normal(0, 2, (self.height, self.width))
 
         x = np.arange(0, self.width)
@@ -92,3 +100,21 @@ class SimulatedCamera(Camera):
         """Set gain and adjust simulated signal amplitude."""
         self.gain = gain
         self._amplitude = 250 * (1 + gain / 10)
+
+    @property
+    def exposure_range(self) -> tuple[float, float]:
+        """Get exposure time range in seconds.
+
+        Returns:
+            Tuple of (min_exposure, max_exposure) in seconds
+        """
+        return (self._exposure_min, self._exposure_max)
+
+    @property
+    def gain_range(self) -> tuple[float, float]:
+        """Get gain range.
+
+        Returns:
+            Tuple of (min_gain, max_gain)
+        """
+        return (self._gain_min, self._gain_max)

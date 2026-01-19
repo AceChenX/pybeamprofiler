@@ -171,3 +171,115 @@ class TestBeamProfilerDimensions:
         assert bp.width_pixels == 500
         assert bp.height_pixels == 500
         assert bp.pixel_size == 1.0
+
+
+class TestBeamProfilerVisualization:
+    """Test visualization methods."""
+
+    def test_create_fast_figure_1d(self):
+        """Test fast figure creation with 1D fitting."""
+        bp = BeamProfiler(camera="simulated", fit="1d")
+
+        bp._camera.start_acquisition()
+        img = bp._camera.get_image()
+        bp._camera.stop_acquisition()
+
+        popt_x, popt_y = bp.analyze(img)
+        fig = bp._create_fast_figure(img, popt_x, popt_y)
+
+        assert fig is not None
+        assert len(fig.data) > 0
+        bp._camera.close()
+
+    def test_create_fast_figure_2d(self):
+        """Test fast figure creation with 2D fitting."""
+        bp = BeamProfiler(camera="simulated", fit="2d")
+
+        bp._camera.start_acquisition()
+        img = bp._camera.get_image()
+        bp._camera.stop_acquisition()
+
+        popt_x, popt_y = bp.analyze(img)
+        fig = bp._create_fast_figure(img, popt_x, popt_y)
+
+        assert fig is not None
+        assert len(fig.data) > 0
+        bp._camera.close()
+
+    def test_create_fast_figure_none_params(self):
+        """Test fast figure creation with None parameters."""
+        bp = BeamProfiler(camera="simulated")
+
+        bp._camera.start_acquisition()
+        img = bp._camera.get_image()
+        bp._camera.stop_acquisition()
+
+        fig = bp._create_fast_figure(img, None, None)
+
+        assert fig is not None
+        assert len(fig.data) > 0
+        bp._camera.close()
+
+    def test_create_fast_figure_none_image(self):
+        """Test fast figure creation with None image."""
+        bp = BeamProfiler(camera="simulated")
+        fig = bp._create_fast_figure(None, None, None)
+
+        assert fig is not None
+        assert len(fig.data) == 0
+        bp._camera.close()
+
+
+class TestBeamProfilerMethods:
+    """Test various BeamProfiler methods."""
+
+    def test_analyze_with_different_definitions(self):
+        """Test analyze with different width definitions."""
+        bp = BeamProfiler(camera="simulated")
+
+        bp._camera.start_acquisition()
+        img = bp._camera.get_image()
+        bp._camera.stop_acquisition()
+
+        for definition in ["gaussian", "fwhm", "d4s"]:
+            bp.definition = definition
+            popt_x, popt_y = bp.analyze(img)
+            assert popt_x is not None
+            assert popt_y is not None
+            assert bp.width_x > 0
+            assert bp.width_y > 0
+
+        bp._camera.close()
+
+    def test_analyze_with_different_fit_methods(self):
+        """Test analyze with different fitting methods."""
+        bp = BeamProfiler(camera="simulated")
+
+        bp._camera.start_acquisition()
+        img = bp._camera.get_image()
+        bp._camera.stop_acquisition()
+
+        for method in ["1d", "2d", "linecut"]:
+            bp.fit_method = method
+            popt_x, popt_y = bp.analyze(img)
+            assert popt_x is not None
+            assert popt_y is not None
+
+        bp._camera.close()
+
+    def test_getattr_proxy(self):
+        """Test attribute proxying to camera."""
+        bp = BeamProfiler(camera="simulated")
+
+        # Test that camera attributes are accessible
+        assert hasattr(bp, "exposure_time")
+        assert hasattr(bp, "gain")
+
+        # Test that non-existent attributes raise AttributeError
+        try:
+            _ = bp.nonexistent_attribute
+            assert False, "Should have raised AttributeError"
+        except AttributeError:
+            pass
+
+        bp._camera.close()
