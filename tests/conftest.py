@@ -35,7 +35,7 @@ def beam_profiler():
 
     bp = BeamProfiler(camera="simulated")
     yield bp
-    bp._camera.close()
+    bp.camera.close()
 
 
 @pytest.fixture

@@ -85,16 +85,16 @@ class TestCameraIntegration:
     def test_camera_type_selection(self):
         """Test camera type string parsing."""
         bp = BeamProfiler(camera="simulated")
-        assert bp._camera is not None
-        assert isinstance(bp._camera, SimulatedCamera)
-        bp._camera.close()
+        assert bp.camera is not None
+        assert isinstance(bp.camera, SimulatedCamera)
+        bp.camera.close()
 
     def test_invalid_camera_fallback(self):
         """Test fallback to simulated for invalid camera type."""
         bp = BeamProfiler(camera="invalid_type")
-        assert bp._camera is not None
-        assert isinstance(bp._camera, SimulatedCamera)
-        bp._camera.close()
+        assert bp.camera is not None
+        assert isinstance(bp.camera, SimulatedCamera)
+        bp.camera.close()
 
     def test_camera_delegation(self):
         """Test that camera methods are accessible via BeamProfiler."""
@@ -105,9 +105,9 @@ class TestCameraIntegration:
         assert hasattr(bp, "set_gain")
 
         bp.set_exposure(0.05)
-        assert bp._camera.exposure_time == 0.05
+        assert bp.camera.exposure_time == 0.05
 
-        bp._camera.close()
+        bp.camera.close()
 
     def test_camera_hardware_imports(self):
         """Test that hardware camera classes can be imported."""

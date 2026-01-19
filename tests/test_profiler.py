@@ -10,9 +10,9 @@ class TestBeamProfilerProperties:
         """Test basic width and diameter properties."""
         bp = beam_profiler
 
-        bp._camera.start_acquisition()
-        img = bp._camera.get_image()
-        bp._camera.stop_acquisition()
+        bp.camera.start_acquisition()
+        img = bp.camera.get_image()
+        bp.camera.stop_acquisition()
 
         bp.analyze(img)
 
@@ -27,9 +27,9 @@ class TestBeamProfilerProperties:
         """Test LaseView-compatible width properties."""
         bp = beam_profiler
 
-        bp._camera.start_acquisition()
-        img = bp._camera.get_image()
-        bp._camera.stop_acquisition()
+        bp.camera.start_acquisition()
+        img = bp.camera.get_image()
+        bp.camera.stop_acquisition()
 
         bp.analyze(img)
 
@@ -46,9 +46,9 @@ class TestBeamProfilerProperties:
         """Test relationships between width properties."""
         bp = beam_profiler
 
-        bp._camera.start_acquisition()
-        img = bp._camera.get_image()
-        bp._camera.stop_acquisition()
+        bp.camera.start_acquisition()
+        img = bp.camera.get_image()
+        bp.camera.stop_acquisition()
 
         bp.analyze(img)
 
@@ -91,14 +91,14 @@ class TestBeamProfilerInitialization:
         bp = BeamProfiler()
         assert bp.fit_method == "1d"
         assert bp.definition == "gaussian"
-        assert bp._camera is not None
-        bp._camera.close()
+        assert bp.camera is not None
+        bp.camera.close()
 
     def test_initialization_with_camera(self):
         """Test initialization with camera type."""
         bp = BeamProfiler(camera="simulated")
-        assert bp._camera is not None
-        bp._camera.close()
+        assert bp.camera is not None
+        bp.camera.close()
 
     def test_initialization_with_file(self, test_image_file):
         """Test initialization with file."""
@@ -111,14 +111,14 @@ class TestBeamProfilerInitialization:
         for method in ["1d", "2d", "linecut"]:
             bp = BeamProfiler(camera="simulated", fit=method)
             assert bp.fit_method == method
-            bp._camera.close()
+            bp.camera.close()
 
     def test_initialization_with_definition(self):
         """Test initialization with definition."""
         for defn in ["gaussian", "fwhm", "d4s"]:
             bp = BeamProfiler(camera="simulated", definition=defn)
             assert bp.definition == defn
-            bp._camera.close()
+            bp.camera.close()
 
 
 class TestBeamProfilerExposure:
@@ -129,20 +129,20 @@ class TestBeamProfilerExposure:
         bp = BeamProfiler(camera="simulated")
 
         # This should not crash
-        bp._camera.start_acquisition()
-        img = bp._camera.get_image()
-        bp._camera.stop_acquisition()
+        bp.camera.start_acquisition()
+        img = bp.camera.get_image()
+        bp.camera.stop_acquisition()
         bp.analyze(img)
 
         assert bp.width > 0
-        bp._camera.close()
+        bp.camera.close()
 
     def test_none_exposure_continuous(self):
         """Test None exposure uses default."""
         bp = BeamProfiler(camera="simulated")
-        bp._camera.set_exposure(None)
-        assert bp._camera.exposure_time == 0.01
-        bp._camera.close()
+        bp.camera.set_exposure(None)
+        assert bp.camera.exposure_time == 0.01
+        bp.camera.close()
 
 
 class TestBeamProfilerDimensions:
@@ -153,16 +153,16 @@ class TestBeamProfilerDimensions:
         bp = BeamProfiler(camera="simulated")
 
         # Verify camera initialized properly
-        assert bp._camera is not None
-        assert bp._camera.width == 1024
-        assert bp._camera.height == 1024
+        assert bp.camera is not None
+        assert bp.camera.width == 1024
+        assert bp.camera.height == 1024
 
         # Check dimensions are propagated to BeamProfiler
         assert bp.width_pixels == 1024
         assert bp.height_pixels == 1024
         assert bp.pixel_size == 5.0
 
-        bp._camera.close()
+        bp.camera.close()
 
     def test_file_dimensions(self, test_image_file):
         """Test dimensions from loaded file."""
@@ -180,45 +180,45 @@ class TestBeamProfilerVisualization:
         """Test fast figure creation with 1D fitting."""
         bp = BeamProfiler(camera="simulated", fit="1d")
 
-        bp._camera.start_acquisition()
-        img = bp._camera.get_image()
-        bp._camera.stop_acquisition()
+        bp.camera.start_acquisition()
+        img = bp.camera.get_image()
+        bp.camera.stop_acquisition()
 
         popt_x, popt_y = bp.analyze(img)
         fig = bp._create_fast_figure(img, popt_x, popt_y)
 
         assert fig is not None
         assert len(fig.data) > 0
-        bp._camera.close()
+        bp.camera.close()
 
     def test_create_fast_figure_2d(self):
         """Test fast figure creation with 2D fitting."""
         bp = BeamProfiler(camera="simulated", fit="2d")
 
-        bp._camera.start_acquisition()
-        img = bp._camera.get_image()
-        bp._camera.stop_acquisition()
+        bp.camera.start_acquisition()
+        img = bp.camera.get_image()
+        bp.camera.stop_acquisition()
 
         popt_x, popt_y = bp.analyze(img)
         fig = bp._create_fast_figure(img, popt_x, popt_y)
 
         assert fig is not None
         assert len(fig.data) > 0
-        bp._camera.close()
+        bp.camera.close()
 
     def test_create_fast_figure_none_params(self):
         """Test fast figure creation with None parameters."""
         bp = BeamProfiler(camera="simulated")
 
-        bp._camera.start_acquisition()
-        img = bp._camera.get_image()
-        bp._camera.stop_acquisition()
+        bp.camera.start_acquisition()
+        img = bp.camera.get_image()
+        bp.camera.stop_acquisition()
 
         fig = bp._create_fast_figure(img, None, None)
 
         assert fig is not None
         assert len(fig.data) > 0
-        bp._camera.close()
+        bp.camera.close()
 
     def test_create_fast_figure_none_image(self):
         """Test fast figure creation with None image."""
@@ -227,7 +227,7 @@ class TestBeamProfilerVisualization:
 
         assert fig is not None
         assert len(fig.data) == 0
-        bp._camera.close()
+        bp.camera.close()
 
 
 class TestBeamProfilerMethods:
@@ -237,9 +237,9 @@ class TestBeamProfilerMethods:
         """Test analyze with different width definitions."""
         bp = BeamProfiler(camera="simulated")
 
-        bp._camera.start_acquisition()
-        img = bp._camera.get_image()
-        bp._camera.stop_acquisition()
+        bp.camera.start_acquisition()
+        img = bp.camera.get_image()
+        bp.camera.stop_acquisition()
 
         for definition in ["gaussian", "fwhm", "d4s"]:
             bp.definition = definition
@@ -249,15 +249,15 @@ class TestBeamProfilerMethods:
             assert bp.width_x > 0
             assert bp.width_y > 0
 
-        bp._camera.close()
+        bp.camera.close()
 
     def test_analyze_with_different_fit_methods(self):
         """Test analyze with different fitting methods."""
         bp = BeamProfiler(camera="simulated")
 
-        bp._camera.start_acquisition()
-        img = bp._camera.get_image()
-        bp._camera.stop_acquisition()
+        bp.camera.start_acquisition()
+        img = bp.camera.get_image()
+        bp.camera.stop_acquisition()
 
         for method in ["1d", "2d", "linecut"]:
             bp.fit_method = method
@@ -265,7 +265,7 @@ class TestBeamProfilerMethods:
             assert popt_x is not None
             assert popt_y is not None
 
-        bp._camera.close()
+        bp.camera.close()
 
     def test_getattr_proxy(self):
         """Test attribute proxying to camera."""
@@ -282,4 +282,4 @@ class TestBeamProfilerMethods:
         except AttributeError:
             pass
 
-        bp._camera.close()
+        bp.camera.close()

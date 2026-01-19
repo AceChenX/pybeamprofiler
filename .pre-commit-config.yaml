@@ -29,10 +29,3 @@ repos:
           --config,
           'lint.extend-fixable = ["F401","F841"]',  # fix unused imports and variables at commit (but not save)
         ]
-      - id: pyright
-        name: pyright
-        entry: env PYRIGHT_PYTHON_IGNORE_WARNINGS=1 pyright
-        language: system
-        types_or: [python, pyi]
-        require_serial: true
-        additional_dependencies: []

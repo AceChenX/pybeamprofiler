@@ -15,9 +15,9 @@ class TestGaussianDefinition:
         bp.fit_method = "1d"
         bp.definition = "gaussian"
 
-        bp._camera.start_acquisition()
-        img = bp._camera.get_image()
-        bp._camera.stop_acquisition()
+        bp.camera.start_acquisition()
+        img = bp.camera.get_image()
+        bp.camera.stop_acquisition()
 
         popt_x, popt_y = bp.analyze(img)
 
@@ -40,9 +40,9 @@ class TestFWHMDefinition:
         bp.fit_method = "1d"
         bp.definition = "fwhm"
 
-        bp._camera.start_acquisition()
-        img = bp._camera.get_image()
-        bp._camera.stop_acquisition()
+        bp.camera.start_acquisition()
+        img = bp.camera.get_image()
+        bp.camera.stop_acquisition()
 
         popt_x, popt_y = bp.analyze(img)
 
@@ -62,9 +62,9 @@ class TestD4SigmaDefinition:
         bp.fit_method = "1d"
         bp.definition = "d4s"
 
-        bp._camera.start_acquisition()
-        img = bp._camera.get_image()
-        bp._camera.stop_acquisition()
+        bp.camera.start_acquisition()
+        img = bp.camera.get_image()
+        bp.camera.stop_acquisition()
 
         bp.analyze(img)
 
@@ -89,9 +89,9 @@ class TestDefinitionComparisons:
         assert bp_d4s.width_x > bp_gaussian.width_x
         assert bp_gaussian.width_x > bp_fwhm.width_x
 
-        bp_gaussian._camera.close()
-        bp_fwhm._camera.close()
-        bp_d4s._camera.close()
+        bp_gaussian.camera.close()
+        bp_fwhm.camera.close()
+        bp_d4s.camera.close()
 
     def test_definition_ratios(self, simulated_image):
         """Test approximate ratios between definitions."""
@@ -107,17 +107,17 @@ class TestDefinitionComparisons:
         expected_ratio = 4.0 / (2 * np.sqrt(2))
         assert abs(ratio_d4s_gaussian - expected_ratio) < 0.2
 
-        bp_gaussian._camera.close()
-        bp_fwhm._camera.close()
-        bp_d4s._camera.close()
+        bp_gaussian.camera.close()
+        bp_fwhm.camera.close()
+        bp_d4s.camera.close()
 
     def test_definition_switching(self, beam_profiler):
         """Test switching definitions on the fly."""
         bp = beam_profiler
 
-        bp._camera.start_acquisition()
-        img = bp._camera.get_image()
-        bp._camera.stop_acquisition()
+        bp.camera.start_acquisition()
+        img = bp.camera.get_image()
+        bp.camera.stop_acquisition()
 
         bp.definition = "gaussian"
         bp.analyze(img)
@@ -145,16 +145,16 @@ class TestDefinitionsWithFittingMethods:
         """Test all definition/fit method combinations."""
         bp = BeamProfiler(camera="simulated", fit=fit_method, definition=definition)
 
-        bp._camera.start_acquisition()
-        img = bp._camera.get_image()
-        bp._camera.stop_acquisition()
+        bp.camera.start_acquisition()
+        img = bp.camera.get_image()
+        bp.camera.stop_acquisition()
 
         popt_x, popt_y = bp.analyze(img)
 
         assert bp.width_x > 0
         assert bp.width_y > 0
 
-        bp._camera.close()
+        bp.camera.close()
 
 
 class TestDefinitionEdgeCases:
@@ -170,7 +170,7 @@ class TestDefinitionEdgeCases:
         assert popt_x is not None
         assert popt_y is not None
 
-        bp._camera.close()
+        bp.camera.close()
 
 
 class TestWidthDefinitions:
@@ -179,9 +179,9 @@ class TestWidthDefinitions:
     def test_gaussian_definition(self):
         """Test default gaussian (1/e²) width definition."""
         bp = BeamProfiler(camera="simulated", fit="1d", definition="gaussian")
-        bp._camera.start_acquisition()
-        img = bp._camera.get_image()
-        bp._camera.stop_acquisition()
+        bp.camera.start_acquisition()
+        img = bp.camera.get_image()
+        bp.camera.stop_acquisition()
 
         popt_x, popt_y = bp.analyze(img)
 
@@ -196,14 +196,14 @@ class TestWidthDefinitions:
         expected_width_x = 2 * np.sqrt(2) * sigma_x * bp.pixel_size
         assert abs(bp.width_x - expected_width_x) < 0.1
 
-        bp._camera.close()
+        bp.camera.close()
 
     def test_fwhm_definition(self):
         """Test FWHM (Full Width at Half Maximum) definition."""
         bp = BeamProfiler(camera="simulated", fit="1d", definition="fwhm")
-        bp._camera.start_acquisition()
-        img = bp._camera.get_image()
-        bp._camera.stop_acquisition()
+        bp.camera.start_acquisition()
+        img = bp.camera.get_image()
+        bp.camera.stop_acquisition()
 
         popt_x, popt_y = bp.analyze(img)
 
@@ -230,9 +230,9 @@ class TestWidthDefinitions:
         bp_d4s = BeamProfiler(camera="simulated", fit="1d", definition="d4s")
 
         # Use same image for all
-        bp_gaussian._camera.start_acquisition()
-        img = bp_gaussian._camera.get_image()
-        bp_gaussian._camera.stop_acquisition()
+        bp_gaussian.camera.start_acquisition()
+        img = bp_gaussian.camera.get_image()
+        bp_gaussian.camera.stop_acquisition()
 
         bp_gaussian.analyze(img)
         bp_fwhm.analyze(img)
@@ -250,17 +250,17 @@ class TestWidthDefinitions:
         expected_ratio = 4.0 / 2.355  # ≈ 1.7
         assert abs(ratio_d4s_fwhm - expected_ratio) < 0.2
 
-        bp_gaussian._camera.close()
-        bp_fwhm._camera.close()
-        bp_d4s._camera.close()
+        bp_gaussian.camera.close()
+        bp_fwhm.camera.close()
+        bp_d4s.camera.close()
 
     def test_2d_fitting_with_definitions(self):
         """Test 2D fitting works with all width definitions."""
         for definition in ["gaussian", "fwhm", "d4s"]:
             bp = BeamProfiler(camera="simulated", fit="2d", definition=definition)
-            bp._camera.start_acquisition()
-            img = bp._camera.get_image()
-            bp._camera.stop_acquisition()
+            bp.camera.start_acquisition()
+            img = bp.camera.get_image()
+            bp.camera.stop_acquisition()
 
             popt_x, popt_y = bp.analyze(img)
 
@@ -268,7 +268,7 @@ class TestWidthDefinitions:
             assert bp.width_y > 0, f"Failed for definition={definition}"
             assert hasattr(bp, "angle_deg"), f"No angle for definition={definition}"
 
-            bp._camera.close()
+            bp.camera.close()
 
 
 class TestExposureHandling:
@@ -279,46 +279,46 @@ class TestExposureHandling:
         bp = BeamProfiler(camera="simulated")
 
         # Test exposure handling without calling plot()
-        bp._camera.set_exposure(None)
-        assert bp._camera.exposure_time == 0.01
+        bp.camera.set_exposure(None)
+        assert bp.camera.exposure_time == 0.01
 
         # Get and analyze an image
-        bp._camera.start_acquisition()
-        img = bp._camera.get_image()
-        bp._camera.stop_acquisition()
+        bp.camera.start_acquisition()
+        img = bp.camera.get_image()
+        bp.camera.stop_acquisition()
         bp.analyze(img)
 
         assert bp.width > 0
-        bp._camera.close()
+        bp.camera.close()
 
     def test_none_exposure_continuous(self):
         """Test that None exposure_time works for continuous (uses default)."""
         bp = BeamProfiler(camera="simulated")
         # Should use default 0.01s
-        bp._camera.set_exposure(None)
-        assert bp._camera.exposure_time == 0.01
-        bp._camera.close()
+        bp.camera.set_exposure(None)
+        assert bp.camera.exposure_time == 0.01
+        bp.camera.close()
 
     def test_exposure_affects_amplitude(self):
         """Test that exposure time affects simulated amplitude."""
         bp = BeamProfiler(camera="simulated")
 
         # Short exposure
-        bp._camera.set_exposure(0.001)
-        bp._camera.start_acquisition()
-        img1 = bp._camera.get_image()
-        bp._camera.stop_acquisition()
+        bp.camera.set_exposure(0.001)
+        bp.camera.start_acquisition()
+        img1 = bp.camera.get_image()
+        bp.camera.stop_acquisition()
 
         # Long exposure
-        bp._camera.set_exposure(0.1)
-        bp._camera.start_acquisition()
-        img2 = bp._camera.get_image()
-        bp._camera.stop_acquisition()
+        bp.camera.set_exposure(0.1)
+        bp.camera.start_acquisition()
+        img2 = bp.camera.get_image()
+        bp.camera.stop_acquisition()
 
         # Long exposure should have higher peak
         assert np.max(img2) > np.max(img1)
 
-        bp._camera.close()
+        bp.camera.close()
 
 
 class TestPropertiesWithDefinitions:
@@ -327,9 +327,9 @@ class TestPropertiesWithDefinitions:
     def test_properties_gaussian(self):
         """Test all properties with gaussian definition."""
         bp = BeamProfiler(camera="simulated", fit="1d", definition="gaussian")
-        bp._camera.start_acquisition()
-        img = bp._camera.get_image()
-        bp._camera.stop_acquisition()
+        bp.camera.start_acquisition()
+        img = bp.camera.get_image()
+        bp.camera.stop_acquisition()
         bp.analyze(img)
 
         # All properties should be accessible
@@ -346,14 +346,14 @@ class TestPropertiesWithDefinitions:
         assert bp.height_y > 0
         assert bp.peak_value > 0
 
-        bp._camera.close()
+        bp.camera.close()
 
     def test_properties_fwhm(self):
         """Test that width_x/y change but properties remain consistent with FWHM."""
         bp = BeamProfiler(camera="simulated", fit="1d", definition="fwhm")
-        bp._camera.start_acquisition()
-        img = bp._camera.get_image()
-        bp._camera.stop_acquisition()
+        bp.camera.start_acquisition()
+        img = bp.camera.get_image()
+        bp.camera.stop_acquisition()
         bp.analyze(img)
 
         # Width should now be FWHM
@@ -362,7 +362,7 @@ class TestPropertiesWithDefinitions:
         # (fwhm_x recalculates from width_x assuming gaussian)
         assert bp.fwhm_x > 0
 
-        bp._camera.close()
+        bp.camera.close()
 
 
 class TestHarvesterIntegration:
@@ -393,23 +393,23 @@ class TestHarvesterIntegration:
         """Test that camera type strings work correctly."""
         # Simulated should still work
         bp = BeamProfiler(camera="simulated")
-        assert bp._camera is not None
-        bp._camera.close()
+        assert bp.camera is not None
+        bp.camera.close()
 
         # FLIR/Basler will fall back to simulated if hardware not available
         # But should not crash
         try:
             bp_flir = BeamProfiler(camera="flir")
-            if bp_flir._camera:
-                bp_flir._camera.close()
+            if bp_flir.camera:
+                bp_flir.camera.close()
         except Exception:
             # Camera initialization fails without hardware or drivers
             pass
 
         try:
             bp_basler = BeamProfiler(camera="basler")
-            if bp_basler._camera:
-                bp_basler._camera.close()
+            if bp_basler.camera:
+                bp_basler.camera.close()
         except Exception:
             # Camera initialization fails without hardware or drivers
             pass
@@ -432,9 +432,9 @@ class TestEdgeCases:
     def test_definition_switching(self):
         """Test switching definition on the fly."""
         bp = BeamProfiler(camera="simulated", definition="gaussian")
-        bp._camera.start_acquisition()
-        img = bp._camera.get_image()
-        bp._camera.stop_acquisition()
+        bp.camera.start_acquisition()
+        img = bp.camera.get_image()
+        bp.camera.stop_acquisition()
 
         bp.analyze(img)
         width_gaussian = bp.width_x
@@ -454,4 +454,4 @@ class TestEdgeCases:
         assert width_fwhm != width_d4s
         assert width_gaussian != width_d4s
 
-        bp._camera.close()
+        bp.camera.close()

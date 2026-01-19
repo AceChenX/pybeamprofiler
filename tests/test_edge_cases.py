@@ -13,8 +13,8 @@ class TestCameraErrorHandling:
     def test_simulated_camera_initialization(self):
         """Test simulated camera can be initialized."""
         bp = BeamProfiler(camera="simulated")
-        assert bp._camera is not None
-        assert isinstance(bp._camera, SimulatedCamera)
+        assert bp.camera is not None
+        assert isinstance(bp.camera, SimulatedCamera)
         assert bp.width_pixels > 0
         assert bp.height_pixels > 0
         assert bp.pixel_size > 0
@@ -43,7 +43,7 @@ class TestCameraErrorHandling:
         """Test invalid camera type raises error."""
         bp = BeamProfiler(camera="nonexistent")
         # Should fall back to simulated
-        assert isinstance(bp._camera, SimulatedCamera)
+        assert isinstance(bp.camera, SimulatedCamera)
 
 
 class TestSimulatedCamera:
@@ -108,9 +108,9 @@ class TestWidthDefinitions:
     def test_gaussian_definition(self):
         """Test Gaussian (1/e²) width definition."""
         bp = BeamProfiler(camera="simulated", fit="1d", definition="gaussian")
-        bp._camera.start_acquisition()
-        img = bp._camera.get_image()
-        bp._camera.stop_acquisition()
+        bp.camera.start_acquisition()
+        img = bp.camera.get_image()
+        bp.camera.stop_acquisition()
 
         bp.analyze(img)
         assert bp.width_x > 0
@@ -120,9 +120,9 @@ class TestWidthDefinitions:
     def test_fwhm_definition(self):
         """Test FWHM width definition."""
         bp = BeamProfiler(camera="simulated", fit="1d", definition="fwhm")
-        bp._camera.start_acquisition()
-        img = bp._camera.get_image()
-        bp._camera.stop_acquisition()
+        bp.camera.start_acquisition()
+        img = bp.camera.get_image()
+        bp.camera.stop_acquisition()
 
         bp.analyze(img)
         assert bp.width_x > 0
@@ -132,9 +132,9 @@ class TestWidthDefinitions:
     def test_d4s_definition(self):
         """Test D4σ (ISO 11146) width definition."""
         bp = BeamProfiler(camera="simulated", fit="1d", definition="d4s")
-        bp._camera.start_acquisition()
-        img = bp._camera.get_image()
-        bp._camera.stop_acquisition()
+        bp.camera.start_acquisition()
+        img = bp.camera.get_image()
+        bp.camera.stop_acquisition()
 
         bp.analyze(img)
         assert bp.width_x > 0
@@ -144,9 +144,9 @@ class TestWidthDefinitions:
     def test_definition_comparison(self):
         """Test that different definitions give different widths."""
         bp = BeamProfiler(camera="simulated", fit="1d")
-        bp._camera.start_acquisition()
-        img = bp._camera.get_image()
-        bp._camera.stop_acquisition()
+        bp.camera.start_acquisition()
+        img = bp.camera.get_image()
+        bp.camera.stop_acquisition()
 
         widths = {}
         for definition in ["gaussian", "fwhm", "d4s"]:
@@ -165,9 +165,9 @@ class TestFittingMethods:
     def test_1d_fitting(self):
         """Test 1D projection fitting."""
         bp = BeamProfiler(camera="simulated", fit="1d")
-        bp._camera.start_acquisition()
-        img = bp._camera.get_image()
-        bp._camera.stop_acquisition()
+        bp.camera.start_acquisition()
+        img = bp.camera.get_image()
+        bp.camera.stop_acquisition()
 
         popt_x, popt_y = bp.analyze(img)
         assert popt_x is not None
@@ -179,9 +179,9 @@ class TestFittingMethods:
     def test_2d_fitting(self):
         """Test 2D Gaussian fitting with rotation."""
         bp = BeamProfiler(camera="simulated", fit="2d")
-        bp._camera.start_acquisition()
-        img = bp._camera.get_image()
-        bp._camera.stop_acquisition()
+        bp.camera.start_acquisition()
+        img = bp.camera.get_image()
+        bp.camera.stop_acquisition()
 
         popt_x, popt_y = bp.analyze(img)
         assert popt_x is not None
@@ -191,9 +191,9 @@ class TestFittingMethods:
     def test_linecut_fitting(self):
         """Test linecut fitting through peak."""
         bp = BeamProfiler(camera="simulated", fit="linecut")
-        bp._camera.start_acquisition()
-        img = bp._camera.get_image()
-        bp._camera.stop_acquisition()
+        bp.camera.start_acquisition()
+        img = bp.camera.get_image()
+        bp.camera.stop_acquisition()
 
         popt_x, popt_y = bp.analyze(img)
         assert popt_x is not None
@@ -209,9 +209,9 @@ class TestBeamProfilerIntegration:
         bp = BeamProfiler(camera="simulated", exposure_time=0.01)
 
         # Should not raise any exceptions
-        bp._camera.start_acquisition()
-        img = bp._camera.get_image()
-        bp._camera.stop_acquisition()
+        bp.camera.start_acquisition()
+        img = bp.camera.get_image()
+        bp.camera.stop_acquisition()
 
         popt_x, popt_y = bp.analyze(img)
 
@@ -225,15 +225,15 @@ class TestBeamProfilerIntegration:
     def test_multiple_acquisitions(self):
         """Test multiple sequential acquisitions."""
         bp = BeamProfiler(camera="simulated")
-        bp._camera.start_acquisition()
+        bp.camera.start_acquisition()
 
         widths = []
         for _ in range(5):
-            img = bp._camera.get_image()
+            img = bp.camera.get_image()
             bp.analyze(img)
             widths.append(bp.width)
 
-        bp._camera.stop_acquisition()
+        bp.camera.stop_acquisition()
 
         # All widths should be positive
         assert all(w > 0 for w in widths)
@@ -244,23 +244,23 @@ class TestBeamProfilerIntegration:
     def test_camera_cleanup(self):
         """Test camera cleanup works correctly."""
         bp = BeamProfiler(camera="simulated")
-        assert bp._camera is not None
+        assert bp.camera is not None
 
-        bp._camera.open()
-        bp._camera.start_acquisition()
-        img = bp._camera.get_image()
-        bp._camera.stop_acquisition()
-        bp._camera.close()
+        bp.camera.open()
+        bp.camera.start_acquisition()
+        img = bp.camera.get_image()
+        bp.camera.stop_acquisition()
+        bp.camera.close()
 
         assert img is not None
 
     def test_fit_caching(self):
         """Test that fit parameters are cached for efficiency."""
         bp = BeamProfiler(camera="simulated", fit="1d")
-        bp._camera.start_acquisition()
+        bp.camera.start_acquisition()
 
         # First fit
-        img1 = bp._camera.get_image()
+        img1 = bp.camera.get_image()
         popt_x1, popt_y1 = bp.analyze(img1)
 
         # Cache should be populated
@@ -268,10 +268,10 @@ class TestBeamProfilerIntegration:
         assert bp._last_popt_y is not None
 
         # Second fit should use cached values as initial guess
-        img2 = bp._camera.get_image()
+        img2 = bp.camera.get_image()
         popt_x2, popt_y2 = bp.analyze(img2)
 
         assert popt_x2 is not None
         assert popt_y2 is not None
 
-        bp._camera.stop_acquisition()
+        bp.camera.stop_acquisition()

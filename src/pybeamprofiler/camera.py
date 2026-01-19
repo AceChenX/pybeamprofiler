@@ -186,35 +186,35 @@ class Camera(ABC):
         camera_info.append(widgets.HTML(f"<b>Pixel Size:</b> {self.pixel_size:.2f} μm"))
 
         # Add sensor description for GenICam cameras
-        if hasattr(self, 'node_map') and self.node_map:
+        if hasattr(self, "node_map") and self.node_map:
             try:
                 if hasattr(self.node_map, "SensorDescription"):
                     desc = self.node_map.SensorDescription.value
                     camera_info.append(widgets.HTML(f"<b>Sensor:</b> {desc}"))
-            except:
+            except Exception:
                 pass
             try:
                 if hasattr(self.node_map, "DeviceModelName"):
                     model = self.node_map.DeviceModelName.value
                     camera_info.append(widgets.HTML(f"<b>Model:</b> {model}"))
-            except:
+            except Exception:
                 pass
 
         camera_info_box = widgets.VBox(camera_info)
 
         # ROI controls (for GenICam cameras)
         roi_controls = None
-        if hasattr(self, 'roi_info') and hasattr(self, 'set_roi'):
+        if hasattr(self, "roi_info") and hasattr(self, "set_roi"):
             roi = self.roi_info
 
             offset_x_input = widgets.IntText(
-                value=roi['offset_x'], description='Offset X:', style=style
+                value=roi["offset_x"], description="Offset X:", style=style
             )
             offset_y_input = widgets.IntText(
-                value=roi['offset_y'], description='Offset Y:', style=style
+                value=roi["offset_y"], description="Offset Y:", style=style
             )
-            width_input = widgets.IntText(value=roi['width'], description='Width:', style=style)
-            height_input = widgets.IntText(value=roi['height'], description='Height:', style=style)
+            width_input = widgets.IntText(value=roi["width"], description="Width:", style=style)
+            height_input = widgets.IntText(value=roi["height"], description="Height:", style=style)
 
             roi_button = widgets.Button(
                 description="Apply ROI", button_style="primary", icon="check"
@@ -245,11 +245,11 @@ class Camera(ABC):
             def on_roi_reset(b):
                 try:
                     roi_max = self.roi_info
-                    self.set_roi(0, 0, roi_max['max_width'], roi_max['max_height'])
+                    self.set_roi(0, 0, roi_max["max_width"], roi_max["max_height"])
                     offset_x_input.value = 0
                     offset_y_input.value = 0
-                    width_input.value = roi_max['max_width']
-                    height_input.value = roi_max['max_height']
+                    width_input.value = roi_max["max_width"]
+                    height_input.value = roi_max["max_height"]
                     camera_info[
                         1
                     ].value = (
@@ -316,7 +316,7 @@ class Camera(ABC):
         Returns:
             List of accordion widgets for common GenICam features
         """
-        if not hasattr(self, 'node_map') or not self.node_map:
+        if not hasattr(self, "node_map") or not self.node_map:
             return []
 
         accordions = []
@@ -356,7 +356,7 @@ class Camera(ABC):
         Returns:
             List of accordion widgets for advanced GenICam features
         """
-        if not hasattr(self, 'node_map') or not self.node_map:
+        if not hasattr(self, "node_map") or not self.node_map:
             return []
 
         accordions = []
@@ -433,11 +433,11 @@ class Camera(ABC):
                 node = getattr(self.node_map, feature_name)
 
                 # Check if readable
-                if not hasattr(node, 'value'):
+                if not hasattr(node, "value"):
                     continue
 
                 # Boolean/Enable/Auto features (checkboxes or dropdowns)
-                if feature_name.endswith('Enable') or feature_name.endswith('Auto'):
+                if feature_name.endswith("Enable") or feature_name.endswith("Auto"):
                     try:
                         current_val = node.value
                         # Handle both boolean and string values
@@ -449,16 +449,16 @@ class Camera(ABC):
                             checkbox = self._create_checkbox(node, feature_name, current_val)
                             if checkbox:
                                 controls.append(checkbox)
-                    except:
+                    except Exception:
                         pass
 
                 # Numeric features (sliders)
-                elif hasattr(node, 'min') and hasattr(node, 'max'):
+                elif hasattr(node, "min") and hasattr(node, "max"):
                     try:
                         slider_box = self._create_slider(node, feature_name, style)
                         if slider_box:
                             controls.append(slider_box)
-                    except:
+                    except Exception:
                         pass
 
                 # Enum features (dropdowns)
@@ -467,7 +467,7 @@ class Camera(ABC):
                         dropdown = self._create_enum_dropdown(node, feature_name, style)
                         if dropdown:
                             controls.append(dropdown)
-                    except:
+                    except Exception:
                         pass
 
             except Exception:
@@ -481,11 +481,11 @@ class Camera(ABC):
 
         def on_change(change):
             try:
-                node.value = change['new']
+                node.value = change["new"]
             except Exception as e:
                 print(f"Error setting {feature_name}: {e}")
 
-        checkbox.observe(on_change, names='value')
+        checkbox.observe(on_change, names="value")
         return checkbox
 
     def _create_slider(self, node, feature_name, style):
@@ -524,16 +524,16 @@ class Camera(ABC):
 
             def on_slider_change(change):
                 try:
-                    node.value = change['new']
-                    input_widget.value = change['new']
+                    node.value = change["new"]
+                    input_widget.value = change["new"]
                 except Exception as e:
                     print(f"Error setting {feature_name}: {e}")
 
             def on_input_change(change):
-                slider.value = change['new']
+                slider.value = change["new"]
 
-            slider.observe(on_slider_change, names='value')
-            input_widget.observe(on_input_change, names='value')
+            slider.observe(on_slider_change, names="value")
+            input_widget.observe(on_input_change, names="value")
 
             return widgets.HBox([slider, input_widget])
 
@@ -547,12 +547,12 @@ class Camera(ABC):
 
             # Try to get available options (GenICam enums)
             options = []
-            if hasattr(node, 'symbolics'):
+            if hasattr(node, "symbolics"):
                 options = list(node.symbolics)
-            elif feature_name.endswith('Enable'):
-                options = ['On', 'Off']
-            elif feature_name.endswith('Auto'):
-                options = ['Off', 'Once', 'Continuous']
+            elif feature_name.endswith("Enable"):
+                options = ["On", "Off"]
+            elif feature_name.endswith("Auto"):
+                options = ["Off", "Once", "Continuous"]
             elif current_val:
                 options = [current_val]
 
@@ -568,11 +568,11 @@ class Camera(ABC):
 
             def on_change(change):
                 try:
-                    node.value = change['new']
+                    node.value = change["new"]
                 except Exception as e:
                     print(f"Error setting {feature_name}: {e}")
 
-            dropdown.observe(on_change, names='value')
+            dropdown.observe(on_change, names="value")
             return dropdown
 
         except Exception:
@@ -588,7 +588,7 @@ class Camera(ABC):
         """
         for param_name, value in kwargs.items():
             # Handle standard camera attributes
-            if param_name == 'exposure_time' or param_name == 'ExposureTime':
+            if param_name == "exposure_time" or param_name == "ExposureTime":
                 try:
                     self.set_exposure(value)
                     print(f"Set exposure_time = {value}")
@@ -596,7 +596,7 @@ class Camera(ABC):
                     print(f"Error setting exposure_time: {e}")
                 continue
 
-            if param_name == 'gain' or param_name == 'Gain':
+            if param_name == "gain" or param_name == "Gain":
                 try:
                     self.set_gain(value)
                     print(f"Set gain = {value}")
@@ -605,25 +605,25 @@ class Camera(ABC):
                 continue
 
             # Handle GenICam node_map features
-            if hasattr(self, 'node_map') and self.node_map:
+            if hasattr(self, "node_map") and self.node_map:
                 if hasattr(self.node_map, param_name):
                     try:
                         node = getattr(self.node_map, param_name)
 
                         # Convert string boolean representations to actual booleans
                         if isinstance(value, str):
-                            if param_name.endswith('Enable') or param_name.endswith('Auto'):
+                            if param_name.endswith("Enable") or param_name.endswith("Auto"):
                                 # Check if this is actually a boolean node
                                 try:
                                     current_val = node.value
                                     if isinstance(current_val, bool):
                                         # It's a boolean node, convert string to bool
-                                        if value.lower() in ['on', 'true', '1', 'yes']:
+                                        if value.lower() in ["on", "true", "1", "yes"]:
                                             value = True
-                                        elif value.lower() in ['off', 'false', '0', 'no']:
+                                        elif value.lower() in ["off", "false", "0", "no"]:
                                             value = False
                                         # else keep as string (might be enum like 'Once', 'Continuous')
-                                except:
+                                except Exception:
                                     pass
 
                         node.value = value

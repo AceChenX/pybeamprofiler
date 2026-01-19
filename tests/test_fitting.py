@@ -13,9 +13,9 @@ class TestOneDimensionalFitting:
         bp = beam_profiler
         bp.fit_method = "1d"
 
-        bp._camera.start_acquisition()
-        img = bp._camera.get_image()
-        bp._camera.stop_acquisition()
+        bp.camera.start_acquisition()
+        img = bp.camera.get_image()
+        bp.camera.stop_acquisition()
 
         popt_x, popt_y = bp.analyze(img)
 
@@ -48,16 +48,16 @@ class TestOneDimensionalFitting:
         bp = beam_profiler
         bp.fit_method = "1d"
 
-        bp._camera.start_acquisition()
-        img1 = bp._camera.get_image()
-        bp._camera.stop_acquisition()
+        bp.camera.start_acquisition()
+        img1 = bp.camera.get_image()
+        bp.camera.stop_acquisition()
 
         popt_x1, _ = bp.analyze(img1)
         assert bp._last_popt_x is not None
 
-        bp._camera.start_acquisition()
-        img2 = bp._camera.get_image()
-        bp._camera.stop_acquisition()
+        bp.camera.start_acquisition()
+        img2 = bp.camera.get_image()
+        bp.camera.stop_acquisition()
 
         popt_x2, _ = bp.analyze(img2)
         assert abs(popt_x2[2] - popt_x1[2]) < 50
@@ -71,9 +71,9 @@ class TestTwoDimensionalFitting:
         bp = beam_profiler
         bp.fit_method = "2d"
 
-        bp._camera.start_acquisition()
-        img = bp._camera.get_image()
-        bp._camera.stop_acquisition()
+        bp.camera.start_acquisition()
+        img = bp.camera.get_image()
+        bp.camera.stop_acquisition()
 
         popt_x, popt_y = bp.analyze(img)
 
@@ -87,9 +87,9 @@ class TestTwoDimensionalFitting:
         """Compare 2D and 1D fitting results on same image."""
         bp = beam_profiler
 
-        bp._camera.start_acquisition()
-        img = bp._camera.get_image()
-        bp._camera.stop_acquisition()
+        bp.camera.start_acquisition()
+        img = bp.camera.get_image()
+        bp.camera.stop_acquisition()
 
         bp.fit_method = "1d"
         bp.analyze(img)
@@ -109,9 +109,9 @@ class TestLinecutFitting:
         """Test linecut fitting produces valid results."""
         bp = BeamProfiler(camera="simulated", fit="linecut")
 
-        bp._camera.start_acquisition()
-        img = bp._camera.get_image()
-        bp._camera.stop_acquisition()
+        bp.camera.start_acquisition()
+        img = bp.camera.get_image()
+        bp.camera.stop_acquisition()
 
         popt_x, popt_y = bp.analyze(img)
 
@@ -121,7 +121,7 @@ class TestLinecutFitting:
         assert bp.width_y > 0
         assert bp.angle_deg == 0.0
 
-        bp._camera.close()
+        bp.camera.close()
 
     def test_linecut_vs_1d_comparison(self, simulated_image):
         """Compare linecut and 1D projection methods."""
@@ -138,8 +138,8 @@ class TestLinecutFitting:
         assert width_1d > 0
         assert abs(width_1d - width_linecut) / width_1d < 0.5
 
-        bp_linecut._camera.close()
-        bp_1d._camera.close()
+        bp_linecut.camera.close()
+        bp_1d.camera.close()
 
 
 class TestFittingEdgeCases:
@@ -168,15 +168,15 @@ class TestFittingEdgeCases:
         bp = beam_profiler
         bp.fit_method = "1d"
 
-        bp._camera.start_acquisition()
+        bp.camera.start_acquisition()
 
         widths = []
         for _ in range(10):
-            img = bp._camera.get_image()
+            img = bp.camera.get_image()
             bp.analyze(img)
             widths.append(bp.width)
 
-        bp._camera.stop_acquisition()
+        bp.camera.stop_acquisition()
 
         assert len(widths) == 10
         assert all(w > 0 for w in widths)
