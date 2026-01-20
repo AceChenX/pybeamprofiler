@@ -152,11 +152,18 @@ class BeamProfiler:
         Args:
             filename: Path to image file
         """
-        img = Image.open(filename).convert("L")
-        self.last_img = np.array(img)
-        self.width_pixels = self.last_img.shape[1]
-        self.height_pixels = self.last_img.shape[0]
-        self.pixel_size = 1.0
+        try:
+            with Image.open(filename) as img:
+                self.last_img = np.array(img)
+                self.width_pixels = self.last_img.shape[1]
+                self.height_pixels = self.last_img.shape[0]
+                self.pixel_size = 1.0  # Assume 1 μm/pixel for static images
+        except FileNotFoundError:
+            logger.error(f"Image file not found: {filename}")
+            raise
+        except Exception as e:
+            logger.error(f"Error loading image file {filename}: {e}")
+            raise
 
     def __enter__(self):
         """Context manager entry."""
@@ -289,7 +296,7 @@ class BeamProfiler:
         """Peak height in Y profile (intensity units)."""
         return self.peak_value
 
-    def _measure_fwhm_direct(self, profile: np.ndarray) -> tuple[float, float, float]:
+    def _measure_fwhm(self, profile: np.ndarray) -> tuple[float, float, float]:
         """Measure Full Width at Half Maximum directly from profile.
 
         Uses linear interpolation for sub-pixel accuracy without assuming
@@ -333,7 +340,7 @@ class BeamProfiler:
 
         return center, fwhm, peak_value
 
-    def _measure_d4s_direct(self, profile: np.ndarray) -> tuple[float, float]:
+    def _measure_d4s(self, profile: np.ndarray) -> tuple[float, float]:
         """Measure D4σ (ISO 11146 second moment width) directly from profile.
 
         Uses intensity-weighted second moment without assuming Gaussian distribution.
@@ -458,11 +465,11 @@ class BeamProfiler:
             proj_y = np.sum(image, axis=1)
 
             if self.definition == "fwhm":
-                center_x, width_x, _ = self._measure_fwhm_direct(proj_x)
-                center_y, width_y, _ = self._measure_fwhm_direct(proj_y)
+                center_x, width_x, _ = self._measure_fwhm(proj_x)
+                center_y, width_y, _ = self._measure_fwhm(proj_y)
             else:  # d4s
-                center_x, width_x = self._measure_d4s_direct(proj_x)
-                center_y, width_y = self._measure_d4s_direct(proj_y)
+                center_x, width_x = self._measure_d4s(proj_x)
+                center_y, width_y = self._measure_d4s(proj_y)
 
             self.center_x = center_x
             self.center_y = center_y
@@ -482,6 +489,10 @@ class BeamProfiler:
             peak_y, peak_x = np.unravel_index(np.argmax(image), image.shape)
             linecut_x = image[peak_y, :]
             linecut_y = image[:, peak_x]
+
+            # Store linecut positions for visualization
+            self._linecut_x = peak_x
+            self._linecut_y = peak_y
 
             popt_x = self._fit_1d_gaussian(linecut_x, self._last_popt_x)
             popt_y = self._fit_1d_gaussian(linecut_y, self._last_popt_y)
@@ -537,7 +548,7 @@ class BeamProfiler:
         elif self.definition == "d4s":
             factor = 4.0  # 4 sigma
         else:  # 'gaussian' - 1/e²
-            factor = 2.0 * np.sqrt(2)  # 2*sqrt(2) sigma for 1/e²
+            factor = 4.0  # 4.0 sigma for 1/e² width
         self.width_x = factor * sigma_x * self.pixel_size
         self.width_y = factor * sigma_y * self.pixel_size
 
@@ -580,6 +591,36 @@ class BeamProfiler:
 
         fig = go.Figure()
         fig.add_trace(go.Heatmap(z=image, colorscale="Viridis", showscale=True))
+
+        # Add linecut crosshair lines if using linecut method
+        if (
+            self.fit_method == "linecut"
+            and hasattr(self, "_linecut_x")
+            and hasattr(self, "_linecut_y")
+        ):
+            # Vertical line at linecut_x
+            fig.add_trace(
+                go.Scatter(
+                    x=[self._linecut_x, self._linecut_x],
+                    y=[0, image.shape[0] - 1],
+                    mode="lines",
+                    line=dict(color="cyan", width=2, dash="dot"),
+                    name="Linecut X",
+                    showlegend=False,
+                )
+            )
+            # Horizontal line at linecut_y
+            fig.add_trace(
+                go.Scatter(
+                    x=[0, image.shape[1] - 1],
+                    y=[self._linecut_y, self._linecut_y],
+                    mode="lines",
+                    line=dict(color="cyan", width=2, dash="dot"),
+                    name="Linecut Y",
+                    showlegend=False,
+                )
+            )
+
         if popt_x is not None and popt_y is not None:
             cx, cy = popt_x[1], popt_y[1]
             rx, ry = 2 * abs(popt_x[2]), 2 * abs(popt_y[2])
@@ -655,6 +696,39 @@ class BeamProfiler:
 
         # Beam Image (heatmap)
         fig.add_trace(go.Heatmap(z=image, colorscale="Viridis", showscale=False), row=2, col=1)
+
+        # Add linecut crosshair lines if using linecut method
+        if (
+            self.fit_method == "linecut"
+            and hasattr(self, "_linecut_x")
+            and hasattr(self, "_linecut_y")
+        ):
+            # Vertical line at linecut_x
+            fig.add_trace(
+                go.Scatter(
+                    x=[self._linecut_x, self._linecut_x],
+                    y=[0, image.shape[0] - 1],
+                    mode="lines",
+                    line=dict(color="cyan", width=2, dash="dot"),
+                    name="Linecut X",
+                    showlegend=True,
+                ),
+                row=2,
+                col=1,
+            )
+            # Horizontal line at linecut_y
+            fig.add_trace(
+                go.Scatter(
+                    x=[0, image.shape[1] - 1],
+                    y=[self._linecut_y, self._linecut_y],
+                    mode="lines",
+                    line=dict(color="cyan", width=2, dash="dot"),
+                    name="Linecut Y",
+                    showlegend=True,
+                ),
+                row=2,
+                col=1,
+            )
 
         if popt_x is not None and popt_y is not None:
             cx, cy = popt_x[1], popt_y[1]
