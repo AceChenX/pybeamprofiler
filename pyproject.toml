@@ -5,14 +5,22 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "pybeamprofiler"
 version = "0.0.1"
-description = "Laser beam profiler using GenICam cameras"
+description = "Real-time laser beam profiler with Gaussian fitting for GenICam cameras"
 readme = "README.md"
 authors = [
   { name = "C.-A. Chen", email = "acechen@cirx.org" },
 ]
 license = { file = "LICENSE" }
+keywords = ["laser", "beam-profiling", "gaussian-fitting", "genicam", "flir", "basler", "camera"]
 classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Physics",
+    "Topic :: Scientific/Engineering :: Image Processing",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
     "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
 ]
@@ -25,7 +33,7 @@ dependencies = [
     "Pillow",
     "harvesters>=1.4.0",
 ]
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 
 [project.urls]
 "Homepage" = "https://github.com/acechenx/pybeamprofiler"
@@ -59,7 +67,7 @@ python_functions = ["test_*"]
 addopts = "-v --cov=pybeamprofiler --cov-report=term-missing"
 
 [tool.ruff]
-target-version = "py39"
+target-version = "py310"
 line-length = 100
 
 [tool.ruff.lint]
@@ -84,7 +92,7 @@ indent-style = "space"
 [tool.pyright]
 include = ["src", "tests"]
 exclude = ["**/__pycache__", "**/.pytest_cache"]
-pythonVersion = "3.9"
+pythonVersion = "3.10"
 typeCheckingMode = "basic"
 reportMissingImports = true
 reportMissingTypeStubs = false

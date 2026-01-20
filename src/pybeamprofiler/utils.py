@@ -46,11 +46,26 @@ def find_cti_files() -> list[str]:
         )
 
     for base_path in search_paths:
-        if os.path.exists(base_path):
-            for root, dirs, files in os.walk(base_path):
-                for file in files:
-                    if file.endswith(".cti"):
-                        cti_files.append(os.path.join(root, file))
+        if not os.path.exists(base_path):
+            continue
+
+        # Resolve path to prevent symlink attacks
+        try:
+            base_path = os.path.realpath(base_path)
+        except (OSError, ValueError) as e:
+            logger.debug(f"Could not resolve path {base_path}: {e}")
+            continue
+
+        # Only search immediate directory, not recursive for security
+        try:
+            for file in os.listdir(base_path):
+                if file.endswith(".cti"):
+                    full_path = os.path.join(base_path, file)
+                    # Verify the file is actually within base_path
+                    if os.path.realpath(full_path).startswith(base_path):
+                        cti_files.append(full_path)
+        except (OSError, PermissionError) as e:
+            logger.debug(f"Could not list directory {base_path}: {e}")
 
     return cti_files
 

@@ -4,6 +4,8 @@ import argparse
 import logging
 import os
 import threading
+import time
+import traceback
 import webbrowser
 
 import numpy as np
@@ -46,6 +48,7 @@ class BeamProfiler:
         file: Path to static image file to analyze
         fit: Fitting method ('1d', '2d', 'linecut')
         definition: Width definition ('gaussian' for 1/e², 'fwhm', 'd4s')
+        exposure_time: Camera exposure time in seconds (default: camera default)
 
     Attributes:
         width_x: Beam width in x direction (μm)
@@ -62,9 +65,10 @@ class BeamProfiler:
         file: str | None = None,
         fit: str = "1d",
         definition: str = "gaussian",
+        exposure_time: float | None = None,
     ):
         """Initialize the beam profiler."""
-        self._camera: Camera | None = None
+        self.camera: Camera | None = None
         self.fit_method = fit
         self.definition = definition
 
@@ -90,44 +94,57 @@ class BeamProfiler:
         elif camera:
             self._initialize_camera(camera)
         else:
-            self._camera = SimulatedCamera()
-            self._camera.open()
+            self.camera = SimulatedCamera()
+            self.camera.open()
             self._mode = "camera"
 
-        if self._camera:
-            self.width_pixels = self._camera.width
-            self.height_pixels = self._camera.height
-            self.pixel_size = self._camera.pixel_size
-        elif file:
-            # For static files, set dimensions from loaded image
-            self.width_pixels = self.last_img.shape[1]
-            self.height_pixels = self.last_img.shape[0]
+        if self.camera:
+            self.width_pixels = self.camera.width
+            self.height_pixels = self.camera.height
+            self.pixel_size = self.camera.pixel_size
+            # Set exposure time if provided
+            if exposure_time is not None:
+                self.camera.set_exposure(exposure_time)
+        elif file and self.last_img is not None:
+            # For static files, dimensions already set in _load_file
+            pass
+        else:
+            raise ValueError("Either camera or file must be provided and successfully loaded")
 
     def _initialize_camera(self, camera: str) -> None:
         """Initialize camera hardware.
 
         Args:
             camera: Camera type string
+
+        Raises:
+            RuntimeError: If physical camera fails to open
         """
         camera_lower = camera.lower()
         if camera_lower == "flir":
-            self._camera = FlirCamera()
+            self.camera = FlirCamera()
         elif camera_lower == "basler":
-            self._camera = BaslerCamera()
+            self.camera = BaslerCamera()
         elif camera_lower == "simulated":
-            self._camera = SimulatedCamera()
+            self.camera = SimulatedCamera()
         else:
             logger.warning(f"Unknown camera {camera}, using Simulated.")
-            self._camera = SimulatedCamera()
+            self.camera = SimulatedCamera()
 
         try:
-            self._camera.open()
+            self.camera.open()
             self._mode = "camera"
         except Exception as e:
-            logger.error(f"Failed to open camera: {e}")
-            self._camera = SimulatedCamera()
-            self._camera.open()
-            self._mode = "camera"
+            # Don't fallback to simulated for physical cameras
+            if camera_lower in ["flir", "basler"]:
+                logger.error(f"Failed to open {camera} camera: {e}")
+                raise RuntimeError(f"Failed to open {camera} camera: {e}") from e
+            else:
+                # Only fallback for unknown/simulated cameras
+                logger.error(f"Failed to open camera: {e}")
+                self.camera = SimulatedCamera()
+                self.camera.open()
+                self._mode = "camera"
 
     def _load_file(self, filename: str) -> None:
         """Load static image file.
@@ -141,10 +158,23 @@ class BeamProfiler:
         self.height_pixels = self.last_img.shape[0]
         self.pixel_size = 1.0
 
+    def __enter__(self):
+        """Context manager entry."""
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Context manager exit - ensure camera is closed."""
+        if self.camera:
+            try:
+                self.camera.close()
+            except Exception as e:
+                logger.warning(f"Error closing camera: {e}")
+        return False
+
     def __getattr__(self, name: str):
         """Proxy camera attributes."""
-        if self._camera and hasattr(self._camera, name):
-            return getattr(self._camera, name)
+        if self.camera and hasattr(self.camera, name):
+            return getattr(self.camera, name)
         raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
 
     @staticmethod
@@ -404,9 +434,21 @@ class BeamProfiler:
 
         Returns:
             tuple of (x_fit_params, y_fit_params) for 1D projections
+
+        Raises:
+            ValueError: If image is None or not 2D
         """
         if image is None:
-            return None, None
+            raise ValueError("Image cannot be None")
+
+        if not isinstance(image, np.ndarray):
+            raise TypeError(f"Image must be numpy array, got {type(image)}")
+
+        if image.ndim != 2:
+            raise ValueError(f"Image must be 2D, got {image.ndim}D array")
+
+        if image.size == 0:
+            raise ValueError("Image cannot be empty")
 
         self.peak_value = float(np.max(image))
 
@@ -501,20 +543,17 @@ class BeamProfiler:
 
     def plot(
         self,
-        exposure_time: float | None = None,
         num_img: int | None = None,
         heatmap_only: bool = False,
     ) -> None:
         """Display beam profile with Gaussian fitting visualization.
 
+        Set exposure time using bp.setting(exposure_time=...) or bp.exposure_time before calling plot().
+
         Args:
-            exposure_time: Camera exposure time in seconds (default 0.01 for continuous mode)
             num_img: Number of images (1 for single shot, None for continuous streaming)
             heatmap_only: Show only heatmap for faster rendering (~8-12 Hz in Jupyter)
         """
-        if self._mode == "camera":
-            exp_time = exposure_time if num_img == 1 else (exposure_time or 0.01)
-            self._camera.set_exposure(exp_time)
 
         self._heatmap_only = heatmap_only  # Store for _plot_stream to use
 
@@ -610,6 +649,8 @@ class BeamProfiler:
                 [{"type": "heatmap"}, {"type": "xy"}],
             ],
             subplot_titles=("X Profile", "", "Beam Image", "Y Profile"),
+            horizontal_spacing=0.02,
+            vertical_spacing=0.02,
         )
 
         # Beam Image (heatmap)
@@ -672,13 +713,19 @@ class BeamProfiler:
             title += f", Angle: {self.angle_deg:.1f}°"
         title += f", Peak: {self.peak_value:.0f}"
 
-        fig.update_layout(height=700, width=900, title_text=title, showlegend=True)
+        fig.update_layout(
+            height=700,
+            width=900,
+            title_text=title,
+            showlegend=True,
+            margin=dict(l=40, r=20, t=80, b=40),
+        )
 
         # Align X profile's x-axis with beam image's x-axis
-        fig.update_xaxes(matches="x3", row=1, col=1)
+        fig.update_xaxes(matches="x3", row=1, col=1, showticklabels=False)
 
         # Align Y profile's y-axis with beam image's y-axis
-        fig.update_yaxes(matches="y3", row=2, col=2)
+        fig.update_yaxes(matches="y3", row=2, col=2, showticklabels=False)
 
         # Ensure proper aspect ratio for beam image
         fig.update_yaxes(scaleanchor="x3", scaleratio=1, row=2, col=1)
@@ -689,9 +736,9 @@ class BeamProfiler:
     def _plot_single(self) -> None:
         """Capture and plot single image."""
         if self._mode == "camera":
-            self._camera.start_acquisition()
-            img = self._camera.get_image()
-            self._camera.stop_acquisition()
+            self.camera.start_acquisition()
+            img = self.camera.get_image()
+            self.camera.stop_acquisition()
         else:
             img = self.last_img
 
@@ -701,12 +748,11 @@ class BeamProfiler:
 
     def _plot_stream(self) -> None:
         """Start continuous streaming with live updates."""
-        import time
 
         # Ensure camera is ready for continuous acquisition
         if self._mode == "camera":
-            if not self._camera.is_acquiring:
-                self._camera.start_acquisition()
+            if not self.camera.is_acquiring:
+                self.camera.start_acquisition()
 
         # Check for heatmap only mode
         heatmap_only = getattr(self, "_heatmap_only", False)
@@ -717,13 +763,12 @@ class BeamProfiler:
 
             get_ipython()
 
-            # Use clear_output for live updates (reliable and fast enough)
+            # Use clear_output for live updates
             if heatmap_only:
-                print("Starting live stream (heatmap only)...")
+                print("Starting live stream (heatmap only, ~25-30 Hz)...")
             else:
-                print("Starting live stream with real-time fitting...")
-            print("   Fitting speed: 850+ fps (fitting is NOT the bottleneck!)")
-            print("   Press Jupyter's interrupt button to stop\n")
+                print("Starting live stream (~6-10 Hz)...")
+            print("Press Jupyter's interrupt button (■) to stop\n")
 
             frame_count = 0
             start_time = time.time()
@@ -731,7 +776,7 @@ class BeamProfiler:
             try:
                 while True:
                     # Get and analyze image
-                    img = self._camera.get_image() if self._mode == "camera" else self.last_img
+                    img = self.camera.get_image() if self._mode == "camera" else self.last_img
                     if img is None:
                         break
 
@@ -761,7 +806,7 @@ class BeamProfiler:
             except KeyboardInterrupt:
                 elapsed = time.time() - start_time
                 fps = frame_count / elapsed if elapsed > 0 else 0
-                print(f"\nLive stream stopped after {frame_count} frames ({fps:.1f} fps average)")
+                print(f"\nStream stopped: {frame_count} frames in {elapsed:.1f}s ({fps:.1f} fps)")
 
         except (NameError, ImportError):
             # Running from command line - use Dash
@@ -770,11 +815,8 @@ class BeamProfiler:
                 from dash import dcc, html
                 from dash.dependencies import Input, Output
             except ImportError:
-                print(
-                    "\nWARNING: Dash not installed. Using matplotlib fallback for command-line streaming."
-                )
-                print("   Install dash for better performance: pip install dash")
-                print("   Or use in Jupyter for best experience.\n")
+                print("\nDash not available. Using matplotlib fallback.")
+                print("Install dash for better performance: pip install dash\n")
 
                 # Matplotlib fallback
                 try:
@@ -785,7 +827,7 @@ class BeamProfiler:
                     fig_plt.tight_layout(pad=3.0)
 
                     def update_frame(frame_num):
-                        img = self._camera.get_image() if self._mode == "camera" else self.last_img
+                        img = self.camera.get_image() if self._mode == "camera" else self.last_img
                         if img is None:
                             return
 
@@ -877,12 +919,15 @@ class BeamProfiler:
             # Dash is available, use it
             app = dash.Dash(__name__)
 
+            # Flag to signal shutdown
+            shutdown_flag = {"stop": False}
+
             # Start acquisition before Dash server
-            if self._mode == "camera" and not self._camera.is_acquiring:
-                self._camera.start_acquisition()
+            if self._mode == "camera" and not self.camera.is_acquiring:
+                self.camera.start_acquisition()
 
             # Get initial image for display
-            initial_img = self._camera.get_image() if self._mode == "camera" else self.last_img
+            initial_img = self.camera.get_image() if self._mode == "camera" else self.last_img
             initial_popt_x, initial_popt_y = (
                 self.analyze(initial_img) if initial_img is not None else (None, None)
             )
@@ -912,13 +957,26 @@ class BeamProfiler:
                 Input("interval-component", "n_intervals"),
             )
             def update_graph_live(n):
-                if n % 10 == 0:  # Print every 10th frame to avoid spam
-                    print(f"[Dash] Processing frame {n}...")
+                # Check if shutdown requested
+                if shutdown_flag["stop"]:
+                    return go.Figure()
 
-                if self._mode == "camera" and not self._camera.is_acquiring:
-                    self._camera.start_acquisition()
+                if n % 10 == 0:
+                    logger.debug(f"Processing frame {n}")
 
-                img = self._camera.get_image() if self._mode == "camera" else self.last_img
+                if self._mode == "camera" and not self.camera.is_acquiring:
+                    try:
+                        self.camera.start_acquisition()
+                    except Exception:
+                        return go.Figure()
+
+                try:
+                    img = self.camera.get_image() if self._mode == "camera" else self.last_img
+                except Exception as e:
+                    # Camera fetch failed (likely stopped), return empty figure
+                    logger.debug(f"Failed to get image: {e}")
+                    return go.Figure()
+
                 if img is None:
                     return go.Figure()
 
@@ -937,11 +995,8 @@ class BeamProfiler:
                 return fig
 
             print("Starting Dash server at http://127.0.0.1:8050")
-            print("   Opening browser automatically...")
-            print("   Press Ctrl+C to stop")
-            print("   INFO: The image updates every 100ms (10 Hz)")
-            print("   INFO: Watch the frame counter in the plot title to verify updates")
-            print()
+            print("Opening browser automatically...")
+            print("Press Ctrl+C to stop\n")
 
             # Suppress Flask/Werkzeug logs for cleaner output
             logging.getLogger("werkzeug").setLevel(logging.ERROR)
@@ -955,7 +1010,11 @@ class BeamProfiler:
 
                 threading.Thread(target=open_browser, daemon=True).start()
 
-            app.run(debug=False, port=8050)
+            try:
+                app.run(debug=False, port=8050)
+            except KeyboardInterrupt:
+                print("\n\nStopping Dash server...")
+                shutdown_flag["stop"] = True
 
 
 if __name__ == "__main__":
@@ -1011,14 +1070,14 @@ if __name__ == "__main__":
         choices=["gaussian", "fwhm", "d4s"],
         help="Width definition: gaussian (1/e²), fwhm, d4s (default: gaussian)",
     )
-
-    # plot() arguments
     parser.add_argument(
         "--exposure-time",
         type=float,
         default=None,
-        help="Camera exposure time in seconds (default: 0.01 for continuous)",
+        help="Camera exposure time in seconds (set during initialization)",
     )
+
+    # plot() arguments
     parser.add_argument(
         "--num-img",
         type=int,
@@ -1057,6 +1116,7 @@ if __name__ == "__main__":
         file=args.file,
         fit=args.fit,
         definition=args.definition,
+        exposure_time=args.exposure_time,
     )
 
     print(f"   Sensor: {bp.width_pixels}×{bp.height_pixels} pixels")
@@ -1072,26 +1132,19 @@ if __name__ == "__main__":
     print()
 
     try:
-        bp.plot(
-            exposure_time=args.exposure_time,
-            num_img=args.num_img,
-            heatmap_only=args.heatmap_only,
-        )
-
-        if args.num_img == 1:
-            print()
-            print("Analysis complete:")
-            print(f"   Width X: {bp.width_x:.1f} μm")
-            print(f"   Width Y: {bp.width_y:.1f} μm")
-            print(f"   Center: ({bp.center_x:.1f}, {bp.center_y:.1f}) pixels")
-            if bp.fit_method == "2d":
-                print(f"   Angle: {bp.angle_deg:.1f}°")
-            print(f"   Peak: {bp.peak_value:.0f}")
-    except KeyboardInterrupt:
-        print("\n\nStopped by user")
+        bp.plot(num_img=args.num_img, heatmap_only=args.heatmap_only)
     except Exception as e:
         print(f"\nERROR: {e}")
         if args.verbose:
-            import traceback
-
             traceback.print_exc()
+    finally:
+        # Ensure camera is properly closed
+        if hasattr(bp, "camera") and bp.camera:
+            try:
+                if bp.camera.is_acquiring:
+                    bp.camera.stop_acquisition()
+                    print("Camera acquisition stopped")
+                bp.camera.close()
+                print("Camera closed")
+            except Exception:
+                pass

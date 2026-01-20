@@ -29,17 +29,31 @@ class TestHarvesterCamera:
         mock_h = Mock()
         mock_harvester_class.return_value = mock_h
 
+        # Mock files attribute for CTI file logging
+        mock_h.files = ["/path/to/test.cti"]
+
         mock_device = Mock()
         mock_device.vendor = "Test Vendor"
         mock_device.model = "Test Model"
         mock_device.serial_number = "12345"
 
-        mock_h.device_info_list = [mock_device]
+        # Make device_info_list a proper list that supports len()
+        device_list = [mock_device]
+        mock_h.device_info_list = device_list
 
         mock_ia = Mock()
         mock_node_map = Mock()
+
+        # Mock dimension attributes (need both max and actual)
+        mock_node_map.WidthMax.value = 1920
+        mock_node_map.HeightMax.value = 1080
         mock_node_map.Width.value = 1920
         mock_node_map.Height.value = 1080
+
+        # Mock offset attributes for ROI reset
+        mock_node_map.OffsetX.value = 0
+        mock_node_map.OffsetY.value = 0
+
         mock_ia.remote_device.node_map = mock_node_map
 
         mock_h.create.return_value = mock_ia
@@ -181,3 +195,87 @@ class TestCameraUtils:
                 assert cameras[0]["vendor"] == "Test Vendor"
                 assert cameras[0]["model"] == "Test Camera"
                 assert cameras[0]["serial_number"] == "12345"
+
+
+class TestHarvesterCameraErrors:
+    """Test HarvesterCamera error handling."""
+
+    @patch("pybeamprofiler.gen_camera.Harvester")
+    def test_camera_open_no_devices(self, mock_harvester_class):
+        """Test camera opening with no devices found."""
+        from pybeamprofiler.gen_camera import HarvesterCamera
+
+        mock_h = Mock()
+        mock_harvester_class.return_value = mock_h
+        mock_h.files = ["/path/to/test.cti"]
+        mock_h.device_info_list = []
+
+        camera = HarvesterCamera()
+
+        try:
+            camera.open()
+            assert False, "Should have raised RuntimeError"
+        except RuntimeError as e:
+            assert "No GenICam cameras found" in str(e)
+
+    @patch("pybeamprofiler.gen_camera.Harvester")
+    def test_camera_open_with_serial_number(self, mock_harvester_class):
+        """Test camera opening with specific serial number."""
+        from pybeamprofiler.gen_camera import HarvesterCamera
+
+        mock_h = Mock()
+        mock_harvester_class.return_value = mock_h
+        mock_h.files = ["/path/to/test.cti"]
+
+        mock_device1 = Mock()
+        mock_device1.vendor = "Test Vendor"
+        mock_device1.model = "Model1"
+        mock_device1.serial_number = "11111"
+
+        mock_device2 = Mock()
+        mock_device2.vendor = "Test Vendor"
+        mock_device2.model = "Model2"
+        mock_device2.serial_number = "22222"
+
+        mock_h.device_info_list = [mock_device1, mock_device2]
+
+        mock_ia = Mock()
+        mock_node_map = Mock()
+        mock_node_map.WidthMax.value = 1920
+        mock_node_map.HeightMax.value = 1080
+        mock_node_map.Width.value = 1920
+        mock_node_map.Height.value = 1080
+        mock_node_map.OffsetX.value = 0
+        mock_node_map.OffsetY.value = 0
+        mock_ia.remote_device.node_map = mock_node_map
+        mock_h.create.return_value = mock_ia
+
+        camera = HarvesterCamera(serial_number="22222")
+        camera.open()
+
+        # Should have selected device2
+        mock_h.create.assert_called_once_with(mock_device2)
+
+    @patch("pybeamprofiler.gen_camera.Harvester")
+    def test_camera_open_serial_not_found(self, mock_harvester_class):
+        """Test camera opening with non-existent serial number."""
+        from pybeamprofiler.gen_camera import HarvesterCamera
+
+        mock_h = Mock()
+        mock_harvester_class.return_value = mock_h
+        mock_h.files = ["/path/to/test.cti"]
+
+        mock_device = Mock()
+        mock_device.vendor = "Test Vendor"
+        mock_device.model = "Test Model"
+        mock_device.serial_number = "11111"
+
+        mock_h.device_info_list = [mock_device]
+
+        camera = HarvesterCamera(serial_number="99999")
+
+        try:
+            camera.open()
+            assert False, "Should have raised RuntimeError"
+        except RuntimeError as e:
+            assert "not found" in str(e)

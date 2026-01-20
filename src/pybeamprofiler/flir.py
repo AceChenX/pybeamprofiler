@@ -64,8 +64,8 @@ class FlirCamera(HarvesterCamera):
             ]
         elif system == "Darwin":
             search_paths = [
-                "/usr/local/lib/FLIR_GenTL.cti",
-                "/Library/Application Support/FLIR/Spinnaker/lib/FLIR_GenTL.cti",
+                "/usr/local/lib/spinnaker-gentl/Spinnaker_GenTL.cti",
+                "/usr/local/lib/spinnaker-gentl/FLIR_GenTL_v140.cti",
             ]
 
         for path in search_paths:
