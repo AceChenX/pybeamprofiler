@@ -27,7 +27,7 @@ class TestGaussianDefinition:
         assert bp.width_y > 0
 
         sigma_x = popt_x[2]
-        expected_width_x = 2 * np.sqrt(2) * sigma_x * bp.pixel_size
+        expected_width_x = 4.0 * sigma_x * bp.pixel_size
         assert abs(bp.width_x - expected_width_x) < 0.1
 
 
@@ -86,7 +86,8 @@ class TestDefinitionComparisons:
         bp_fwhm.analyze(simulated_image)
         bp_d4s.analyze(simulated_image)
 
-        assert bp_d4s.width_x > bp_gaussian.width_x
+        # D4σ and Gaussian should be similar (both ~4σ), FWHM smallest (~2.355σ)
+        assert abs(bp_d4s.width_x - bp_gaussian.width_x) / bp_gaussian.width_x < 0.05
         assert bp_gaussian.width_x > bp_fwhm.width_x
 
         bp_gaussian.camera.close()
@@ -103,9 +104,9 @@ class TestDefinitionComparisons:
         bp_fwhm.analyze(simulated_image)
         bp_d4s.analyze(simulated_image)
 
-        ratio_d4s_gaussian = bp_d4s.width_x / bp_gaussian.width_x
-        expected_ratio = 4.0 / (2 * np.sqrt(2))
-        assert abs(ratio_d4s_gaussian - expected_ratio) < 0.2
+        ratio_gauss_fwhm = bp_gaussian.width_x / bp_fwhm.width_x
+        expected_ratio = 4.0 / 2.355
+        assert abs(ratio_gauss_fwhm - expected_ratio) < 0.2
 
         bp_gaussian.camera.close()
         bp_fwhm.camera.close()
@@ -190,10 +191,10 @@ class TestWidthDefinitions:
         assert bp.width_x > 0
         assert bp.width_y > 0
 
-        # For gaussian definition, width should be 2*sqrt(2)*sigma
+        # For gaussian definition, width should be 4*sigma (1/e²)
         # Verify the relationship
         sigma_x = popt_x[2]
-        expected_width_x = 2 * np.sqrt(2) * sigma_x * bp.pixel_size
+        expected_width_x = 4.0 * sigma_x * bp.pixel_size
         assert abs(bp.width_x - expected_width_x) < 0.1
 
         bp.camera.close()
@@ -238,17 +239,20 @@ class TestWidthDefinitions:
         bp_fwhm.analyze(img)
         bp_d4s.analyze(img)
 
-        # D4σ should be largest, gaussian intermediate, FWHM smallest
+        # D4σ and Gaussian should be similar (both ~4σ), FWHM smallest (~2.355σ)
         # D4σ = 4σ ≈ 4.0
-        # Gaussian = 2√2σ ≈ 2.83
+        # Gaussian = 4σ ≈ 4.0 (1/e²)
         # FWHM = 2.355σ ≈ 2.355
-        assert bp_d4s.width_x > bp_gaussian.width_x
+
+        # D4σ and Gaussian should be close (within 5%)
+        assert abs(bp_d4s.width_x - bp_gaussian.width_x) / bp_gaussian.width_x < 0.05
+        # Gaussian should be significantly larger than FWHM
         assert bp_gaussian.width_x > bp_fwhm.width_x
 
-        # Check approximate ratios
-        ratio_d4s_fwhm = bp_d4s.width_x / bp_fwhm.width_x
+        # Check approximate ratios (Gaussian vs FWHM)
+        ratio_gauss_fwhm = bp_gaussian.width_x / bp_fwhm.width_x
         expected_ratio = 4.0 / 2.355  # ≈ 1.7
-        assert abs(ratio_d4s_fwhm - expected_ratio) < 0.2
+        assert abs(ratio_gauss_fwhm - expected_ratio) < 0.2
 
         bp_gaussian.camera.close()
         bp_fwhm.camera.close()

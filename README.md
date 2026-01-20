@@ -387,4 +387,4 @@ Contributions welcome! Please:
 - Built on [Harvesters](https://github.com/genicam/harvesters) for GenICam camera interface
 - Uses [Plotly/Dash](https://plotly.com/dash/) for interactive visualization
 - Inspired by various beam profiling tools: LaseView (old freeware version), [ptomato/Beams](https://github.com/ptomato/Beams), [jordens/bullseye](https://github.com/jordens/bullseye)
-- FLIR and Basler cameras loaned from [Atom Computing](https://atom-computing.com/) for testing.
+- FLIR and Basler cameras loaned from [Atom Computing](https://atom-computing.com/) for testing

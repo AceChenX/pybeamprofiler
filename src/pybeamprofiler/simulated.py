@@ -1,6 +1,7 @@
 """Simulated camera for testing and demonstration."""
 
 import logging
+import os
 import time
 
 import numpy as np
@@ -62,12 +63,8 @@ class SimulatedCamera(Camera):
         Returns:
             2D numpy array of uint8 intensity values
         """
-        """Generate simulated beam image with random fluctuations.
-
-        Returns:
-            2D numpy array of uint8 intensity values
-        """
-        time.sleep(self.exposure_time if self.exposure_time < 0.1 else 0.1)
+        if "PYTEST_CURRENT_TEST" not in os.environ:
+            time.sleep(self.exposure_time if self.exposure_time < 0.1 else 0.1)
         cx = self._center_x + np.random.normal(0, 3)
         cy = self._center_y + np.random.normal(0, 3)
         sx = self._sigma_x + np.random.normal(0, 2)

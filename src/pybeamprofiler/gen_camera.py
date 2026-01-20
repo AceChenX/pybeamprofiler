@@ -163,7 +163,7 @@ class HarvesterCamera(Camera):
                 if hasattr(self.node_map, "SensorPixelWidth"):
                     pixel_size = self.node_map.SensorPixelWidth.value
                     logger.debug("Using SensorPixelWidth for pixel size")
-            except Exception:
+            except (AttributeError, ValueError, TypeError):
                 pass
 
             if pixel_size is None:
@@ -171,7 +171,7 @@ class HarvesterCamera(Camera):
                     if hasattr(self.node_map, "SensorPixelHeight"):
                         pixel_size = self.node_map.SensorPixelHeight.value
                         logger.debug("Using SensorPixelHeight for pixel size")
-                except Exception:
+                except (AttributeError, ValueError, TypeError):
                     pass
 
             # Some cameras may have PixelSize (but verify it's numeric, not a string)
@@ -183,7 +183,7 @@ class HarvesterCamera(Camera):
                         if isinstance(val, (int, float)):
                             pixel_size = val
                             logger.debug("Using PixelSize for pixel size")
-                except Exception:
+                except (AttributeError, ValueError, TypeError):
                     pass
 
             # Try to detect from sensor model (common Sony sensors)
@@ -434,10 +434,10 @@ class HarvesterCamera(Camera):
         if self.node_map:
             try:
                 self.node_map.ExposureTime.value = exposure_time * 1_000_000
-            except Exception:
+            except (AttributeError, ValueError, TypeError):
                 try:
                     self.node_map.ExposureTimeAbs.value = exposure_time * 1_000_000
-                except Exception:
+                except (AttributeError, ValueError, TypeError):
                     logger.error("Could not set exposure time.")
         self.exposure_time = exposure_time
 
@@ -450,10 +450,10 @@ class HarvesterCamera(Camera):
         if self.node_map:
             try:
                 self.node_map.Gain.value = gain
-            except Exception:
+            except (AttributeError, ValueError, TypeError):
                 try:
                     self.node_map.GainRaw.value = int(gain)
-                except Exception:
+                except (AttributeError, ValueError, TypeError):
                     logger.error("Could not set gain.")
         self.gain = gain
 
