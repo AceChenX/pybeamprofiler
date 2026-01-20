@@ -4,6 +4,8 @@ import argparse
 import logging
 import os
 import threading
+import time
+import traceback
 import webbrowser
 
 import numpy as np
@@ -103,10 +105,11 @@ class BeamProfiler:
             # Set exposure time if provided
             if exposure_time is not None:
                 self.camera.set_exposure(exposure_time)
-        elif file:
-            # For static files, set dimensions from loaded image
-            self.width_pixels = self.last_img.shape[1]
-            self.height_pixels = self.last_img.shape[0]
+        elif file and self.last_img is not None:
+            # For static files, dimensions already set in _load_file
+            pass
+        else:
+            raise ValueError("Either camera or file must be provided and successfully loaded")
 
     def _initialize_camera(self, camera: str) -> None:
         """Initialize camera hardware.
@@ -154,6 +157,19 @@ class BeamProfiler:
         self.width_pixels = self.last_img.shape[1]
         self.height_pixels = self.last_img.shape[0]
         self.pixel_size = 1.0
+
+    def __enter__(self):
+        """Context manager entry."""
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Context manager exit - ensure camera is closed."""
+        if self.camera:
+            try:
+                self.camera.close()
+            except Exception as e:
+                logger.warning(f"Error closing camera: {e}")
+        return False
 
     def __getattr__(self, name: str):
         """Proxy camera attributes."""
@@ -418,9 +434,21 @@ class BeamProfiler:
 
         Returns:
             tuple of (x_fit_params, y_fit_params) for 1D projections
+
+        Raises:
+            ValueError: If image is None or not 2D
         """
         if image is None:
-            return None, None
+            raise ValueError("Image cannot be None")
+
+        if not isinstance(image, np.ndarray):
+            raise TypeError(f"Image must be numpy array, got {type(image)}")
+
+        if image.ndim != 2:
+            raise ValueError(f"Image must be 2D, got {image.ndim}D array")
+
+        if image.size == 0:
+            raise ValueError("Image cannot be empty")
 
         self.peak_value = float(np.max(image))
 
@@ -720,7 +748,6 @@ class BeamProfiler:
 
     def _plot_stream(self) -> None:
         """Start continuous streaming with live updates."""
-        import time
 
         # Ensure camera is ready for continuous acquisition
         if self._mode == "camera":
@@ -1109,8 +1136,6 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"\nERROR: {e}")
         if args.verbose:
-            import traceback
-
             traceback.print_exc()
     finally:
         # Ensure camera is properly closed

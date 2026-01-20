@@ -5,6 +5,8 @@ from .flir import FlirCamera
 from .simulated import SimulatedCamera
 from .utils import find_cti_files, list_cameras, print_camera_info
 
+__version__ = "0.0.1"
+
 __all__ = [
     "Camera",
     "SimulatedCamera",
@@ -14,4 +16,5 @@ __all__ = [
     "list_cameras",
     "print_camera_info",
     "find_cti_files",
+    "__version__",
 ]

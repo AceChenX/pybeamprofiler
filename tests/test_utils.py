@@ -10,14 +10,14 @@ class TestFindCtiFiles:
 
     @patch("pybeamprofiler.utils.platform.system")
     @patch("pybeamprofiler.utils.os.path.exists")
-    @patch("pybeamprofiler.utils.os.walk")
-    def test_find_cti_windows(self, mock_walk, mock_exists, mock_system):
+    @patch("pybeamprofiler.utils.os.path.realpath")
+    @patch("pybeamprofiler.utils.os.listdir")
+    def test_find_cti_windows(self, mock_listdir, mock_realpath, mock_exists, mock_system):
         """Test CTI file finding on Windows."""
         mock_system.return_value = "Windows"
         mock_exists.return_value = True
-        mock_walk.return_value = [
-            (r"C:\Program Files\FLIR Systems\Spinnaker\cti64", [], ["FLIR_GenTL.cti"])
-        ]
+        mock_realpath.side_effect = lambda x: x  # Return path as-is
+        mock_listdir.return_value = ["FLIR_GenTL.cti", "other_file.txt"]
 
         cti_files = utils.find_cti_files()
 
@@ -26,12 +26,14 @@ class TestFindCtiFiles:
 
     @patch("pybeamprofiler.utils.platform.system")
     @patch("pybeamprofiler.utils.os.path.exists")
-    @patch("pybeamprofiler.utils.os.walk")
-    def test_find_cti_linux(self, mock_walk, mock_exists, mock_system):
+    @patch("pybeamprofiler.utils.os.path.realpath")
+    @patch("pybeamprofiler.utils.os.listdir")
+    def test_find_cti_linux(self, mock_listdir, mock_realpath, mock_exists, mock_system):
         """Test CTI file finding on Linux."""
         mock_system.return_value = "Linux"
         mock_exists.return_value = True
-        mock_walk.return_value = [("/opt/spinnaker/lib/flir-gentl", [], ["FLIR_GenTL_v140.cti"])]
+        mock_realpath.side_effect = lambda x: x  # Return path as-is
+        mock_listdir.return_value = ["FLIR_GenTL_v140.cti"]
 
         cti_files = utils.find_cti_files()
 
@@ -40,12 +42,14 @@ class TestFindCtiFiles:
 
     @patch("pybeamprofiler.utils.platform.system")
     @patch("pybeamprofiler.utils.os.path.exists")
-    @patch("pybeamprofiler.utils.os.walk")
-    def test_find_cti_macos(self, mock_walk, mock_exists, mock_system):
+    @patch("pybeamprofiler.utils.os.path.realpath")
+    @patch("pybeamprofiler.utils.os.listdir")
+    def test_find_cti_macos(self, mock_listdir, mock_realpath, mock_exists, mock_system):
         """Test CTI file finding on macOS."""
         mock_system.return_value = "Darwin"
         mock_exists.return_value = True
-        mock_walk.return_value = [("/usr/local/lib", [], ["FLIR_GenTL.cti", "ProducerGEV.cti"])]
+        mock_realpath.side_effect = lambda x: x  # Return path as-is
+        mock_listdir.return_value = ["FLIR_GenTL.cti", "ProducerGEV.cti"]
 
         cti_files = utils.find_cti_files()
 
@@ -220,6 +224,6 @@ class TestPrintCameraInfo:
 
         # Check that both cameras are printed
         calls = [str(call) for call in mock_print.call_args_list]
-        assert any("Found 2 cameras" in str(call) for call in calls)
+        assert any("Found 2 camera" in str(call) for call in calls)  # Matches "camera(s)"
         assert any("FLIR" in str(call) for call in calls)
         assert any("Basler" in str(call) for call in calls)

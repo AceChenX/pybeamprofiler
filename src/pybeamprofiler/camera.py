@@ -1,10 +1,14 @@
 """Base camera interface for beam profiler."""
 
+import logging
+import math
 from abc import ABC, abstractmethod
 
 import ipywidgets as widgets
 import numpy as np
 from IPython.display import display
+
+logger = logging.getLogger(__name__)
 
 
 class Camera(ABC):
@@ -83,8 +87,6 @@ class Camera(ABC):
         gain_min, gain_max = 0.0, 24.0
         if hasattr(self, "gain_range"):
             gain_min, gain_max = self.gain_range
-
-        import math
 
         exp_min_log = math.floor(math.log10(exposure_min))
         exp_max_log = math.ceil(math.log10(exposure_max))
@@ -191,14 +193,14 @@ class Camera(ABC):
                 if hasattr(self.node_map, "SensorDescription"):
                     desc = self.node_map.SensorDescription.value
                     camera_info.append(widgets.HTML(f"<b>Sensor:</b> {desc}"))
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"Optional feature SensorDescription not available: {e}")
             try:
                 if hasattr(self.node_map, "DeviceModelName"):
                     model = self.node_map.DeviceModelName.value
                     camera_info.append(widgets.HTML(f"<b>Model:</b> {model}"))
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"Optional feature DeviceModelName not available: {e}")
 
         camera_info_box = widgets.VBox(camera_info)
 
@@ -449,8 +451,8 @@ class Camera(ABC):
                             checkbox = self._create_checkbox(node, feature_name, current_val)
                             if checkbox:
                                 controls.append(checkbox)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.debug(f"Could not create checkbox for {feature_name}: {e}")
 
                 # Numeric features (sliders)
                 elif hasattr(node, "min") and hasattr(node, "max"):
@@ -458,8 +460,8 @@ class Camera(ABC):
                         slider_box = self._create_slider(node, feature_name, style)
                         if slider_box:
                             controls.append(slider_box)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.debug(f"Could not create slider for {feature_name}: {e}")
 
                 # Enum features (dropdowns)
                 else:
@@ -467,8 +469,8 @@ class Camera(ABC):
                         dropdown = self._create_enum_dropdown(node, feature_name, style)
                         if dropdown:
                             controls.append(dropdown)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.debug(f"Could not create dropdown for {feature_name}: {e}")
 
             except Exception:
                 pass
@@ -623,8 +625,10 @@ class Camera(ABC):
                                         elif value.lower() in ["off", "false", "0", "no"]:
                                             value = False
                                         # else keep as string (might be enum like 'Once', 'Continuous')
-                                except Exception:
-                                    pass
+                                except Exception as e:
+                                    logger.debug(
+                                        f"Could not check boolean type for {param_name}: {e}"
+                                    )
 
                         node.value = value
                         print(f"Set {param_name} = {value}")

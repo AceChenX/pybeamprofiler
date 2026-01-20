@@ -1,5 +1,7 @@
 """Tests for BeamProfiler properties, attributes, and integration."""
 
+import pytest
+
 from pybeamprofiler import BeamProfiler
 
 
@@ -276,10 +278,83 @@ class TestBeamProfilerMethods:
         assert hasattr(bp, "gain")
 
         # Test that non-existent attributes raise AttributeError
-        try:
+        with pytest.raises(AttributeError):
             _ = bp.nonexistent_attribute
-            assert False, "Should have raised AttributeError"
-        except AttributeError:
-            pass
 
+        bp.camera.close()
+
+
+class TestBeamProfilerContextManager:
+    """Test context manager support."""
+
+    def test_context_manager_basic(self):
+        """Test basic context manager usage."""
+        with BeamProfiler(camera="simulated") as bp:
+            assert bp.camera is not None
+            bp.camera.start_acquisition()
+            img = bp.camera.get_image()
+            bp.camera.stop_acquisition()
+            bp.analyze(img)
+            assert bp.width > 0
+        # Camera should be closed after exiting context
+
+    def test_context_manager_with_exception(self):
+        """Test context manager properly closes camera on exception."""
+        try:
+            with BeamProfiler(camera="simulated") as bp:
+                assert bp.camera is not None
+                raise ValueError("Test exception")
+        except ValueError:
+            pass  # Expected
+        # Camera should still be closed
+
+    def test_context_manager_with_file(self, test_image_file):
+        """Test context manager with static file (no camera to close)."""
+        with BeamProfiler(file=test_image_file) as bp:
+            assert bp.last_img is not None
+            bp.analyze(bp.last_img)
+        # Should exit cleanly even though camera is None
+
+
+class TestBeamProfilerInputValidation:
+    """Test input validation for analyze method."""
+
+    def test_analyze_none_image(self):
+        """Test analyze raises error on None input."""
+        bp = BeamProfiler(camera="simulated")
+        with pytest.raises(ValueError, match="Image cannot be None"):
+            bp.analyze(None)
+        bp.camera.close()
+
+    def test_analyze_wrong_type(self):
+        """Test analyze raises error on wrong type."""
+        bp = BeamProfiler(camera="simulated")
+        with pytest.raises(TypeError, match="Image must be numpy array"):
+            bp.analyze([1, 2, 3])
+        bp.camera.close()
+
+    def test_analyze_wrong_dimensions(self):
+        """Test analyze raises error on wrong dimensions."""
+        import numpy as np
+
+        bp = BeamProfiler(camera="simulated")
+
+        # Test 1D array
+        with pytest.raises(ValueError, match="Image must be 2D"):
+            bp.analyze(np.array([1, 2, 3]))
+
+        # Test 3D array
+        with pytest.raises(ValueError, match="Image must be 2D"):
+            bp.analyze(np.zeros((10, 10, 3)))
+
+        bp.camera.close()
+
+    def test_analyze_empty_image(self):
+        """Test analyze raises error on empty image."""
+        import numpy as np
+
+        bp = BeamProfiler(camera="simulated")
+        with pytest.raises(ValueError, match="Image cannot be empty"):
+            bp.analyze(np.array([[]]))
+        bp.camera.close()
         bp.camera.close()
