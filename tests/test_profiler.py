@@ -63,7 +63,7 @@ class TestBeamProfilerStaticImages:
 
     def test_load_from_file(self, test_image_file):
         """Test loading image from file."""
-        bp = BeamProfiler(file=test_image_file)
+        bp = BeamProfiler(file=test_image_file, pixel_size=1.0)
 
         assert bp.last_img is not None
         assert bp.last_img.shape == (500, 500)
@@ -71,7 +71,7 @@ class TestBeamProfilerStaticImages:
 
     def test_analyze_static_image(self, test_image_file):
         """Test analyzing static image file."""
-        bp = BeamProfiler(file=test_image_file)
+        bp = BeamProfiler(file=test_image_file, pixel_size=1.0)
         bp.fit_method = "1d"
         bp.definition = "gaussian"
 
@@ -104,7 +104,7 @@ class TestBeamProfilerInitialization:
 
     def test_initialization_with_file(self, test_image_file):
         """Test initialization with file."""
-        bp = BeamProfiler(file=test_image_file)
+        bp = BeamProfiler(file=test_image_file, pixel_size=1.0)
         assert bp.last_img is not None
         assert bp._mode == "static"
 
@@ -168,7 +168,7 @@ class TestBeamProfilerDimensions:
 
     def test_file_dimensions(self, test_image_file):
         """Test dimensions from loaded file."""
-        bp = BeamProfiler(file=test_image_file)
+        bp = BeamProfiler(file=test_image_file, pixel_size=1.0)
 
         assert bp.width_pixels == 500
         assert bp.height_pixels == 500
@@ -310,7 +310,7 @@ class TestBeamProfilerContextManager:
 
     def test_context_manager_with_file(self, test_image_file):
         """Test context manager with static file (no camera to close)."""
-        with BeamProfiler(file=test_image_file) as bp:
+        with BeamProfiler(file=test_image_file, pixel_size=1.0) as bp:
             assert bp.last_img is not None
             bp.analyze(bp.last_img)
         # Should exit cleanly even though camera is None
