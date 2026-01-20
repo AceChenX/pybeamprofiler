@@ -49,6 +49,7 @@ class BeamProfiler:
         fit: Fitting method ('1d', '2d', 'linecut')
         definition: Width definition ('gaussian' for 1/e², 'fwhm', 'd4s')
         exposure_time: Camera exposure time in seconds (default: camera default)
+        pixel_size: Pixel size in micrometers
 
     Attributes:
         width_x: Beam width in x direction (μm)
@@ -66,6 +67,7 @@ class BeamProfiler:
         fit: str = "1d",
         definition: str = "gaussian",
         exposure_time: float | None = None,
+        pixel_size: float | None = None,
     ):
         """Initialize the beam profiler."""
         self.camera: Camera | None = None
@@ -90,7 +92,8 @@ class BeamProfiler:
         if file:
             self._load_file(file)
             self._mode = "static"
-            self.pixel_size = 1.0
+            assert pixel_size is not None, "Pixel size must be provided for static beam image files"
+            self.pixel_size = pixel_size
         elif camera:
             self._initialize_camera(camera)
         else:
@@ -157,10 +160,6 @@ class BeamProfiler:
                 self.last_img = np.array(img)
                 self.width_pixels = self.last_img.shape[1]
                 self.height_pixels = self.last_img.shape[0]
-                self.pixel_size = 1.0  # Assume 1 μm/pixel for static images
-        except FileNotFoundError:
-            logger.error(f"Image file not found: {filename}")
-            raise
         except Exception as e:
             logger.error(f"Error loading image file {filename}: {e}")
             raise
