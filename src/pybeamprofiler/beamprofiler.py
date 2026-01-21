@@ -69,7 +69,13 @@ class BeamProfiler:
         exposure_time: float | None = None,
         pixel_size: float | None = None,
     ):
-        """Initialize the beam profiler."""
+        """Initialize the beam profiler.
+
+        Raises:
+            ValueError: If neither camera nor file is provided or successfully loaded
+            RuntimeError: If physical camera (FLIR/Basler) fails to open
+            AssertionError: If pixel_size not provided for static image files
+        """
         self.camera: Camera | None = None
         self.fit_method = fit
         self.definition = definition
@@ -392,7 +398,10 @@ class BeamProfiler:
 
         try:
             x = np.arange(n)
-            popt, _ = curve_fit(BeamProfiler.gaussian, x, profile, p0=p0, maxfev=100)
+            # Bounds constrain parameters for faster convergence:
+            # amplitude > 0, center in [0, n], sigma in [0.1, n], offset unbounded
+            bounds = ([0, 0, 0.1, -np.inf], [np.inf, n, n, np.inf])
+            popt, _ = curve_fit(BeamProfiler.gaussian, x, profile, p0=p0, bounds=bounds, maxfev=100)
             return popt
         except (RuntimeError, ValueError) as e:
             logger.warning(f"1D fit failed: {e}, using initial guess")
@@ -419,12 +428,16 @@ class BeamProfiler:
         try:
             x, y = np.arange(w), np.arange(h)
             xv, yv = np.meshgrid(x, y)
+            # Bounds constrain parameters for faster convergence:
+            # amplitude > 0, centers in image, sigmas > 0.1, theta in [-π, π]
+            bounds = ([0, 0, 0, 0.1, 0.1, -np.pi, -np.inf], [np.inf, w, h, w, h, np.pi, np.inf])
             popt, _ = curve_fit(
                 BeamProfiler.gaussian_2d,
                 (xv.ravel(), yv.ravel()),
                 image.ravel(),
                 p0=p0,
-                maxfev=200,
+                bounds=bounds,
+                maxfev=100,
             )
             self._last_popt_2d = popt
             return popt
@@ -558,11 +571,9 @@ class BeamProfiler:
     ) -> None:
         """Display beam profile with Gaussian fitting visualization.
 
-        Set exposure time using bp.setting(exposure_time=...) or bp.exposure_time before calling plot().
-
         Args:
             num_img: Number of images (1 for single shot, None for continuous streaming)
-            heatmap_only: Show only heatmap for faster rendering (~8-12 Hz in Jupyter)
+            heatmap_only: Show only heatmap for faster rendering
         """
 
         self._heatmap_only = heatmap_only  # Store for _plot_stream to use
@@ -838,10 +849,10 @@ class BeamProfiler:
 
             # Use clear_output for live updates
             if heatmap_only:
-                print("Starting live stream (heatmap only, ~25-30 Hz)...")
+                logger.info("Starting live stream (heatmap only, ~25-30 Hz)...")
             else:
-                print("Starting live stream (~6-10 Hz)...")
-            print("Press Jupyter's interrupt button (■) to stop\n")
+                logger.info("Starting live stream (~6-10 Hz)...")
+            logger.info("Press Jupyter's interrupt button (■) to stop\n")
 
             frame_count = 0
             start_time = time.time()
@@ -879,7 +890,9 @@ class BeamProfiler:
             except KeyboardInterrupt:
                 elapsed = time.time() - start_time
                 fps = frame_count / elapsed if elapsed > 0 else 0
-                print(f"\nStream stopped: {frame_count} frames in {elapsed:.1f}s ({fps:.1f} fps)")
+                logger.info(
+                    f"\nStream stopped: {frame_count} frames in {elapsed:.1f}s ({fps:.1f} fps)"
+                )
 
         except (NameError, ImportError):
             # Running from command line - use Dash
@@ -888,8 +901,8 @@ class BeamProfiler:
                 from dash import dcc, html
                 from dash.dependencies import Input, Output
             except ImportError:
-                print("\nDash not available. Using matplotlib fallback.")
-                print("Install dash for better performance: pip install dash\n")
+                logger.info("\nDash not available. Using matplotlib fallback.")
+                logger.info("Install dash for better performance: pip install dash\n")
 
                 # Matplotlib fallback
                 try:
@@ -974,17 +987,17 @@ class BeamProfiler:
                             family="monospace",
                         )
 
-                    print("Starting matplotlib animation (press Ctrl+C to stop)...")
+                    logger.info("Starting matplotlib animation (press Ctrl+C to stop)...")
                     _anim = FuncAnimation(
                         fig_plt, update_frame, interval=50, cache_frame_data=False
                     )
                     plt.show()
 
                 except ImportError:
-                    print("ERROR: Neither dash nor matplotlib is installed.")
-                    print("   Install one of them:")
-                    print("   - pip install dash (recommended for streaming)")
-                    print("   - pip install matplotlib")
+                    logger.error("ERROR: Neither dash nor matplotlib is installed.")
+                    logger.error("   Install one of them:")
+                    logger.error("   - pip install dash (recommended for streaming)")
+                    logger.error("   - pip install matplotlib")
                     return
 
                 return
@@ -1067,9 +1080,9 @@ class BeamProfiler:
 
                 return fig
 
-            print("Starting Dash server at http://127.0.0.1:8050")
-            print("Opening browser automatically...")
-            print("Press Ctrl+C to stop\n")
+            logger.info("Starting Dash server at http://127.0.0.1:8050")
+            logger.info("Opening browser automatically...")
+            logger.info("Press Ctrl+C to stop\n")
 
             # Suppress Flask/Werkzeug logs for cleaner output
             logging.getLogger("werkzeug").setLevel(logging.ERROR)
@@ -1086,7 +1099,7 @@ class BeamProfiler:
             try:
                 app.run(debug=False, port=8050)
             except KeyboardInterrupt:
-                print("\n\nStopping Dash server...")
+                logger.info("\n\nStopping Dash server...")
                 shutdown_flag["stop"] = True
 
 
@@ -1180,9 +1193,9 @@ if __name__ == "__main__":
         logging.basicConfig(level=logging.WARNING)
 
     # Create BeamProfiler instance
-    print("Initializing pyBeamprofiler...")
-    print(f"   Camera: {args.file if args.file else args.camera}")
-    print(f"   Fitting: {args.fit} ({args.definition})")
+    logger.info("Initializing pyBeamprofiler...")
+    logger.info(f"   Camera: {args.file if args.file else args.camera}")
+    logger.info(f"   Fitting: {args.fit} ({args.definition})")
 
     bp = BeamProfiler(
         camera=None if args.file else args.camera,
@@ -1192,22 +1205,20 @@ if __name__ == "__main__":
         exposure_time=args.exposure_time,
     )
 
-    print(f"   Sensor: {bp.width_pixels}×{bp.height_pixels} pixels")
-    print(f"   Pixel size: {bp.pixel_size:.2f} μm")
-    print()
+    logger.info(f"   Sensor: {bp.width_pixels}×{bp.height_pixels} pixels")
+    logger.info(f"   Pixel size: {bp.pixel_size:.2f} μm")
 
     # Start acquisition
     if args.num_img == 1:
-        print("Single shot acquisition...")
+        logger.info("Single shot acquisition...")
     else:
-        print("Starting continuous streaming...")
-        print("   Press Ctrl+C to stop")
-    print()
+        logger.info("Starting continuous streaming...")
+        logger.info("   Press Ctrl+C to stop")
 
     try:
         bp.plot(num_img=args.num_img, heatmap_only=args.heatmap_only)
     except Exception as e:
-        print(f"\nERROR: {e}")
+        logger.error(f"\nERROR: {e}")
         if args.verbose:
             traceback.print_exc()
     finally:
@@ -1216,8 +1227,8 @@ if __name__ == "__main__":
             try:
                 if bp.camera.is_acquiring:
                     bp.camera.stop_acquisition()
-                    print("Camera acquisition stopped")
+                    logger.info("Camera acquisition stopped")
                 bp.camera.close()
-                print("Camera closed")
+                logger.info("Camera closed")
             except Exception:
                 pass

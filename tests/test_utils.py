@@ -165,21 +165,21 @@ class TestPrintCameraInfo:
     """Test camera info printing."""
 
     @patch("pybeamprofiler.utils.list_cameras")
-    @patch("builtins.print")
-    def test_print_camera_info_no_cameras(self, mock_print, mock_list):
+    @patch("pybeamprofiler.utils.logger.info")
+    def test_print_camera_info_no_cameras(self, mock_logger, mock_list):
         """Test printing when no cameras found."""
         mock_list.return_value = []
 
         utils.print_camera_info()
 
-        # Check that helpful message is printed
-        calls = [str(call) for call in mock_print.call_args_list]
+        # Check that helpful message is logged
+        calls = [str(call) for call in mock_logger.call_args_list]
         assert any("No cameras found" in str(call) for call in calls)
         assert any("Camera is connected" in str(call) for call in calls)
 
     @patch("pybeamprofiler.utils.list_cameras")
-    @patch("builtins.print")
-    def test_print_camera_info_single_camera(self, mock_print, mock_list):
+    @patch("pybeamprofiler.utils.logger.info")
+    def test_print_camera_info_single_camera(self, mock_logger, mock_list):
         """Test printing info for single camera."""
         mock_list.return_value = [
             {
@@ -193,15 +193,15 @@ class TestPrintCameraInfo:
 
         utils.print_camera_info()
 
-        # Check that camera info is printed
-        calls = [str(call) for call in mock_print.call_args_list]
+        # Check that camera info is logged
+        calls = [str(call) for call in mock_logger.call_args_list]
         assert any("Found 1 camera" in str(call) for call in calls)
         assert any("FLIR" in str(call) for call in calls)
         assert any("BFS-U3-123S6M" in str(call) for call in calls)
 
     @patch("pybeamprofiler.utils.list_cameras")
-    @patch("builtins.print")
-    def test_print_camera_info_multiple_cameras(self, mock_print, mock_list):
+    @patch("pybeamprofiler.utils.logger.info")
+    def test_print_camera_info_multiple_cameras(self, mock_logger, mock_list):
         """Test printing info for multiple cameras."""
         mock_list.return_value = [
             {
@@ -222,8 +222,8 @@ class TestPrintCameraInfo:
 
         utils.print_camera_info("/path/to/test.cti")
 
-        # Check that both cameras are printed
-        calls = [str(call) for call in mock_print.call_args_list]
+        # Check that both cameras are logged
+        calls = [str(call) for call in mock_logger.call_args_list]
         assert any("Found 2 camera" in str(call) for call in calls)  # Matches "camera(s)"
         assert any("FLIR" in str(call) for call in calls)
         assert any("Basler" in str(call) for call in calls)

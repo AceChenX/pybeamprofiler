@@ -135,17 +135,17 @@ def print_camera_info(cti_file: str | None = None) -> None:
     cameras = list_cameras(cti_file)
 
     if not cameras:
-        print("No cameras found.")
-        print("\nMake sure:")
-        print("  1. Camera is connected")
-        print("  2. GenTL producer (.cti) is installed:")
-        print("     - FLIR: Spinnaker SDK")
-        print("     - Basler: Pylon SDK")
+        logger.info("No cameras found.")
+        logger.info("\nMake sure:")
+        logger.info("  1. Camera is connected")
+        logger.info("  2. GenTL producer (.cti) is installed:")
+        logger.info("     - FLIR: Spinnaker SDK")
+        logger.info("     - Basler: Pylon SDK")
         return
 
-    print(f"Found {len(cameras)} camera(s):\n")
+    logger.info(f"Found {len(cameras)} camera(s):\n")
     for cam in cameras:
-        print(f"[{cam['index']}] {cam['vendor']} {cam['model']}")
-        print(f"    Serial Number: {cam['serial_number']}")
-        print(f"    Device ID: {cam['id']}")
-        print()
+        logger.info(f"[{cam['index']}] {cam['vendor']} {cam['model']}")
+        logger.info(f"    Serial Number: {cam['serial_number']}")
+        logger.info(f"    Device ID: {cam['id']}")
+        logger.info("")
