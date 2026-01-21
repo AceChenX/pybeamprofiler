@@ -573,7 +573,7 @@ class BeamProfiler:
 
         Args:
             num_img: Number of images (1 for single shot, None for continuous streaming)
-            heatmap_only: Show only heatmap for faster rendering (~30 Hz vs ~23 Hz full plot)
+            heatmap_only: Show only heatmap for faster rendering
         """
 
         self._heatmap_only = heatmap_only  # Store for _plot_stream to use
@@ -994,10 +994,10 @@ class BeamProfiler:
                     plt.show()
 
                 except ImportError:
-                    logger.info("ERROR: Neither dash nor matplotlib is installed.")
-                    logger.info("   Install one of them:")
-                    logger.info("   - pip install dash (recommended for streaming)")
-                    logger.info("   - pip install matplotlib")
+                    logger.error("ERROR: Neither dash nor matplotlib is installed.")
+                    logger.error("   Install one of them:")
+                    logger.error("   - pip install dash (recommended for streaming)")
+                    logger.error("   - pip install matplotlib")
                     return
 
                 return
@@ -1218,7 +1218,7 @@ if __name__ == "__main__":
     try:
         bp.plot(num_img=args.num_img, heatmap_only=args.heatmap_only)
     except Exception as e:
-        logger.info(f"\nERROR: {e}")
+        logger.error(f"\nERROR: {e}")
         if args.verbose:
             traceback.print_exc()
     finally:
