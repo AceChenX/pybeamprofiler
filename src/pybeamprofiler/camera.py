@@ -187,7 +187,7 @@ class Camera(ABC):
         camera_info.append(widgets.HTML(f"<b>Sensor Size:</b> {self.width}×{self.height} pixels"))
         camera_info.append(widgets.HTML(f"<b>Pixel Size:</b> {self.pixel_size:.2f} μm"))
 
-        # Add sensor description for GenICam cameras
+        # Add sensor description
         if hasattr(self, "node_map") and self.node_map:
             try:
                 if hasattr(self.node_map, "SensorDescription"):
@@ -204,7 +204,7 @@ class Camera(ABC):
 
         camera_info_box = widgets.VBox(camera_info)
 
-        # ROI controls (for GenICam cameras)
+        # ROI controls
         roi_controls = None
         if hasattr(self, "roi_info") and hasattr(self, "set_roi"):
             roi = self.roi_info
@@ -242,7 +242,7 @@ class Camera(ABC):
                         f"<b>Sensor Size:</b> {updated_roi['width']}×{updated_roi['height']} pixels"
                     )
                 except Exception as e:
-                    print(f"Error setting ROI: {e}")
+                    logger.error(f"Error setting ROI: {e}")
 
             def on_roi_reset(b):
                 try:
@@ -258,7 +258,7 @@ class Camera(ABC):
                         f"<b>Sensor Size:</b> {roi_max['max_width']}×{roi_max['max_height']} pixels"
                     )
                 except Exception as e:
-                    print(f"Error resetting ROI: {e}")
+                    logger.error(f"Error resetting ROI: {e}")
 
             roi_button.on_click(on_roi_apply)
             roi_reset_button.on_click(on_roi_reset)
@@ -485,7 +485,7 @@ class Camera(ABC):
             try:
                 node.value = change["new"]
             except Exception as e:
-                print(f"Error setting {feature_name}: {e}")
+                logger.error(f"Error setting {feature_name}: {e}")
 
         checkbox.observe(on_change, names="value")
         return checkbox
@@ -529,7 +529,7 @@ class Camera(ABC):
                     node.value = change["new"]
                     input_widget.value = change["new"]
                 except Exception as e:
-                    print(f"Error setting {feature_name}: {e}")
+                    logger.error(f"Error setting {feature_name}: {e}")
 
             def on_input_change(change):
                 slider.value = change["new"]
@@ -572,7 +572,7 @@ class Camera(ABC):
                 try:
                     node.value = change["new"]
                 except Exception as e:
-                    print(f"Error setting {feature_name}: {e}")
+                    logger.error(f"Error setting {feature_name}: {e}")
 
             dropdown.observe(on_change, names="value")
             return dropdown
@@ -593,17 +593,17 @@ class Camera(ABC):
             if param_name == "exposure_time" or param_name == "ExposureTime":
                 try:
                     self.set_exposure(value)
-                    print(f"Set exposure_time = {value}")
+                    logger.info(f"Set exposure_time = {value}")
                 except Exception as e:
-                    print(f"Error setting exposure_time: {e}")
+                    logger.error(f"Error setting exposure_time: {e}")
                 continue
 
             if param_name == "gain" or param_name == "Gain":
                 try:
                     self.set_gain(value)
-                    print(f"Set gain = {value}")
+                    logger.info(f"Set gain = {value}")
                 except Exception as e:
-                    print(f"Error setting gain: {e}")
+                    logger.error(f"Error setting gain: {e}")
                 continue
 
             # Handle GenICam node_map features
@@ -631,10 +631,10 @@ class Camera(ABC):
                                     )
 
                         node.value = value
-                        print(f"Set {param_name} = {value}")
+                        logger.info(f"Set {param_name} = {value}")
                     except Exception as e:
-                        print(f"Error setting {param_name}: {e}")
+                        logger.error(f"Error setting {param_name}: {e}")
                 else:
-                    print(f"Warning: Parameter '{param_name}' not found in node_map")
+                    logger.warning(f"Parameter '{param_name}' not found in node_map")
             else:
-                print(f"Warning: Parameter '{param_name}' not recognized")
+                logger.warning(f"Parameter '{param_name}' not recognized")

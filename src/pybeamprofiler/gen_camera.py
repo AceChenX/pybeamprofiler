@@ -27,8 +27,8 @@ class HarvesterCamera(Camera):
         serial_number: Camera serial number to select specific device
 
     Attributes:
-        width_pixels: Sensor width in pixels
-        height_pixels: Sensor height in pixels
+        width: Sensor width in pixels
+        height: Sensor height in pixels
         pixel_size: Pixel pitch in micrometers
         exposure_time: Current exposure time in seconds
         gain: Current gain value
