@@ -8,6 +8,8 @@ from .gen_camera import HarvesterCamera
 
 logger = logging.getLogger(__name__)
 
+PYLON_PRODUCERS = ("ProducerGEV.cti", "ProducerU3V.cti")
+
 
 class BaslerCamera(HarvesterCamera):
     """Basler camera using Harvesters GenICam interface.
@@ -56,10 +58,7 @@ class BaslerCamera(HarvesterCamera):
                 base = rf"C:\Program Files\Basler\pylon {version}\Runtime\x64"
                 if os.path.isdir(base):
                     found = []
-                    for producer in [
-                        "ProducerGEV.cti",
-                        "ProducerU3V.cti",
-                    ]:
+                    for producer in PYLON_PRODUCERS:
                         path = os.path.join(base, producer)
                         if os.path.exists(path):
                             found.append(path)
@@ -76,7 +75,7 @@ class BaslerCamera(HarvesterCamera):
             for base in bases:
                 if os.path.isdir(base):
                     found = []
-                    for producer in ["ProducerGEV.cti", "ProducerU3V.cti"]:
+                    for producer in PYLON_PRODUCERS:
                         path = os.path.join(base, producer)
                         if os.path.exists(path):
                             found.append(path)
@@ -87,7 +86,7 @@ class BaslerCamera(HarvesterCamera):
             base = "/Library/Frameworks/pylon.framework/Libraries/gentlproducer/gtl"
             if os.path.isdir(base):
                 found = []
-                for producer in ["ProducerGEV.cti", "ProducerU3V.cti"]:
+                for producer in PYLON_PRODUCERS:
                     path = os.path.join(base, producer)
                     if os.path.exists(path):
                         found.append(path)

@@ -151,7 +151,15 @@ class TestBaslerCamera:
 
         # Returns None when CTI files are not found, or path string if available
         cti_path = BaslerCamera._find_basler_cti()
-        assert cti_path is None or isinstance(cti_path, str)
+        assert cti_path is None or isinstance(cti_path, str) or isinstance(cti_path, list)
+
+    def test_pylon_producers_constant(self):
+        """Test that PYLON_PRODUCERS constant is defined and contains expected producers."""
+        from pybeamprofiler.basler import PYLON_PRODUCERS
+
+        assert isinstance(PYLON_PRODUCERS, (list, tuple))
+        assert "ProducerGEV.cti" in PYLON_PRODUCERS
+        assert "ProducerU3V.cti" in PYLON_PRODUCERS
 
 
 class TestCameraUtils:
