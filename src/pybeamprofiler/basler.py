@@ -8,6 +8,8 @@ from .gen_camera import HarvesterCamera
 
 logger = logging.getLogger(__name__)
 
+PYLON_PRODUCERS = ("ProducerGEV.cti", "ProducerU3V.cti")
+
 
 class BaslerCamera(HarvesterCamera):
     """Basler camera using Harvesters GenICam interface.
@@ -40,39 +42,55 @@ class BaslerCamera(HarvesterCamera):
         super().__init__(cti_file=cti_file, serial_number=serial_number)
 
     @staticmethod
-    def _find_basler_cti() -> str | None:
+    def _find_basler_cti() -> str | list[str] | None:
         """Search for Basler Pylon CTI file in platform-specific paths.
 
         Returns:
-            Path to CTI file if found, None otherwise
+            Path(s) to CTI file if found, None otherwise
         """
+        if os.environ.get("GENICAM_GENTL64_PATH"):
+            return None
+
         system = platform.system()
-        search_paths = []
 
         if system == "Windows":
             for version in ["7", "6", "5"]:
                 base = rf"C:\Program Files\Basler\pylon {version}\Runtime\x64"
-                search_paths.extend(
-                    [
-                        os.path.join(base, "ProducerGEV.cti"),
-                        os.path.join(base, "ProducerU3V.cti"),
-                    ]
-                )
-        elif system == "Linux":
-            search_paths = [
-                "/opt/pylon/lib64/gentlproducer/gtl/ProducerGEV.cti",
-                "/opt/pylon/lib64/gentlproducer/gtl/ProducerU3V.cti",
-                "/opt/pylon5/lib64/gentlproducer/gtl/ProducerGEV.cti",
-                "/opt/pylon5/lib64/gentlproducer/gtl/ProducerU3V.cti",
-            ]
-        elif system == "Darwin":
-            search_paths = [
-                "/Library/Frameworks/pylon.framework/Libraries/gentlproducer/gtl/ProducerGEV.cti",
-                "/Library/Frameworks/pylon.framework/Libraries/gentlproducer/gtl/ProducerU3V.cti",
-            ]
+                if os.path.isdir(base):
+                    found = []
+                    for producer in PYLON_PRODUCERS:
+                        path = os.path.join(base, producer)
+                        if os.path.exists(path):
+                            found.append(path)
 
-        for path in search_paths:
-            if os.path.exists(path):
-                return path
+                    if found:
+                        return found
+
+        elif system == "Linux":
+            # Check standard pylon (symlink to latest)
+            bases = [
+                "/opt/pylon/lib64/gentlproducer/gtl",
+                "/opt/pylon5/lib64/gentlproducer/gtl",
+            ]
+            for base in bases:
+                if os.path.isdir(base):
+                    found = []
+                    for producer in PYLON_PRODUCERS:
+                        path = os.path.join(base, producer)
+                        if os.path.exists(path):
+                            found.append(path)
+                    if found:
+                        return found
+
+        elif system == "Darwin":
+            base = "/Library/Frameworks/pylon.framework/Libraries/gentlproducer/gtl"
+            if os.path.isdir(base):
+                found = []
+                for producer in PYLON_PRODUCERS:
+                    path = os.path.join(base, producer)
+                    if os.path.exists(path):
+                        found.append(path)
+                if found:
+                    return found
 
         return None

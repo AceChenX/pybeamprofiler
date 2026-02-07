@@ -47,15 +47,18 @@ class FlirCamera(HarvesterCamera):
         Returns:
             Path to CTI file if found, None otherwise
         """
+        if os.environ.get("GENICAM_GENTL64_PATH"):
+            return None
+
         system = platform.system()
         search_paths = []
 
         if system == "Windows":
             base = r"C:\Program Files\FLIR Systems\Spinnaker"
             search_paths = [
+                os.path.join(base, "cti64", "FLIR_GenTL.cti"),
                 os.path.join(base, "cti64", "vs2015", "FLIR_GenTL_v140.cti"),
                 os.path.join(base, "cti64", "vs2017", "FLIR_GenTL_v141.cti"),
-                os.path.join(base, "cti64", "FLIR_GenTL.cti"),
             ]
         elif system == "Linux":
             search_paths = [

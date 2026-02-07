@@ -34,7 +34,7 @@ class HarvesterCamera(Camera):
         gain: Current gain value
     """
 
-    def __init__(self, cti_file: str | None = None, serial_number: str | None = None):
+    def __init__(self, cti_file: str | list[str] | None = None, serial_number: str | None = None):
         """Initialize Harvester camera."""
         super().__init__()
         if Harvester is None:
@@ -44,11 +44,13 @@ class HarvesterCamera(Camera):
         self.h = Harvester()
 
         if cti_file:
-            if not os.path.exists(cti_file):
-                logger.warning(f"CTI file not found: {cti_file}")
-            else:
-                self.h.add_file(cti_file)
-                logger.info(f"Using CTI file: {cti_file}")
+            files = [cti_file] if isinstance(cti_file, str) else cti_file
+            for file_path in files:
+                if not os.path.exists(file_path):
+                    logger.warning(f"CTI file not found: {file_path}")
+                else:
+                    self.h.add_file(file_path)
+                    logger.info(f"Using CTI file: {file_path}")
         else:
             gentl_path = os.environ.get("GENICAM_GENTL64_PATH", "")
             if gentl_path:
