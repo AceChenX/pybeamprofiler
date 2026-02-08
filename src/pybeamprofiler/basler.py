@@ -33,7 +33,10 @@ class BaslerCamera(HarvesterCamera):
         if cti_file is None:
             cti_file = self._find_basler_cti()
             if cti_file:
-                logger.info(f"Found Basler CTI: {cti_file}")
+                if isinstance(cti_file, list):
+                    logger.info(f"Found Basler CTI files: {', '.join(cti_file)}")
+                else:
+                    logger.info(f"Found Basler CTI: {cti_file}")
             else:
                 logger.warning(
                     "Basler Pylon CTI not found. Please install Pylon SDK or specify cti_file path."
@@ -42,11 +45,11 @@ class BaslerCamera(HarvesterCamera):
         super().__init__(cti_file=cti_file, serial_number=serial_number)
 
     @staticmethod
-    def _find_basler_cti() -> str | list[str] | None:
+    def _find_basler_cti() -> list[str] | None:
         """Search for Basler Pylon CTI file in platform-specific paths.
 
         Returns:
-            Path(s) to CTI file if found, None otherwise
+            List of CTI file paths if found, None otherwise
         """
         if os.environ.get("GENICAM_GENTL64_PATH"):
             return None
