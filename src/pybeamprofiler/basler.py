@@ -29,31 +29,44 @@ class BaslerCamera(HarvesterCamera):
     """
 
     def __init__(self, cti_file: str | None = None, serial_number: str | None = None):
-        """Initialize Basler camera with Pylon GenTL."""
+        """Initialize Basler camera with Pylon GenTL.
+
+        Args:
+            cti_file: Path to CTI file. If None, searches GENICAM_GENTL64_PATH then platform paths
+            serial_number: Camera serial number for device selection
+        """
         if cti_file is None:
-            cti_file = self._find_basler_cti()
-            if cti_file:
-                if isinstance(cti_file, list):
-                    logger.info(f"Found Basler CTI files: {', '.join(cti_file)}")
+            # Try GENICAM_GENTL64_PATH first (user-configured)
+            gentl_path = os.environ.get("GENICAM_GENTL64_PATH")
+            if gentl_path:
+                logger.info(f"Using GENICAM_GENTL64_PATH: {gentl_path}")
+                cti_file = HarvesterCamera._parse_gentl_path(gentl_path)
+
+            # Fall back to platform-specific Pylon SDK paths
+            if not cti_file:
+                cti_file = self._find_basler_cti()
+                if cti_file:
+                    if isinstance(cti_file, list):
+                        logger.info(f"Found Basler CTI files: {', '.join(cti_file)}")
+                    else:
+                        logger.info(f"Found Basler CTI: {cti_file}")
                 else:
-                    logger.info(f"Found Basler CTI: {cti_file}")
-            else:
-                logger.warning(
-                    "Basler Pylon CTI not found. Please install Pylon SDK or specify cti_file path."
-                )
+                    logger.warning(
+                        "Basler Pylon CTI not found. Please install Pylon SDK or set GENICAM_GENTL64_PATH."
+                    )
 
         super().__init__(cti_file=cti_file, serial_number=serial_number)
 
     @staticmethod
     def _find_basler_cti() -> list[str] | None:
-        """Search for Basler Pylon CTI file in platform-specific paths.
+        """Search for Basler Pylon CTI files in platform-specific SDK installation paths.
+
+        Basler cameras require multiple CTI producers for different interfaces
+        (GigE, USB3). This method finds all available producers.
 
         Returns:
             List of CTI file paths if found, None otherwise
         """
-        if os.environ.get("GENICAM_GENTL64_PATH"):
-            return None
-
         system = platform.system()
 
         if system == "Windows":
