@@ -600,7 +600,22 @@ class BeamProfiler:
             return go.Figure()
 
         fig = go.Figure()
-        fig.add_trace(go.Heatmap(z=image, colorscale="Viridis", showscale=True))
+
+        # Create physical coordinate arrays for heatmap
+        h, w = image.shape
+        x_coords = np.arange(w) * self.pixel_size
+        y_coords = np.arange(h) * self.pixel_size
+
+        fig.add_trace(
+            go.Heatmap(
+                z=image,
+                x=x_coords,
+                y=y_coords,
+                colorscale="Hot",
+                showscale=True,
+                colorbar=dict(thickness=15, len=0.7),
+            )
+        )
 
         # Add linecut crosshair lines if using linecut method
         if (
@@ -608,11 +623,16 @@ class BeamProfiler:
             and hasattr(self, "_linecut_x")
             and hasattr(self, "_linecut_y")
         ):
+            # Convert linecut positions to physical dimensions
+            linecut_x_um = self._linecut_x * self.pixel_size
+            linecut_y_um = self._linecut_y * self.pixel_size
+            h, w = image.shape
+
             # Vertical line at linecut_x
             fig.add_trace(
                 go.Scatter(
-                    x=[self._linecut_x, self._linecut_x],
-                    y=[0, image.shape[0] - 1],
+                    x=[linecut_x_um, linecut_x_um],
+                    y=[0, (h - 1) * self.pixel_size],
                     mode="lines",
                     line=dict(color="cyan", width=2, dash="dot"),
                     name="Linecut X",
@@ -622,8 +642,8 @@ class BeamProfiler:
             # Horizontal line at linecut_y
             fig.add_trace(
                 go.Scatter(
-                    x=[0, image.shape[1] - 1],
-                    y=[self._linecut_y, self._linecut_y],
+                    x=[0, (w - 1) * self.pixel_size],
+                    y=[linecut_y_um, linecut_y_um],
                     mode="lines",
                     line=dict(color="cyan", width=2, dash="dot"),
                     name="Linecut Y",
@@ -646,10 +666,14 @@ class BeamProfiler:
                 x_ellipse = cx + rx * np.cos(theta_vals)
                 y_ellipse = cy + ry * np.sin(theta_vals)
 
+            # Convert ellipse to physical dimensions
+            x_ellipse_um = x_ellipse * self.pixel_size
+            y_ellipse_um = y_ellipse * self.pixel_size
+
             fig.add_trace(
                 go.Scatter(
-                    x=x_ellipse,
-                    y=y_ellipse,
+                    x=x_ellipse_um,
+                    y=y_ellipse_um,
                     mode="lines",
                     line=dict(color="red", width=2, dash="dash"),
                     name=f"{self.definition} Width",
@@ -657,19 +681,48 @@ class BeamProfiler:
                 )
             )
 
-        # Compact title
-        title = f"X={self.width_x:.0f}μm Y={self.width_y:.0f}μm"
+        # Compact title with coordinates in physical dimensions
+        center_x_um = self.center_x * self.pixel_size
+        center_y_um = self.center_y * self.pixel_size
+        title = "<b>Beam Profile</b><br>"
+        title += (
+            f"<span style='font-size:14px'>Width: X={self.width_x:.1f}μm, Y={self.width_y:.1f}μm | "
+        )
+        title += f"Center: ({center_x_um:.1f}, {center_y_um:.1f})μm</span><br>"
+        title += f"<span style='font-size:12px'>Peak={self.peak_value:.0f}"
         if self.fit_method == "2d":
-            title += f" θ={self.angle_deg:.0f}°"
-        title += f" Peak={self.peak_value:.0f}"
+            title += f" | Angle={self.angle_deg:.1f}°"
+        title += "</span>"
+
+        # Convert image coordinates to physical dimensions for axes
+        h, w = image.shape
+        x_range = [0, w * self.pixel_size]
+        y_range = [0, h * self.pixel_size]
 
         fig.update_layout(
             height=600,
             width=600,
             title_text=title,
-            yaxis=dict(scaleanchor="x", scaleratio=1),
-            xaxis=dict(constrain="domain"),
+            title_font_size=16,
+            yaxis=dict(
+                scaleanchor="x",
+                scaleratio=1,
+                showgrid=True,
+                gridcolor="rgba(128,128,128,0.2)",
+                range=y_range,
+                title="Y (μm)",
+                title_font_size=12,
+            ),
+            xaxis=dict(
+                constrain="domain",
+                showgrid=True,
+                gridcolor="rgba(128,128,128,0.2)",
+                range=x_range,
+                title="X (μm)",
+                title_font_size=12,
+            ),
             showlegend=False,
+            plot_bgcolor="rgba(240,240,240,0.5)",
         )
 
         return fig
@@ -705,7 +758,23 @@ class BeamProfiler:
         )
 
         # Beam Image (heatmap)
-        fig.add_trace(go.Heatmap(z=image, colorscale="Viridis", showscale=False), row=2, col=1)
+        # Create physical coordinate arrays for heatmap
+        h, w = image.shape
+        x_coords = np.arange(w) * self.pixel_size
+        y_coords = np.arange(h) * self.pixel_size
+
+        fig.add_trace(
+            go.Heatmap(
+                z=image,
+                x=x_coords,
+                y=y_coords,
+                colorscale="Hot",
+                showscale=True,
+                colorbar=dict(x=1.15, thickness=15, len=0.5),
+            ),
+            row=2,
+            col=1,
+        )
 
         # Add linecut crosshair lines if using linecut method
         if (
@@ -713,11 +782,16 @@ class BeamProfiler:
             and hasattr(self, "_linecut_x")
             and hasattr(self, "_linecut_y")
         ):
+            # Convert linecut positions to physical dimensions
+            linecut_x_um = self._linecut_x * self.pixel_size
+            linecut_y_um = self._linecut_y * self.pixel_size
+            h, w = image.shape
+
             # Vertical line at linecut_x
             fig.add_trace(
                 go.Scatter(
-                    x=[self._linecut_x, self._linecut_x],
-                    y=[0, image.shape[0] - 1],
+                    x=[linecut_x_um, linecut_x_um],
+                    y=[0, (h - 1) * self.pixel_size],
                     mode="lines",
                     line=dict(color="cyan", width=2, dash="dot"),
                     name="Linecut X",
@@ -729,8 +803,8 @@ class BeamProfiler:
             # Horizontal line at linecut_y
             fig.add_trace(
                 go.Scatter(
-                    x=[0, image.shape[1] - 1],
-                    y=[self._linecut_y, self._linecut_y],
+                    x=[0, (w - 1) * self.pixel_size],
+                    y=[linecut_y_um, linecut_y_um],
                     mode="lines",
                     line=dict(color="cyan", width=2, dash="dot"),
                     name="Linecut Y",
@@ -755,12 +829,16 @@ class BeamProfiler:
                 x_ellipse = cx + rx * np.cos(theta_vals)
                 y_ellipse = cy + ry * np.sin(theta_vals)
 
+            # Convert ellipse to physical dimensions
+            x_ellipse_um = x_ellipse * self.pixel_size
+            y_ellipse_um = y_ellipse * self.pixel_size
+
             fig.add_trace(
                 go.Scatter(
-                    x=x_ellipse,
-                    y=y_ellipse,
+                    x=x_ellipse_um,
+                    y=y_ellipse_um,
                     mode="lines",
-                    line=dict(color="red", width=2, dash="dash"),
+                    line=dict(color="#FF4444", width=3, dash="dash"),
                     name=f"{self.definition} Width",
                     showlegend=True,
                 ),
@@ -770,50 +848,141 @@ class BeamProfiler:
 
         # X Profile (Integrated) - Above beam image
         x = np.arange(len(image[0]))
+        x_um = x * self.pixel_size  # Convert to physical dimensions
         proj_x = np.sum(image, axis=0)
         fig.add_trace(
-            go.Scatter(x=x, y=proj_x, mode="markers", name="Data X", marker=dict(size=2)),
+            go.Scatter(
+                x=x_um,
+                y=proj_x,
+                mode="markers",
+                name="Data X",
+                marker=dict(size=3, color="#1f77b4", opacity=0.6),
+            ),
             row=1,
             col=1,
         )
         if popt_x is not None:
             fitted_x = BeamProfiler.gaussian(x, *popt_x)
-            fig.add_trace(go.Scatter(x=x, y=fitted_x, mode="lines", name="Fit X"), row=1, col=1)
+            fig.add_trace(
+                go.Scatter(
+                    x=x_um,
+                    y=fitted_x,
+                    mode="lines",
+                    name="Fit X",
+                    line=dict(color="#FF4444", width=2),
+                ),
+                row=1,
+                col=1,
+            )
 
         # Y Profile (Integrated) - Right of beam image, rotated
         y = np.arange(len(image))
+        y_um = y * self.pixel_size  # Convert to physical dimensions
         proj_y = np.sum(image, axis=1)
         fig.add_trace(
-            go.Scatter(x=proj_y, y=y, mode="markers", name="Data Y", marker=dict(size=2)),
+            go.Scatter(
+                x=proj_y,
+                y=y_um,
+                mode="markers",
+                name="Data Y",
+                marker=dict(size=3, color="#2ca02c", opacity=0.6),
+            ),
             row=2,
             col=2,
         )
         if popt_y is not None:
             fitted_y = BeamProfiler.gaussian(y, *popt_y)
-            fig.add_trace(go.Scatter(x=fitted_y, y=y, mode="lines", name="Fit Y"), row=2, col=2)
+            fig.add_trace(
+                go.Scatter(
+                    x=fitted_y,
+                    y=y_um,
+                    mode="lines",
+                    name="Fit Y",
+                    line=dict(color="#FF4444", width=2),
+                ),
+                row=2,
+                col=2,
+            )
 
-        title = f"{self.definition.upper()} Width: X={self.width_x:.1f} μm, Y={self.width_y:.1f} μm"
+        # Convert center coordinates to physical dimensions
+        center_x_um = self.center_x * self.pixel_size
+        center_y_um = self.center_y * self.pixel_size
+
+        title = f"<b>Beam Profile Analysis - {self.definition.upper()}</b><br>"
+        title += (
+            f"<span style='font-size:14px'>Width: X={self.width_x:.1f}μm, Y={self.width_y:.1f}μm | "
+        )
+        title += f"Center: ({center_x_um:.1f}, {center_y_um:.1f})μm | "
+        title += f"Peak: {self.peak_value:.0f}"
         if self.fit_method == "2d":
-            title += f", Angle: {self.angle_deg:.1f}°"
-        title += f", Peak: {self.peak_value:.0f}"
+            title += f" | Angle: {self.angle_deg:.1f}°"
+        title += "</span>"
 
         fig.update_layout(
             height=700,
             width=900,
             title_text=title,
+            title_font_size=16,
             showlegend=True,
-            margin=dict(l=40, r=20, t=80, b=40),
+            legend=dict(
+                orientation="h",
+                yanchor="top",
+                y=-0.05,
+                xanchor="center",
+                x=0.5,
+                font=dict(size=11),
+            ),
+            margin=dict(l=40, r=20, t=100, b=60),
+            plot_bgcolor="rgba(245,245,245,0.5)",
         )
 
         # Align X profile's x-axis with beam image's x-axis
-        fig.update_xaxes(matches="x3", row=1, col=1, showticklabels=False)
+        fig.update_xaxes(
+            matches="x3",
+            row=1,
+            col=1,
+            showticklabels=False,
+            showgrid=True,
+            gridcolor="rgba(200,200,200,0.3)",
+        )
 
         # Align Y profile's y-axis with beam image's y-axis
-        fig.update_yaxes(matches="y3", row=2, col=2, showticklabels=False)
+        fig.update_yaxes(
+            matches="y3",
+            row=2,
+            col=2,
+            showticklabels=False,
+            showgrid=True,
+            gridcolor="rgba(200,200,200,0.3)",
+        )
 
         # Ensure proper aspect ratio for beam image
-        fig.update_yaxes(scaleanchor="x3", scaleratio=1, row=2, col=1)
-        fig.update_xaxes(constrain="domain", row=2, col=1)
+        # Convert image dimensions to physical coordinates
+        h, w = image.shape
+        x_range = [0, w * self.pixel_size]
+        y_range = [0, h * self.pixel_size]
+
+        fig.update_yaxes(
+            scaleanchor="x3",
+            scaleratio=1,
+            row=2,
+            col=1,
+            showgrid=True,
+            gridcolor="rgba(128,128,128,0.2)",
+            range=y_range,
+        )
+        fig.update_xaxes(
+            constrain="domain",
+            row=2,
+            col=1,
+            showgrid=True,
+            gridcolor="rgba(128,128,128,0.2)",
+            range=x_range,
+        )
+
+        # Add labels to beam image axes with physical dimensions
+        fig.update_xaxes(title_text="X (μm)", title_font_size=12, row=2, col=1)
+        fig.update_yaxes(title_text="Y (μm)", title_font_size=12, row=2, col=1)
 
         return fig
 
@@ -880,7 +1049,7 @@ class BeamProfiler:
 
                     current_title = fig.layout.title.text if fig.layout.title else ""
                     fig.update_layout(
-                        title_text=f"{current_title}<br><sub>Frame #{frame_count} | FPS: {fps:.1f}</sub>"
+                        title_text=f"{current_title}<br><span style='font-size:11px; color:#666'>Frame #{frame_count} | FPS: {fps:.1f}</span>"
                     )
 
                     # Clear and display updated figure
@@ -908,6 +1077,7 @@ class BeamProfiler:
                 try:
                     import matplotlib.pyplot as plt
                     from matplotlib.animation import FuncAnimation
+                    from matplotlib.patches import Ellipse
 
                     fig_plt, axes = plt.subplots(2, 2, figsize=(10, 8))
                     fig_plt.tight_layout(pad=3.0)
@@ -931,8 +1101,6 @@ class BeamProfiler:
 
                         # Add ellipse overlay
                         if popt_x is not None and popt_y is not None:
-                            from matplotlib.patches import Ellipse
-
                             cx, cy = popt_x[1], popt_y[1]
                             width_px, height_px = 4 * abs(popt_x[2]), 4 * abs(popt_y[2])
                             ellipse = Ellipse(
@@ -1005,6 +1173,47 @@ class BeamProfiler:
             # Dash is available, use it
             app = dash.Dash(__name__)
 
+            # Inject JavaScript to close tab when server disconnects (Ctrl-C)
+            # Uses the same approach as camera_streamer.py
+            app.index_string = """
+            <!DOCTYPE html>
+            <html>
+                <head>
+                    {%metas%}
+                    <title>{%title%}</title>
+                    {%favicon%}
+                    {%css%}
+                    <script>
+                        // Close tab when Dash server disconnects
+                        window.addEventListener('load', function() {
+                            var failedAttempts = 0;
+                            setInterval(function() {
+                                fetch('/_dash-component-suites/dash/dcc/async-graph.js', {
+                                    method: 'HEAD',
+                                    cache: 'no-cache'
+                                }).then(function() {
+                                    failedAttempts = 0;
+                                }).catch(function() {
+                                    failedAttempts++;
+                                    if (failedAttempts >= 2) {
+                                        window.open('', '_self').close();
+                                    }
+                                });
+                            }, 500);
+                        });
+                    </script>
+                </head>
+                <body>
+                    {%app_entry%}
+                    <footer>
+                        {%config%}
+                        {%scripts%}
+                        {%renderer%}
+                    </footer>
+                </body>
+            </html>
+            """
+
             # Flag to signal shutdown
             shutdown_flag = {"stop": False}
 
@@ -1076,13 +1285,15 @@ class BeamProfiler:
 
                 # Always add frame number to show updates
                 current_title = fig.layout.title.text if fig.layout.title else ""
-                fig.update_layout(title_text=f"{current_title} | Frame #{n}")
+                fig.update_layout(
+                    title_text=f"{current_title}<br><span style='font-size:11px; color:#666'>Frame #{n}</span>"
+                )
 
                 return fig
 
             logger.info("Starting Dash server at http://127.0.0.1:8050")
             logger.info("Opening browser automatically...")
-            logger.info("Press Ctrl+C to stop\n")
+            logger.info("Press Ctrl+C to stop")
 
             # Suppress Flask/Werkzeug logs for cleaner output
             logging.getLogger("werkzeug").setLevel(logging.ERROR)
@@ -1092,12 +1303,13 @@ class BeamProfiler:
             if os.environ.get("PYBEAMPROFILER_NO_BROWSER") != "1":
 
                 def open_browser():
+                    time.sleep(0.5)  # Give server time to start
                     webbrowser.open("http://127.0.0.1:8050")
 
                 threading.Thread(target=open_browser, daemon=True).start()
 
             try:
-                app.run(debug=False, port=8050)
+                app.run(debug=False, port=8050, use_reloader=False)
             except KeyboardInterrupt:
                 logger.info("\n\nStopping Dash server...")
                 shutdown_flag["stop"] = True
