@@ -27,40 +27,54 @@ class FlirCamera(HarvesterCamera):
     """
 
     def __init__(self, cti_file: str | None = None, serial_number: str | None = None):
-        """Initialize FLIR camera with Spinnaker GenTL."""
+        """Initialize FLIR camera with Spinnaker GenTL.
+
+        Args:
+            cti_file: Path to CTI file. If None, searches GENICAM_GENTL64_PATH then platform paths
+            serial_number: Camera serial number for device selection
+        """
         if cti_file is None:
-            cti_file = self._find_flir_cti()
-            if cti_file:
-                logger.info(f"Found FLIR CTI: {cti_file}")
-            else:
-                logger.warning(
-                    "FLIR Spinnaker CTI not found. "
-                    "Please install Spinnaker SDK or specify cti_file path."
-                )
+            # Try GENICAM_GENTL64_PATH first (user-configured)
+            gentl_path = os.environ.get("GENICAM_GENTL64_PATH")
+            if gentl_path:
+                logger.info(f"Using GENICAM_GENTL64_PATH: {gentl_path}")
+                cti_file = HarvesterCamera._parse_gentl_path(gentl_path)
+
+            # Fall back to platform-specific Spinnaker SDK paths
+            if not cti_file:
+                cti_file = self._find_flir_cti()
+                if cti_file:
+                    logger.info(f"Found FLIR CTI: {cti_file}")
+                else:
+                    logger.warning(
+                        "FLIR Spinnaker CTI not found. "
+                        "Please install Spinnaker SDK or set GENICAM_GENTL64_PATH."
+                    )
 
         super().__init__(cti_file=cti_file, serial_number=serial_number)
 
     @staticmethod
     def _find_flir_cti() -> str | None:
-        """Search for FLIR Spinnaker CTI file in platform-specific paths.
+        """Search for FLIR Spinnaker CTI in platform-specific SDK installation paths.
+
+        Searches common Spinnaker SDK installation locations by platform.
 
         Returns:
-            Path to CTI file if found, None otherwise
+            Path to first found CTI file, or None if not found
         """
         system = platform.system()
         search_paths = []
 
         if system == "Windows":
-            base = r"C:\Program Files\FLIR Systems\Spinnaker"
+            base = r"C:\Program Files\Teledyne\Spinnaker"
             search_paths = [
-                os.path.join(base, "cti64", "vs2015", "FLIR_GenTL_v140.cti"),
-                os.path.join(base, "cti64", "vs2017", "FLIR_GenTL_v141.cti"),
-                os.path.join(base, "cti64", "FLIR_GenTL.cti"),
+                os.path.join(base, "cti64", "vs2015", "Spinnaker_v140.cti"),
+                os.path.join(base, "cti64", "vs2017", "Spinnaker_v141.cti"),
             ]
         elif system == "Linux":
             search_paths = [
-                "/opt/spinnaker/lib/flir-gentl/FLIR_GenTL.cti",
-                "/usr/lib/flir-gentl/FLIR_GenTL.cti",
+                "/opt/spinnaker/lib/flir-gentl/Spinnaker_GenTL.cti",
+                "/opt/spinnaker/lib/flir-gentl/FLIR_GenTL_v140.cti",
             ]
         elif system == "Darwin":
             search_paths = [

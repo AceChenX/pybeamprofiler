@@ -34,8 +34,13 @@ class HarvesterCamera(Camera):
         gain: Current gain value
     """
 
-    def __init__(self, cti_file: str | None = None, serial_number: str | None = None):
-        """Initialize Harvester camera."""
+    def __init__(self, cti_file: str | list[str] | None = None, serial_number: str | None = None):
+        """Initialize Harvester camera.
+
+        Args:
+            cti_file: Path(s) to GenTL producer (.cti) file(s)
+            serial_number: Camera serial number for device selection
+        """
         super().__init__()
         if Harvester is None:
             raise ImportError(
@@ -44,30 +49,17 @@ class HarvesterCamera(Camera):
         self.h = Harvester()
 
         if cti_file:
-            if not os.path.exists(cti_file):
-                logger.warning(f"CTI file not found: {cti_file}")
-            else:
-                self.h.add_file(cti_file)
-                logger.info(f"Using CTI file: {cti_file}")
+            files = [cti_file] if isinstance(cti_file, str) else cti_file
+            for file_path in files:
+                if not os.path.exists(file_path):
+                    logger.warning(f"CTI file not found: {file_path}")
+                else:
+                    self.h.add_file(file_path)
+                    logger.info(f"Using CTI file: {file_path}")
         else:
-            gentl_path = os.environ.get("GENICAM_GENTL64_PATH", "")
-            if gentl_path:
-                logger.info(f"Using GENICAM_GENTL64_PATH: {gentl_path}")
-                separator = ";" if os.name == "nt" else ":"
-                for path in gentl_path.split(separator):
-                    path = path.strip()
-                    if path and os.path.exists(path):
-                        if os.path.isdir(path):
-                            for file in os.listdir(path):
-                                if file.endswith(".cti"):
-                                    cti_path = os.path.join(path, file)
-                                    self.h.add_file(cti_path)
-                                    logger.info(f"Added CTI: {cti_path}")
-                        elif path.endswith(".cti"):
-                            self.h.add_file(path)
-                            logger.info(f"Added CTI: {path}")
-            else:
-                logger.info("GENICAM_GENTL64_PATH not set, attempting manual discovery")
+            logger.warning(
+                "No CTI file specified. Please provide cti_file parameter or set GENICAM_GENTL64_PATH."
+            )
 
         self.serial_number = serial_number
         self.ia = None  # ImageAcquirer
@@ -83,6 +75,41 @@ class HarvesterCamera(Camera):
         # Initialize width/height for Camera base class compatibility
         self.width = 0
         self.height = 0
+
+    @staticmethod
+    def _parse_gentl_path(gentl_path: str) -> str | list[str] | None:
+        """Parse GENICAM_GENTL64_PATH environment variable.
+
+        Handles both directory paths (searches for .cti files) and direct
+        .cti file paths. Supports multiple paths separated by platform-specific
+        separator (';' on Windows, ':' on Unix).
+
+        Args:
+            gentl_path: Value of GENICAM_GENTL64_PATH environment variable
+
+        Returns:
+            Single CTI path (str), multiple paths (list[str]), or None if not found
+        """
+        separator = ";" if os.name == "nt" else ":"
+        cti_files = []
+
+        for path in gentl_path.split(separator):
+            path = path.strip()
+            if not path or not os.path.exists(path):
+                continue
+
+            if os.path.isdir(path):
+                # Directory: find all .cti files
+                for file in os.listdir(path):
+                    if file.endswith(".cti"):
+                        cti_files.append(os.path.join(path, file))
+            elif path.endswith(".cti"):
+                # Direct .cti file
+                cti_files.append(path)
+
+        if not cti_files:
+            return None
+        return cti_files if len(cti_files) > 1 else cti_files[0]
 
     def open(self) -> None:
         """Open camera connection and retrieve camera properties."""
