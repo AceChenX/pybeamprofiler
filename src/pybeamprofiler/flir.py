@@ -54,16 +54,15 @@ class FlirCamera(HarvesterCamera):
         search_paths = []
 
         if system == "Windows":
-            base = r"C:\Program Files\FLIR Systems\Spinnaker"
+            base = r"C:\Program Files\Teledyne\Spinnaker"
             search_paths = [
-                os.path.join(base, "cti64", "FLIR_GenTL.cti"),
-                os.path.join(base, "cti64", "vs2015", "FLIR_GenTL_v140.cti"),
-                os.path.join(base, "cti64", "vs2017", "FLIR_GenTL_v141.cti"),
+                os.path.join(base, "cti64", "vs2015", "Spinnaker_v140.cti"),
+                os.path.join(base, "cti64", "vs2017", "Spinnaker_v141.cti"),
             ]
         elif system == "Linux":
             search_paths = [
-                "/opt/spinnaker/lib/flir-gentl/FLIR_GenTL.cti",
-                "/usr/lib/flir-gentl/FLIR_GenTL.cti",
+                "/opt/spinnaker/lib/flir-gentl/Spinnaker_GenTL.cti",
+                "/opt/spinnaker/lib/flir-gentl/FLIR_GenTL_v140.cti",
             ]
         elif system == "Darwin":
             search_paths = [
