@@ -29,14 +29,14 @@ class TestCameraErrorHandling:
         """Test exposure time can be set after initialization."""
         bp = BeamProfiler(camera="simulated")
         new_exposure = 0.025
-        bp.exposure_time = new_exposure
+        bp.exposure_time = new_exposure  # ty:ignore[unresolved-attribute]
         assert bp.exposure_time == pytest.approx(new_exposure, rel=0.01)
 
     def test_gain_setter(self):
         """Test gain can be set after initialization."""
         bp = BeamProfiler(camera="simulated")
         new_gain = 10.0
-        bp.gain = new_gain
+        bp.gain = new_gain  # ty:ignore[unresolved-attribute]
         assert bp.gain == pytest.approx(new_gain, rel=0.1)
 
     def test_invalid_camera_type(self):
@@ -108,6 +108,7 @@ class TestWidthDefinitions:
     def test_gaussian_definition(self):
         """Test Gaussian (1/e²) width definition."""
         bp = BeamProfiler(camera="simulated", fit="1d", definition="gaussian")
+        assert bp.camera is not None
         bp.camera.start_acquisition()
         img = bp.camera.get_image()
         bp.camera.stop_acquisition()
@@ -120,6 +121,7 @@ class TestWidthDefinitions:
     def test_fwhm_definition(self):
         """Test FWHM width definition."""
         bp = BeamProfiler(camera="simulated", fit="1d", definition="fwhm")
+        assert bp.camera is not None
         bp.camera.start_acquisition()
         img = bp.camera.get_image()
         bp.camera.stop_acquisition()
@@ -132,6 +134,7 @@ class TestWidthDefinitions:
     def test_d4s_definition(self):
         """Test D4σ (ISO 11146) width definition."""
         bp = BeamProfiler(camera="simulated", fit="1d", definition="d4s")
+        assert bp.camera is not None
         bp.camera.start_acquisition()
         img = bp.camera.get_image()
         bp.camera.stop_acquisition()
@@ -144,6 +147,7 @@ class TestWidthDefinitions:
     def test_definition_comparison(self):
         """Test that different definitions give different widths."""
         bp = BeamProfiler(camera="simulated", fit="1d")
+        assert bp.camera is not None
         bp.camera.start_acquisition()
         img = bp.camera.get_image()
         bp.camera.stop_acquisition()
@@ -165,6 +169,7 @@ class TestFittingMethods:
     def test_1d_fitting(self):
         """Test 1D projection fitting."""
         bp = BeamProfiler(camera="simulated", fit="1d")
+        assert bp.camera is not None
         bp.camera.start_acquisition()
         img = bp.camera.get_image()
         bp.camera.stop_acquisition()
@@ -179,6 +184,7 @@ class TestFittingMethods:
     def test_2d_fitting(self):
         """Test 2D Gaussian fitting with rotation."""
         bp = BeamProfiler(camera="simulated", fit="2d")
+        assert bp.camera is not None
         bp.camera.start_acquisition()
         img = bp.camera.get_image()
         bp.camera.stop_acquisition()
@@ -191,6 +197,7 @@ class TestFittingMethods:
     def test_linecut_fitting(self):
         """Test linecut fitting through peak."""
         bp = BeamProfiler(camera="simulated", fit="linecut")
+        assert bp.camera is not None
         bp.camera.start_acquisition()
         img = bp.camera.get_image()
         bp.camera.stop_acquisition()
@@ -207,6 +214,7 @@ class TestBeamProfilerIntegration:
     def test_single_shot_workflow(self):
         """Test complete single-shot acquisition workflow."""
         bp = BeamProfiler(camera="simulated", exposure_time=0.01)
+        assert bp.camera is not None
 
         # Should not raise any exceptions
         bp.camera.start_acquisition()
@@ -225,6 +233,7 @@ class TestBeamProfilerIntegration:
     def test_multiple_acquisitions(self):
         """Test multiple sequential acquisitions."""
         bp = BeamProfiler(camera="simulated")
+        assert bp.camera is not None
         bp.camera.start_acquisition()
 
         widths = []
@@ -257,6 +266,7 @@ class TestBeamProfilerIntegration:
     def test_fit_caching(self):
         """Test that fit parameters are cached for efficiency."""
         bp = BeamProfiler(camera="simulated", fit="1d")
+        assert bp.camera is not None
         bp.camera.start_acquisition()
 
         # First fit

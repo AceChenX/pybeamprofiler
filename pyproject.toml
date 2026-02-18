@@ -1,6 +1,6 @@
 [build-system]
-requires = ["setuptools>=61.0"]
-build-backend = "setuptools.build_meta"
+requires = ["hatchling"]
+build-backend = "hatchling.build"
 
 [project]
 name = "pybeamprofiler"
@@ -39,9 +39,17 @@ requires-python = ">=3.10"
 "Homepage" = "https://github.com/acechenx/pybeamprofiler"
 "Bug Tracker" = "https://github.com/acechenx/pybeamprofiler/issues"
 
-[tool.setuptools.packages.find]
-where = ["src"]
-include = ["pybeamprofiler*"]
+[tool.hatch.build.targets.wheel]
+packages = ["src/pybeamprofiler"]
+
+[tool.uv]
+# harvesters depends on the `genicam` PyPI package, which has no macOS wheel.
+# On macOS, genicam is provided by the camera SDK (Pylon, Spinnaker) installed
+# into the Python environment. This override tells uv to skip resolving the
+# PyPI genicam wheel on macOS so `uv sync` succeeds.
+override-dependencies = [
+    "genicam>=0 ; sys_platform != 'darwin'",
+]
 
 [project.optional-dependencies]
 test = [
@@ -52,7 +60,7 @@ dev = [
     "pytest>=7.0",
     "pytest-cov>=4.0",
     "ruff>=0.14.0",
-    "pyright>=1.1.0",
+    "ty>=0.0.1a6",
     "pre-commit>=4.5.0",
 ]
 matplotlib = [
@@ -89,10 +97,5 @@ known-first-party = ["pybeamprofiler"]
 quote-style = "double"
 indent-style = "space"
 
-[tool.pyright]
-include = ["src", "tests"]
-exclude = ["**/__pycache__", "**/.pytest_cache"]
-pythonVersion = "3.10"
-typeCheckingMode = "basic"
-reportMissingImports = true
-reportMissingTypeStubs = false
+[tool.ty.environment]
+python-version = "3.10"

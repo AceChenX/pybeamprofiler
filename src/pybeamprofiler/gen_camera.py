@@ -8,7 +8,7 @@ import numpy as np
 try:
     from harvesters.core import Harvester
 except ImportError:
-    Harvester = None
+    Harvester = None  # ty:ignore[invalid-assignment]
 
 from .camera import Camera
 
@@ -207,7 +207,7 @@ class HarvesterCamera(Camera):
                     if hasattr(self.node_map, "PixelSize"):
                         val = self.node_map.PixelSize.value
                         # Only use if it's a number (not a string like "Bpp8")
-                        if isinstance(val, (int, float)):
+                        if isinstance(val, int | float):
                             pixel_size = val
                             logger.debug("Using PixelSize for pixel size")
                 except (AttributeError, ValueError, TypeError):
@@ -440,7 +440,7 @@ class HarvesterCamera(Camera):
         if not self.ia:
             raise RuntimeError("Camera not opened.")
 
-        with self.ia.fetch(timeout=3.0) as buffer:
+        with self.ia.fetch(timeout=3.0) as buffer:  # ty:ignore[invalid-context-manager]
             component = buffer.payload.components[0]
 
             if component.data_format == "Mono8":
