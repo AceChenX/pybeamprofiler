@@ -22,10 +22,10 @@ Real-time laser beam profiler with Gaussian fitting for GenICam cameras.
 
 ```bash
 # Install
-pip install .
+uv pip install .
 
 # Run with simulated camera (no hardware needed)
-python -m pybeamprofiler.beamprofiler --camera simulated
+uv run python -m pybeamprofiler.beamprofiler --camera simulated
 
 # Browser opens automatically at http://127.0.0.1:8050
 ```
@@ -35,22 +35,22 @@ python -m pybeamprofiler.beamprofiler --camera simulated
 ### Basic Installation
 
 ```bash
-pip install .
+uv sync
 ```
 
 ### Development Installation
 
 ```bash
-pip install -e .[dev]
+uv sync --extra dev
 pre-commit install  # Optional: enable git hooks
 ```
 
 ### Optional Dependencies
 
 ```bash
-pip install .[matplotlib]  # Matplotlib fallback for CLI
-pip install .[test]        # Testing tools only
-pip install .[dev]         # All development tools
+uv sync --extra matplotlib  # Matplotlib fallback for CLI
+uv sync --extra test        # Testing tools only
+uv sync --extra dev         # All development tools
 ```
 
 ## Usage
@@ -290,42 +290,42 @@ Automatic pixel size detection for 40+ sensor models including:
 **Development:**
 - pytest, pytest-cov - Testing framework
 - ruff - Fast linter and formatter
-- pyright - Static type checking
+- ty - Static type checking
 - pre-commit - Git hooks for code quality
 
 ## Testing
 
 ```bash
 # Run all tests
-pytest
+uv run pytest
 
 # Run with coverage
-pytest --cov=pybeamprofiler --cov-report=html
+uv run pytest --cov=pybeamprofiler --cov-report=html
 
 # Run specific test file
-pytest tests/test_fitting.py
+uv run pytest tests/test_fitting.py
 
 # Run with verbose output
-pytest -v
+uv run pytest -v
 ```
 
 ## Development
 
 ```bash
 # Install in development mode
-pip install -e .[dev]
+uv sync --extra dev
 
 # Install pre-commit hooks
 pre-commit install
 
 # Run linter
-ruff check src tests
+uv run ruff check src tests
 
 # Run formatter
-ruff format src tests
+uv run ruff format src tests
 
 # Run type checker
-pyright src
+uv run ty check src tests
 ```
 
 ## Troubleshooting

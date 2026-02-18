@@ -11,6 +11,7 @@ class TestOneDimensionalFitting:
     def test_1d_fitting_basic(self, beam_profiler):
         """Test 1D fitting produces valid results."""
         bp = beam_profiler
+        assert bp.camera is not None
         bp.fit_method = "1d"
 
         bp.camera.start_acquisition()
@@ -46,6 +47,7 @@ class TestOneDimensionalFitting:
     def test_1d_fit_caching(self, beam_profiler):
         """Test fit parameter caching improves convergence."""
         bp = beam_profiler
+        assert bp.camera is not None
         bp.fit_method = "1d"
 
         bp.camera.start_acquisition()
@@ -69,6 +71,7 @@ class TestTwoDimensionalFitting:
     def test_2d_fitting_basic(self, beam_profiler):
         """Test 2D fitting with angle detection."""
         bp = beam_profiler
+        assert bp.camera is not None
         bp.fit_method = "2d"
 
         bp.camera.start_acquisition()
@@ -86,6 +89,7 @@ class TestTwoDimensionalFitting:
     def test_2d_vs_1d_comparison(self, beam_profiler):
         """Compare 2D and 1D fitting results on same image."""
         bp = beam_profiler
+        assert bp.camera is not None
 
         bp.camera.start_acquisition()
         img = bp.camera.get_image()
@@ -108,6 +112,7 @@ class TestLinecutFitting:
     def test_linecut_fitting_basic(self):
         """Test linecut fitting produces valid results."""
         bp = BeamProfiler(camera="simulated", fit="linecut")
+        assert bp.camera is not None
 
         bp.camera.start_acquisition()
         img = bp.camera.get_image()
@@ -138,8 +143,8 @@ class TestLinecutFitting:
         assert width_1d > 0
         assert abs(width_1d - width_linecut) / width_1d < 0.5
 
-        bp_linecut.camera.close()
-        bp_1d.camera.close()
+        bp_linecut.camera.close()  # ty:ignore[unresolved-attribute]
+        bp_1d.camera.close()  # ty:ignore[unresolved-attribute]
 
 
 class TestFittingEdgeCases:
@@ -166,6 +171,7 @@ class TestFittingEdgeCases:
     def test_multiple_consecutive_fits(self, beam_profiler):
         """Test multiple consecutive fits produce consistent results."""
         bp = beam_profiler
+        assert bp.camera is not None
         bp.fit_method = "1d"
 
         bp.camera.start_acquisition()

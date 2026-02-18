@@ -1,8 +1,18 @@
 """Tests for utility functions."""
 
+import sys
+from types import ModuleType
 from unittest.mock import Mock, patch
 
 from pybeamprofiler import utils
+
+
+def _mock_harvesters_core() -> tuple[ModuleType, Mock]:
+    """Return a fake harvesters.core module and its Harvester class mock."""
+    mock_harvester_class = Mock()
+    fake_core = ModuleType("harvesters.core")
+    fake_core.Harvester = mock_harvester_class  # type: ignore[attr-defined]
+    return fake_core, mock_harvester_class
 
 
 class TestFindCtiFiles:
@@ -73,9 +83,9 @@ class TestFindCtiFiles:
 class TestListCameras:
     """Test camera listing functionality."""
 
-    @patch("harvesters.core.Harvester")
-    def test_list_cameras_with_cti(self, mock_harvester_class):
+    def test_list_cameras_with_cti(self):
         """Test listing cameras with specific CTI file."""
+        fake_core, mock_harvester_class = _mock_harvesters_core()
         mock_h = Mock()
         mock_harvester_class.return_value = mock_h
 
@@ -87,8 +97,9 @@ class TestListCameras:
 
         mock_h.device_info_list = [mock_device]
 
-        with patch("pybeamprofiler.utils.os.path.exists", return_value=True):
-            cameras = utils.list_cameras("/path/to/test.cti")
+        with patch.dict(sys.modules, {"harvesters.core": fake_core}):
+            with patch("pybeamprofiler.utils.os.path.exists", return_value=True):
+                cameras = utils.list_cameras("/path/to/test.cti")
 
         assert len(cameras) == 1
         assert cameras[0]["vendor"] == "Test Vendor"
@@ -97,33 +108,35 @@ class TestListCameras:
         assert cameras[0]["id"] == "device_id_123"
         assert cameras[0]["index"] == 0
 
-    @patch("harvesters.core.Harvester")
-    def test_list_cameras_cti_not_found(self, mock_harvester_class):
+    def test_list_cameras_cti_not_found(self):
         """Test listing cameras when CTI file doesn't exist."""
+        fake_core, mock_harvester_class = _mock_harvesters_core()
         mock_h = Mock()
         mock_harvester_class.return_value = mock_h
 
-        with patch("pybeamprofiler.utils.os.path.exists", return_value=False):
-            cameras = utils.list_cameras("/nonexistent/path.cti")
+        with patch.dict(sys.modules, {"harvesters.core": fake_core}):
+            with patch("pybeamprofiler.utils.os.path.exists", return_value=False):
+                cameras = utils.list_cameras("/nonexistent/path.cti")
 
         assert cameras == []
 
     @patch("pybeamprofiler.utils.find_cti_files")
-    @patch("harvesters.core.Harvester")
-    def test_list_cameras_no_cti_files(self, mock_harvester_class, mock_find_cti):
+    def test_list_cameras_no_cti_files(self, mock_find_cti):
         """Test listing cameras when no CTI files found."""
+        fake_core, mock_harvester_class = _mock_harvesters_core()
         mock_h = Mock()
         mock_harvester_class.return_value = mock_h
         mock_find_cti.return_value = []
 
-        cameras = utils.list_cameras()
+        with patch.dict(sys.modules, {"harvesters.core": fake_core}):
+            cameras = utils.list_cameras()
 
         assert cameras == []
 
     @patch("pybeamprofiler.utils.find_cti_files")
-    @patch("harvesters.core.Harvester")
-    def test_list_cameras_multiple_devices(self, mock_harvester_class, mock_find_cti):
+    def test_list_cameras_multiple_devices(self, mock_find_cti):
         """Test listing multiple cameras."""
+        fake_core, mock_harvester_class = _mock_harvesters_core()
         mock_h = Mock()
         mock_harvester_class.return_value = mock_h
         mock_find_cti.return_value = ["/path/to/test.cti"]
@@ -142,7 +155,8 @@ class TestListCameras:
 
         mock_h.device_info_list = [mock_device1, mock_device2]
 
-        cameras = utils.list_cameras()
+        with patch.dict(sys.modules, {"harvesters.core": fake_core}):
+            cameras = utils.list_cameras()
 
         assert len(cameras) == 2
         assert cameras[0]["vendor"] == "FLIR"

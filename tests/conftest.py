@@ -34,6 +34,7 @@ def beam_profiler():
     from pybeamprofiler import BeamProfiler
 
     bp = BeamProfiler(camera="simulated")
+    assert bp.camera is not None
     yield bp
     bp.camera.close()
 

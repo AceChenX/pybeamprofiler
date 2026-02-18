@@ -33,25 +33,26 @@ class FlirCamera(HarvesterCamera):
             cti_file: Path to CTI file. If None, searches GENICAM_GENTL64_PATH then platform paths
             serial_number: Camera serial number for device selection
         """
-        if cti_file is None:
+        cti_file_resolved: str | list[str] | None = cti_file
+        if cti_file_resolved is None:
             # Try GENICAM_GENTL64_PATH first (user-configured)
             gentl_path = os.environ.get("GENICAM_GENTL64_PATH")
             if gentl_path:
                 logger.info(f"Using GENICAM_GENTL64_PATH: {gentl_path}")
-                cti_file = HarvesterCamera._parse_gentl_path(gentl_path)
+                cti_file_resolved = HarvesterCamera._parse_gentl_path(gentl_path)
 
             # Fall back to platform-specific Spinnaker SDK paths
-            if not cti_file:
-                cti_file = self._find_flir_cti()
-                if cti_file:
-                    logger.info(f"Found FLIR CTI: {cti_file}")
+            if not cti_file_resolved:
+                cti_file_resolved = self._find_flir_cti()
+                if cti_file_resolved:
+                    logger.info(f"Found FLIR CTI: {cti_file_resolved}")
                 else:
                     logger.warning(
                         "FLIR Spinnaker CTI not found. "
                         "Please install Spinnaker SDK or set GENICAM_GENTL64_PATH."
                     )
 
-        super().__init__(cti_file=cti_file, serial_number=serial_number)
+        super().__init__(cti_file=cti_file_resolved, serial_number=serial_number)
 
     @staticmethod
     def _find_flir_cti() -> str | None:

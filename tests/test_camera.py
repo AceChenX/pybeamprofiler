@@ -99,6 +99,7 @@ class TestCameraIntegration:
     def test_camera_delegation(self):
         """Test that camera methods are accessible via BeamProfiler."""
         bp = BeamProfiler(camera="simulated")
+        assert bp.camera is not None
 
         assert hasattr(bp, "start_acquisition")
         assert hasattr(bp, "set_exposure")
