@@ -21,8 +21,8 @@ Real-time laser beam profiler with Gaussian fitting for GenICam cameras.
 ## Quick Start
 
 ```bash
-# Install
-uv pip install .
+# Install (creates/updates a reproducible environment from the lockfile)
+uv sync
 
 # Run with simulated camera (no hardware needed)
 uv run python -m pybeamprofiler.beamprofiler --camera simulated
@@ -37,6 +37,10 @@ uv run python -m pybeamprofiler.beamprofiler --camera simulated
 ```bash
 uv sync
 ```
+
+`uv sync` installs the exact versions recorded in `uv.lock`, giving you a reproducible environment. This is the recommended path for both users and CI.
+
+> **Installing into an existing environment?** If you are managing your own virtualenv or conda environment and do not want to use the lockfile, you can run `uv pip install .` (or plain `pip install .`) instead. Be aware that this resolves dependencies independently and may produce a different set of package versions than the lockfile.
 
 ### Development Installation
 
