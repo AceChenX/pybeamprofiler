@@ -997,7 +997,8 @@ class BeamProfiler:
             img = self.last_img
 
         if img is None:
-            return
+            logger.error("No image available for analysis in _plot_single (img is None).")
+            raise ValueError("No image available to analyze or plot (img is None).")
         popt_x, popt_y = self.analyze(img)
         fig = self._create_figure(img, popt_x, popt_y)
         fig.show()
