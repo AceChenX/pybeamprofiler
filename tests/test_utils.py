@@ -97,7 +97,11 @@ class TestListCameras:
 
         mock_h.device_info_list = [mock_device]
 
-        with patch.dict(sys.modules, {"harvesters.core": fake_core}):
+        # Ensure both the parent package and the core submodule are present in sys.modules
+        fake_parent = ModuleType("harvesters")
+        fake_parent.core = fake_core  # type: ignore[attr-defined]
+
+        with patch.dict(sys.modules, {"harvesters": fake_parent, "harvesters.core": fake_core}):
             with patch("pybeamprofiler.utils.os.path.exists", return_value=True):
                 cameras = utils.list_cameras("/path/to/test.cti")
 
