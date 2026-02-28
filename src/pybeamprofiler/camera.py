@@ -252,9 +252,7 @@ class Camera(ABC):
             def on_roi_reset(b):
                 try:
                     roi_max = cast(dict[str, Any], self.roi_info)
-                    self.set_roi(
-                        0, 0, roi_max["max_width"], roi_max["max_height"]
-                    )  # ty:ignore[call-non-callable]
+                    self.set_roi(0, 0, roi_max["max_width"], roi_max["max_height"])  # ty:ignore[call-non-callable]
                     offset_x_input.value = 0
                     offset_y_input.value = 0
                     width_input.value = roi_max["max_width"]
