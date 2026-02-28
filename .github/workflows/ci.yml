@@ -29,12 +29,7 @@ jobs:
         enable-cache: true
 
     - name: Set up Python ${{ matrix.python-version }}
-      run: |
-        if [ "${{ matrix.experimental }}" = "true" ]; then
-          uv python install ${{ matrix.python-version }} --allow-prereleases
-        else
-          uv python install ${{ matrix.python-version }}
-        fi
+      run: uv python install ${{ matrix.python-version }}
 
     - name: Install dependencies
       run: uv sync --extra dev
