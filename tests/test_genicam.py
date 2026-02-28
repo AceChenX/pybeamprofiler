@@ -157,7 +157,7 @@ class TestBaslerCamera:
         """Test that PYLON_PRODUCERS constant is defined and contains expected producers."""
         from pybeamprofiler.basler import PYLON_PRODUCERS
 
-        assert isinstance(PYLON_PRODUCERS, list | tuple)
+        assert isinstance(PYLON_PRODUCERS, (list, tuple))
         assert "ProducerGEV.cti" in PYLON_PRODUCERS
         assert "ProducerU3V.cti" in PYLON_PRODUCERS
 
