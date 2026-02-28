@@ -207,7 +207,7 @@ class HarvesterCamera(Camera):
                     if hasattr(self.node_map, "PixelSize"):
                         val = self.node_map.PixelSize.value
                         # Only use if it's a number (not a string like "Bpp8")
-                        if isinstance(val, int | float):
+                        if isinstance(val, (int, float)):
                             pixel_size = val
                             logger.debug("Using PixelSize for pixel size")
                 except (AttributeError, ValueError, TypeError):
