@@ -3,6 +3,7 @@
 import logging
 import math
 from abc import ABC, abstractmethod
+from typing import Any, cast
 
 import ipywidgets as widgets
 import numpy as np
@@ -82,11 +83,11 @@ class Camera(ABC):
         # Get exposure range from camera if available
         exposure_min, exposure_max = 1e-6, 1.0  # Default: 1us to 1s
         if hasattr(self, "exposure_range"):
-            exposure_min, exposure_max = self.exposure_range
+            exposure_min, exposure_max = cast(tuple[float, float], self.exposure_range)
 
         gain_min, gain_max = 0.0, 24.0
         if hasattr(self, "gain_range"):
-            gain_min, gain_max = self.gain_range
+            gain_min, gain_max = cast(tuple[float, float], self.gain_range)
 
         exp_min_log = math.floor(math.log10(exposure_min))
         exp_max_log = math.ceil(math.log10(exposure_max))
@@ -191,13 +192,13 @@ class Camera(ABC):
         if hasattr(self, "node_map") and self.node_map:
             try:
                 if hasattr(self.node_map, "SensorDescription"):
-                    desc = self.node_map.SensorDescription.value
+                    desc = self.node_map.SensorDescription.value  # ty:ignore[unresolved-attribute]
                     camera_info.append(widgets.HTML(f"<b>Sensor:</b> {desc}"))
             except Exception as e:
                 logger.debug(f"Optional feature SensorDescription not available: {e}")
             try:
                 if hasattr(self.node_map, "DeviceModelName"):
-                    model = self.node_map.DeviceModelName.value
+                    model = self.node_map.DeviceModelName.value  # ty:ignore[unresolved-attribute]
                     camera_info.append(widgets.HTML(f"<b>Model:</b> {model}"))
             except Exception as e:
                 logger.debug(f"Optional feature DeviceModelName not available: {e}")
@@ -207,13 +208,17 @@ class Camera(ABC):
         # ROI controls
         roi_controls = None
         if hasattr(self, "roi_info") and hasattr(self, "set_roi"):
-            roi = self.roi_info
+            roi = cast(dict[str, Any], self.roi_info)
 
             offset_x_input = widgets.IntText(
-                value=roi["offset_x"], description="Offset X:", style=style
+                value=roi["offset_x"],
+                description="Offset X:",
+                style=style,
             )
             offset_y_input = widgets.IntText(
-                value=roi["offset_y"], description="Offset Y:", style=style
+                value=roi["offset_y"],
+                description="Offset Y:",
+                style=style,
             )
             width_input = widgets.IntText(value=roi["width"], description="Width:", style=style)
             height_input = widgets.IntText(value=roi["height"], description="Height:", style=style)
@@ -233,9 +238,9 @@ class Camera(ABC):
                         offset_y_input.value,
                         width_input.value,
                         height_input.value,
-                    )
+                    )  # ty:ignore[call-non-callable]
                     # Update info display
-                    updated_roi = self.roi_info
+                    updated_roi = cast(dict[str, Any], self.roi_info)
                     camera_info[
                         1
                     ].value = (
@@ -246,8 +251,8 @@ class Camera(ABC):
 
             def on_roi_reset(b):
                 try:
-                    roi_max = self.roi_info
-                    self.set_roi(0, 0, roi_max["max_width"], roi_max["max_height"])
+                    roi_max = cast(dict[str, Any], self.roi_info)
+                    self.set_roi(0, 0, roi_max["max_width"], roi_max["max_height"])  # ty:ignore[call-non-callable]
                     offset_x_input.value = 0
                     offset_y_input.value = 0
                     width_input.value = roi_max["max_width"]
@@ -428,11 +433,11 @@ class Camera(ABC):
         controls = []
 
         for feature_name in features:
-            if not hasattr(self.node_map, feature_name):
+            if not hasattr(self.node_map, feature_name):  # ty:ignore[unresolved-attribute]
                 continue
 
             try:
-                node = getattr(self.node_map, feature_name)
+                node = getattr(self.node_map, feature_name)  # ty:ignore[unresolved-attribute]
 
                 # Check if readable
                 if not hasattr(node, "value"):

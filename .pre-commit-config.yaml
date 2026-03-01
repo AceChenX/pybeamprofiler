@@ -11,21 +11,23 @@ repos:
       - id: sort-simple-yaml
       - id: trailing-whitespace
 
-  - repo: local
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.14.0
     hooks:
       - id: ruff-format
-        name: ruff format
-        entry: ruff format
-        language: system
-        types_or: [python, pyi]
-      - id: ruff-check
-        name: ruff check
-        entry: ruff check
-        language: system
-        types_or: [python, pyi]
+      - id: ruff
         args: [
           --fix,
           --exit-non-zero-on-fix,
           --config,
-          'lint.extend-fixable = ["F401","F841"]',  # fix unused imports and variables at commit (but not save)
+          'lint.extend-fixable = ["F401","F841"]',
         ]
+
+  - repo: local
+    hooks:
+      - id: ty
+        name: ty type check
+        entry: uv run ty check src tests
+        language: system
+        types_or: [python, pyi]
+        pass_filenames: false

@@ -11,6 +11,7 @@ class TestBeamProfilerProperties:
     def test_basic_properties(self, beam_profiler):
         """Test basic width and diameter properties."""
         bp = beam_profiler
+        assert bp.camera is not None
 
         bp.camera.start_acquisition()
         img = bp.camera.get_image()
@@ -28,6 +29,7 @@ class TestBeamProfilerProperties:
     def test_laseview_properties(self, beam_profiler):
         """Test LaseView-compatible width properties."""
         bp = beam_profiler
+        assert bp.camera is not None
 
         bp.camera.start_acquisition()
         img = bp.camera.get_image()
@@ -47,6 +49,7 @@ class TestBeamProfilerProperties:
     def test_property_relationships(self, beam_profiler):
         """Test relationships between width properties."""
         bp = beam_profiler
+        assert bp.camera is not None
 
         bp.camera.start_acquisition()
         img = bp.camera.get_image()
@@ -75,7 +78,7 @@ class TestBeamProfilerStaticImages:
         bp.fit_method = "1d"
         bp.definition = "gaussian"
 
-        popt_x, popt_y = bp.analyze(bp.last_img)
+        popt_x, popt_y = bp.analyze(bp.last_img)  # ty:ignore[invalid-argument-type]
 
         assert popt_x is not None
         assert popt_y is not None
@@ -112,6 +115,7 @@ class TestBeamProfilerInitialization:
         """Test initialization with fit method."""
         for method in ["1d", "2d", "linecut"]:
             bp = BeamProfiler(camera="simulated", fit=method)
+            assert bp.camera is not None
             assert bp.fit_method == method
             bp.camera.close()
 
@@ -119,6 +123,7 @@ class TestBeamProfilerInitialization:
         """Test initialization with definition."""
         for defn in ["gaussian", "fwhm", "d4s"]:
             bp = BeamProfiler(camera="simulated", definition=defn)
+            assert bp.camera is not None
             assert bp.definition == defn
             bp.camera.close()
 
@@ -129,6 +134,7 @@ class TestBeamProfilerExposure:
     def test_none_exposure_single_shot(self):
         """Test None exposure doesn't crash for single shot."""
         bp = BeamProfiler(camera="simulated")
+        assert bp.camera is not None
 
         # This should not crash
         bp.camera.start_acquisition()
@@ -142,7 +148,8 @@ class TestBeamProfilerExposure:
     def test_none_exposure_continuous(self):
         """Test None exposure uses default."""
         bp = BeamProfiler(camera="simulated")
-        bp.camera.set_exposure(None)
+        assert bp.camera is not None
+        bp.camera.set_exposure(None)  # ty:ignore[invalid-argument-type]
         assert bp.camera.exposure_time == 0.01
         bp.camera.close()
 
@@ -181,6 +188,7 @@ class TestBeamProfilerVisualization:
     def test_create_fast_figure_1d(self):
         """Test fast figure creation with 1D fitting."""
         bp = BeamProfiler(camera="simulated", fit="1d")
+        assert bp.camera is not None
 
         bp.camera.start_acquisition()
         img = bp.camera.get_image()
@@ -196,6 +204,7 @@ class TestBeamProfilerVisualization:
     def test_create_fast_figure_2d(self):
         """Test fast figure creation with 2D fitting."""
         bp = BeamProfiler(camera="simulated", fit="2d")
+        assert bp.camera is not None
 
         bp.camera.start_acquisition()
         img = bp.camera.get_image()
@@ -211,6 +220,7 @@ class TestBeamProfilerVisualization:
     def test_create_fast_figure_none_params(self):
         """Test fast figure creation with None parameters."""
         bp = BeamProfiler(camera="simulated")
+        assert bp.camera is not None
 
         bp.camera.start_acquisition()
         img = bp.camera.get_image()
@@ -225,7 +235,8 @@ class TestBeamProfilerVisualization:
     def test_create_fast_figure_none_image(self):
         """Test fast figure creation with None image."""
         bp = BeamProfiler(camera="simulated")
-        fig = bp._create_fast_figure(None, None, None)
+        assert bp.camera is not None
+        fig = bp._create_fast_figure(None, None, None)  # ty:ignore[invalid-argument-type]
 
         assert fig is not None
         assert len(fig.data) == 0
@@ -238,6 +249,7 @@ class TestBeamProfilerMethods:
     def test_analyze_with_different_definitions(self):
         """Test analyze with different width definitions."""
         bp = BeamProfiler(camera="simulated")
+        assert bp.camera is not None
 
         bp.camera.start_acquisition()
         img = bp.camera.get_image()
@@ -256,6 +268,7 @@ class TestBeamProfilerMethods:
     def test_analyze_with_different_fit_methods(self):
         """Test analyze with different fitting methods."""
         bp = BeamProfiler(camera="simulated")
+        assert bp.camera is not None
 
         bp.camera.start_acquisition()
         img = bp.camera.get_image()
@@ -281,6 +294,7 @@ class TestBeamProfilerMethods:
         with pytest.raises(AttributeError):
             _ = bp.nonexistent_attribute
 
+        assert bp.camera is not None
         bp.camera.close()
 
 
@@ -323,14 +337,16 @@ class TestBeamProfilerInputValidation:
         """Test analyze raises error on None input."""
         bp = BeamProfiler(camera="simulated")
         with pytest.raises(ValueError, match="Image cannot be None"):
-            bp.analyze(None)
+            bp.analyze(None)  # ty: ignore[invalid-argument-type]
+        assert bp.camera is not None
         bp.camera.close()
 
     def test_analyze_wrong_type(self):
         """Test analyze raises error on wrong type."""
         bp = BeamProfiler(camera="simulated")
         with pytest.raises(TypeError, match="Image must be numpy array"):
-            bp.analyze([1, 2, 3])
+            bp.analyze([1, 2, 3])  # ty: ignore[invalid-argument-type]
+        assert bp.camera is not None
         bp.camera.close()
 
     def test_analyze_wrong_dimensions(self):
@@ -347,6 +363,7 @@ class TestBeamProfilerInputValidation:
         with pytest.raises(ValueError, match="Image must be 2D"):
             bp.analyze(np.zeros((10, 10, 3)))
 
+        assert bp.camera is not None
         bp.camera.close()
 
     def test_analyze_empty_image(self):
@@ -356,5 +373,5 @@ class TestBeamProfilerInputValidation:
         bp = BeamProfiler(camera="simulated")
         with pytest.raises(ValueError, match="Image cannot be empty"):
             bp.analyze(np.array([[]]))
-        bp.camera.close()
+        assert bp.camera is not None
         bp.camera.close()

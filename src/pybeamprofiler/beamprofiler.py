@@ -989,12 +989,16 @@ class BeamProfiler:
     def _plot_single(self) -> None:
         """Capture and plot single image."""
         if self._mode == "camera":
+            assert self.camera is not None
             self.camera.start_acquisition()
             img = self.camera.get_image()
             self.camera.stop_acquisition()
         else:
             img = self.last_img
 
+        if img is None:
+            logger.error("No image available for analysis in _plot_single (img is None).")
+            raise ValueError("No image available to analyze or plot (img is None).")
         popt_x, popt_y = self.analyze(img)
         fig = self._create_figure(img, popt_x, popt_y)
         fig.show()
@@ -1004,6 +1008,7 @@ class BeamProfiler:
 
         # Ensure camera is ready for continuous acquisition
         if self._mode == "camera":
+            assert self.camera is not None
             if not self.camera.is_acquiring:
                 self.camera.start_acquisition()
 
@@ -1014,7 +1019,7 @@ class BeamProfiler:
             # Check if running in Jupyter
             from IPython.display import clear_output, display
 
-            get_ipython()
+            get_ipython()  # ty: ignore[unresolved-reference]
 
             # Use clear_output for live updates
             if heatmap_only:
@@ -1029,7 +1034,11 @@ class BeamProfiler:
             try:
                 while True:
                     # Get and analyze image
-                    img = self.camera.get_image() if self._mode == "camera" else self.last_img
+                    img = (
+                        self.camera.get_image()
+                        if self._mode == "camera" and self.camera is not None
+                        else self.last_img
+                    )
                     if img is None:
                         break
 
@@ -1075,15 +1084,19 @@ class BeamProfiler:
 
                 # Matplotlib fallback
                 try:
-                    import matplotlib.pyplot as plt
-                    from matplotlib.animation import FuncAnimation
-                    from matplotlib.patches import Ellipse
+                    import matplotlib.pyplot as plt  # ty: ignore[unresolved-import]
+                    from matplotlib.animation import FuncAnimation  # ty: ignore[unresolved-import]
+                    from matplotlib.patches import Ellipse  # ty: ignore[unresolved-import]
 
                     fig_plt, axes = plt.subplots(2, 2, figsize=(10, 8))
                     fig_plt.tight_layout(pad=3.0)
 
                     def update_frame(frame_num):
-                        img = self.camera.get_image() if self._mode == "camera" else self.last_img
+                        img = (
+                            self.camera.get_image()
+                            if self._mode == "camera" and self.camera is not None
+                            else self.last_img
+                        )
                         if img is None:
                             return
 
@@ -1218,11 +1231,15 @@ class BeamProfiler:
             shutdown_flag = {"stop": False}
 
             # Start acquisition before Dash server
-            if self._mode == "camera" and not self.camera.is_acquiring:
+            if self._mode == "camera" and self.camera is not None and not self.camera.is_acquiring:
                 self.camera.start_acquisition()
 
             # Get initial image for display
-            initial_img = self.camera.get_image() if self._mode == "camera" else self.last_img
+            initial_img = (
+                self.camera.get_image()
+                if self._mode == "camera" and self.camera is not None
+                else self.last_img
+            )
             initial_popt_x, initial_popt_y = (
                 self.analyze(initial_img) if initial_img is not None else (None, None)
             )
@@ -1259,14 +1276,22 @@ class BeamProfiler:
                 if n % 10 == 0:
                     logger.debug(f"Processing frame {n}")
 
-                if self._mode == "camera" and not self.camera.is_acquiring:
+                if (
+                    self._mode == "camera"
+                    and self.camera is not None
+                    and not self.camera.is_acquiring
+                ):
                     try:
                         self.camera.start_acquisition()
                     except Exception:
                         return go.Figure()
 
                 try:
-                    img = self.camera.get_image() if self._mode == "camera" else self.last_img
+                    img = (
+                        self.camera.get_image()
+                        if self._mode == "camera" and self.camera is not None
+                        else self.last_img
+                    )
                 except Exception as e:
                     # Camera fetch failed (likely stopped), return empty figure
                     logger.debug(f"Failed to get image: {e}")

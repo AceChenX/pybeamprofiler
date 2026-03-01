@@ -35,27 +35,28 @@ class BaslerCamera(HarvesterCamera):
             cti_file: Path to CTI file. If None, searches GENICAM_GENTL64_PATH then platform paths
             serial_number: Camera serial number for device selection
         """
-        if cti_file is None:
+        cti_file_resolved: str | list[str] | None = cti_file
+        if cti_file_resolved is None:
             # Try GENICAM_GENTL64_PATH first (user-configured)
             gentl_path = os.environ.get("GENICAM_GENTL64_PATH")
             if gentl_path:
                 logger.info(f"Using GENICAM_GENTL64_PATH: {gentl_path}")
-                cti_file = HarvesterCamera._parse_gentl_path(gentl_path)
+                cti_file_resolved = HarvesterCamera._parse_gentl_path(gentl_path)
 
             # Fall back to platform-specific Pylon SDK paths
-            if not cti_file:
-                cti_file = self._find_basler_cti()
-                if cti_file:
-                    if isinstance(cti_file, list):
-                        logger.info(f"Found Basler CTI files: {', '.join(cti_file)}")
+            if not cti_file_resolved:
+                cti_file_resolved = self._find_basler_cti()
+                if cti_file_resolved:
+                    if isinstance(cti_file_resolved, list):
+                        logger.info(f"Found Basler CTI files: {', '.join(cti_file_resolved)}")
                     else:
-                        logger.info(f"Found Basler CTI: {cti_file}")
+                        logger.info(f"Found Basler CTI: {cti_file_resolved}")
                 else:
                     logger.warning(
                         "Basler Pylon CTI not found. Please install Pylon SDK or set GENICAM_GENTL64_PATH."
                     )
 
-        super().__init__(cti_file=cti_file, serial_number=serial_number)
+        super().__init__(cti_file=cti_file_resolved, serial_number=serial_number)
 
     @staticmethod
     def _find_basler_cti() -> list[str] | None:

@@ -86,7 +86,7 @@ class SimulatedCamera(Camera):
         self.image_buffer = image
         return image
 
-    def set_exposure(self, exposure_time: float):
+    def set_exposure(self, exposure_time: float | None):
         """Set exposure time and adjust simulated signal amplitude."""
         if exposure_time is None:
             exposure_time = 0.01
