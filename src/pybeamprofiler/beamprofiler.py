@@ -1,6 +1,7 @@
 """Laser beam profiler with Gaussian fitting and visualization."""
 
 import argparse
+import asyncio
 import logging
 import os
 import threading
@@ -428,6 +429,7 @@ class BeamProfiler:
         try:
             x, y = np.arange(w), np.arange(h)
             xv, yv = np.meshgrid(x, y)
+
             # Bounds constrain parameters for faster convergence:
             # amplitude > 0, centers in image, sigmas > 0.1, theta in [-π, π]
             bounds = ([0, 0, 0, 0.1, 0.1, -np.pi, -np.inf], [np.inf, w, h, w, h, np.pi, np.inf])
@@ -568,7 +570,7 @@ class BeamProfiler:
         self,
         num_img: int | None = None,
         heatmap_only: bool = False,
-    ) -> None:
+    ) -> asyncio.Task | None:
         """Display beam profile with Gaussian fitting visualization.
 
         Args:
@@ -580,8 +582,9 @@ class BeamProfiler:
 
         if num_img == 1 or self._mode == "static":
             self._plot_single()
+            return None
         else:
-            self._plot_stream()
+            return self._plot_stream()
 
     def _create_fast_figure(
         self, image: np.ndarray, popt_x: list | None, popt_y: list | None
@@ -603,6 +606,7 @@ class BeamProfiler:
 
         # Create physical coordinate arrays for heatmap
         h, w = image.shape
+
         x_coords = np.arange(w) * self.pixel_size
         y_coords = np.arange(h) * self.pixel_size
 
@@ -700,6 +704,7 @@ class BeamProfiler:
         y_range = [0, h * self.pixel_size]
 
         fig.update_layout(
+            uirevision="constant",
             height=600,
             width=600,
             title_text=title,
@@ -850,6 +855,7 @@ class BeamProfiler:
         x = np.arange(len(image[0]))
         x_um = x * self.pixel_size  # Convert to physical dimensions
         proj_x = np.sum(image, axis=0)
+
         fig.add_trace(
             go.Scatter(
                 x=x_um,
@@ -879,6 +885,7 @@ class BeamProfiler:
         y = np.arange(len(image))
         y_um = y * self.pixel_size  # Convert to physical dimensions
         proj_y = np.sum(image, axis=1)
+
         fig.add_trace(
             go.Scatter(
                 x=proj_y,
@@ -919,6 +926,7 @@ class BeamProfiler:
         title += "</span>"
 
         fig.update_layout(
+            uirevision="constant",
             height=700,
             width=900,
             title_text=title,
@@ -1003,7 +1011,7 @@ class BeamProfiler:
         fig = self._create_figure(img, popt_x, popt_y)
         fig.show()
 
-    def _plot_stream(self) -> None:
+    def _plot_stream(self) -> asyncio.Task | None:
         """Start continuous streaming with live updates."""
 
         # Ensure camera is ready for continuous acquisition
@@ -1023,54 +1031,73 @@ class BeamProfiler:
 
             # Use clear_output for live updates
             if heatmap_only:
-                logger.info("Starting live stream (heatmap only, ~25-30 Hz)...")
+                logger.info("Starting live stream (heatmap only)...")
             else:
-                logger.info("Starting live stream (~6-10 Hz)...")
+                logger.info("Starting live stream...")
             logger.info("Press Jupyter's interrupt button (■) to stop\n")
 
-            frame_count = 0
-            start_time = time.time()
+            async def jupyter_stream_loop():
+                frame_count = 0
+                start_time = time.time()
+                try:
+                    while True:
+                        # Give kernel event loop a tiny slice to process interrupts/callbacks
+                        await asyncio.sleep(0)
 
-            try:
-                while True:
-                    # Get and analyze image
-                    img = (
-                        self.camera.get_image()
-                        if self._mode == "camera" and self.camera is not None
-                        else self.last_img
-                    )
-                    if img is None:
-                        break
+                        # Get image
+                        img = (
+                            self.camera.get_image()
+                            if self._mode == "camera" and self.camera is not None
+                            else self.last_img
+                        )
+                        if img is None:
+                            break
 
-                    # Perform Gaussian fitting
-                    popt_x, popt_y = self.analyze(img)
+                        # Offload Gaussian fitting
+                        popt_x, popt_y = await asyncio.to_thread(self.analyze, img)
 
-                    # Create figure
-                    if heatmap_only:
-                        fig = self._create_fast_figure(img, popt_x, popt_y)
-                    else:
-                        fig = self._create_figure(img, popt_x, popt_y)
+                        # Offload figure creation
+                        if heatmap_only:
+                            fig = await asyncio.to_thread(
+                                self._create_fast_figure, img, popt_x, popt_y
+                            )
+                        else:
+                            fig = await asyncio.to_thread(self._create_figure, img, popt_x, popt_y)
 
-                    # Add frame info to title
-                    frame_count += 1
+                        # Add frame info to title
+                        frame_count += 1
+                        elapsed = time.time() - start_time
+                        fps = frame_count / elapsed if elapsed > 0 else 0
+
+                        current_title = fig.layout.title.text if fig.layout.title else ""
+                        fig.update_layout(
+                            title_text=f"{current_title}<br><span style='font-size:11px; color:#666'>Frame #{frame_count} | FPS: {fps:.1f}</span>"
+                        )
+
+                        # Clear and display updated figure
+                        clear_output(wait=True)
+                        display(fig)
+
+                except asyncio.CancelledError:
+                    pass
+                except KeyboardInterrupt:
+                    pass
+                finally:
                     elapsed = time.time() - start_time
                     fps = frame_count / elapsed if elapsed > 0 else 0
-
-                    current_title = fig.layout.title.text if fig.layout.title else ""
-                    fig.update_layout(
-                        title_text=f"{current_title}<br><span style='font-size:11px; color:#666'>Frame #{frame_count} | FPS: {fps:.1f}</span>"
+                    logger.info(
+                        f"\nStream stopped: {frame_count} frames in {elapsed:.1f}s ({fps:.1f} fps)"
                     )
 
-                    # Clear and display updated figure
-                    clear_output(wait=True)
-                    display(fig)
-
-            except KeyboardInterrupt:
-                elapsed = time.time() - start_time
-                fps = frame_count / elapsed if elapsed > 0 else 0
-                logger.info(
-                    f"\nStream stopped: {frame_count} frames in {elapsed:.1f}s ({fps:.1f} fps)"
-                )
+            # Create the loop task within Jupyter's existing event loop
+            try:
+                loop = asyncio.get_running_loop()
+                task = loop.create_task(jupyter_stream_loop())
+                # Return the task so Jupyter displays standard outputs correctly
+                return task
+            except RuntimeError:
+                # Fallback if no loop is somehow running
+                asyncio.run(jupyter_stream_loop())
 
         except (NameError, ImportError):
             # Running from command line - use Dash
@@ -1268,7 +1295,7 @@ class BeamProfiler:
                 Output("live-update-graph", "figure"),
                 Input("interval-component", "n_intervals"),
             )
-            def update_graph_live(n):
+            async def update_graph_live(n):
                 # Check if shutdown requested
                 if shutdown_flag["stop"]:
                     return go.Figure()
@@ -1300,13 +1327,15 @@ class BeamProfiler:
                 if img is None:
                     return go.Figure()
 
-                popt_x, popt_y = self.analyze(img)
+                # Offload to another thread to release the GIL, allowing
+                # the camera stream loop to read frames cleanly in the background.
+                popt_x, popt_y = await asyncio.to_thread(self.analyze, img)
 
                 # Use heatmap_only mode if set
                 if heatmap_only:
-                    fig = self._create_fast_figure(img, popt_x, popt_y)
+                    fig = await asyncio.to_thread(self._create_fast_figure, img, popt_x, popt_y)
                 else:
-                    fig = self._create_figure(img, popt_x, popt_y)
+                    fig = await asyncio.to_thread(self._create_figure, img, popt_x, popt_y)
 
                 # Always add frame number to show updates
                 current_title = fig.layout.title.text if fig.layout.title else ""

@@ -30,7 +30,7 @@ dependencies = [
     "numpy",
     "scipy",
     "plotly",
-    "dash",
+    "dash[async]",
     "ipywidgets",
     "Pillow",
     "harvesters>=1.4.0",
