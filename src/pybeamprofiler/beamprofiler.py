@@ -1045,11 +1045,11 @@ class BeamProfiler:
                         await asyncio.sleep(0)
 
                         # Get image
-                        img = (
-                            self.camera.get_image()
-                            if self._mode == "camera" and self.camera is not None
-                            else self.last_img
-                        )
+                        if self._mode == "camera" and self.camera is not None:
+                            # Offload potentially blocking camera acquisition to a thread
+                            img = await asyncio.to_thread(self.camera.get_image)
+                        else:
+                            img = self.last_img
                         if img is None:
                             break
 
