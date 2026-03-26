@@ -93,6 +93,7 @@ class BeamProfiler:
         self._last_popt_x = None
         self._last_popt_y = None
         self._last_popt_2d = None
+        self._stream_task = None  # Reference to Jupyter streaming background task
 
         self.last_img = None  # Initialize before file/camera loading
 
@@ -566,6 +567,15 @@ class BeamProfiler:
         self.width_x = factor * sigma_x * self.pixel_size
         self.width_y = factor * sigma_y * self.pixel_size
 
+    def stop(self) -> None:
+        """Stop any active continuous streams and stop camera acquisition."""
+        if hasattr(self, "_stream_task") and self._stream_task is not None:
+            self._stream_task.cancel()
+            self._stream_task = None
+
+        if self._mode == "camera" and self.camera is not None and self.camera.is_acquiring:
+            self.camera.stop_acquisition()
+
     def plot(
         self,
         num_img: int | None = None,
@@ -576,6 +586,13 @@ class BeamProfiler:
         Args:
             num_img: Number of images (1 for single shot, None for continuous streaming)
             heatmap_only: Show only heatmap for faster rendering
+
+        Returns:
+            In single-shot or static mode, returns `None`.
+            In streaming mode within a Jupyter environment, returns the background `asyncio.Task`
+            powering the live visualization. This allows calling `.cancel()` on the task to stop
+            the loop programmatically. Outside of Jupyter (terminal Dash/matplotlib), returns `None`
+            as it inherently binds to the main process until interrupted (e.g. Ctrl-C).
         """
 
         self._heatmap_only = heatmap_only  # Store for _plot_stream to use
@@ -1034,49 +1051,56 @@ class BeamProfiler:
                 logger.info("Starting live stream (heatmap only)...")
             else:
                 logger.info("Starting live stream...")
-            logger.info("Press Jupyter's interrupt button (■) to stop\n")
+            logger.info("Call profiler.stop() or cancel the returned task to stop\n")
 
             async def jupyter_stream_loop():
                 frame_count = 0
                 start_time = time.time()
                 try:
                     while True:
-                        # Give kernel event loop a tiny slice to process interrupts/callbacks
-                        await asyncio.sleep(0)
+                        try:
+                            # Give kernel event loop a tiny slice to process interrupts/callbacks
+                            await asyncio.sleep(0)
 
-                        # Get image
-                        if self._mode == "camera" and self.camera is not None:
-                            # Offload potentially blocking camera acquisition to a thread
-                            img = await asyncio.to_thread(self.camera.get_image)
-                        else:
-                            img = self.last_img
-                        if img is None:
-                            break
+                            # Get image
+                            if self._mode == "camera" and self.camera is not None:
+                                # Offload potentially blocking camera acquisition to a thread
+                                img = await asyncio.to_thread(self.camera.get_image)
+                            else:
+                                img = self.last_img
+                            if img is None:
+                                break
 
-                        # Offload Gaussian fitting
-                        popt_x, popt_y = await asyncio.to_thread(self.analyze, img)
+                            # Offload Gaussian fitting
+                            popt_x, popt_y = await asyncio.to_thread(self.analyze, img)
 
-                        # Offload figure creation
-                        if heatmap_only:
-                            fig = await asyncio.to_thread(
-                                self._create_fast_figure, img, popt_x, popt_y
+                            # Offload figure creation
+                            if heatmap_only:
+                                fig = await asyncio.to_thread(
+                                    self._create_fast_figure, img, popt_x, popt_y
+                                )
+                            else:
+                                fig = await asyncio.to_thread(
+                                    self._create_figure, img, popt_x, popt_y
+                                )
+
+                            # Add frame info to title
+                            frame_count += 1
+                            elapsed = time.time() - start_time
+                            fps = frame_count / elapsed if elapsed > 0 else 0
+
+                            current_title = fig.layout.title.text if fig.layout.title else ""
+                            fig.update_layout(
+                                title_text=f"{current_title}<br><span style='font-size:11px; color:#666'>Frame #{frame_count} | FPS: {fps:.1f}</span>"
                             )
-                        else:
-                            fig = await asyncio.to_thread(self._create_figure, img, popt_x, popt_y)
 
-                        # Add frame info to title
-                        frame_count += 1
-                        elapsed = time.time() - start_time
-                        fps = frame_count / elapsed if elapsed > 0 else 0
+                            # Clear and display updated figure
+                            clear_output(wait=True)
+                            display(fig)
 
-                        current_title = fig.layout.title.text if fig.layout.title else ""
-                        fig.update_layout(
-                            title_text=f"{current_title}<br><span style='font-size:11px; color:#666'>Frame #{frame_count} | FPS: {fps:.1f}</span>"
-                        )
-
-                        # Clear and display updated figure
-                        clear_output(wait=True)
-                        display(fig)
+                        except Exception as e:
+                            logger.error(f"Unexpected error in stream loop: {e}", exc_info=True)
+                            break
 
                 except asyncio.CancelledError:
                     pass
@@ -1093,6 +1117,7 @@ class BeamProfiler:
             try:
                 loop = asyncio.get_running_loop()
                 task = loop.create_task(jupyter_stream_loop())
+                self._stream_task = task
                 # Return the task so Jupyter displays standard outputs correctly
                 return task
             except RuntimeError:
@@ -1314,11 +1339,10 @@ class BeamProfiler:
                         return go.Figure()
 
                 try:
-                    img = (
-                        self.camera.get_image()
-                        if self._mode == "camera" and self.camera is not None
-                        else self.last_img
-                    )
+                    if self._mode == "camera" and self.camera is not None:
+                        img = await asyncio.to_thread(self.camera.get_image)
+                    else:
+                        img = self.last_img
                 except Exception as e:
                     # Camera fetch failed (likely stopped), return empty figure
                     logger.debug(f"Failed to get image: {e}")
@@ -1327,23 +1351,27 @@ class BeamProfiler:
                 if img is None:
                     return go.Figure()
 
-                # Offload to another thread to release the GIL, allowing
-                # the camera stream loop to read frames cleanly in the background.
-                popt_x, popt_y = await asyncio.to_thread(self.analyze, img)
+                try:
+                    # Offload to another thread to release the GIL, allowing
+                    # the camera stream loop to read frames cleanly in the background.
+                    popt_x, popt_y = await asyncio.to_thread(self.analyze, img)
 
-                # Use heatmap_only mode if set
-                if heatmap_only:
-                    fig = await asyncio.to_thread(self._create_fast_figure, img, popt_x, popt_y)
-                else:
-                    fig = await asyncio.to_thread(self._create_figure, img, popt_x, popt_y)
+                    # Use heatmap_only mode if set
+                    if heatmap_only:
+                        fig = await asyncio.to_thread(self._create_fast_figure, img, popt_x, popt_y)
+                    else:
+                        fig = await asyncio.to_thread(self._create_figure, img, popt_x, popt_y)
 
-                # Always add frame number to show updates
-                current_title = fig.layout.title.text if fig.layout.title else ""
-                fig.update_layout(
-                    title_text=f"{current_title}<br><span style='font-size:11px; color:#666'>Frame #{n}</span>"
-                )
+                    # Always add frame number to show updates
+                    current_title = fig.layout.title.text if fig.layout.title else ""
+                    fig.update_layout(
+                        title_text=f"{current_title}<br><span style='font-size:11px; color:#666'>Frame #{n}</span>"
+                    )
 
-                return fig
+                    return fig
+                except Exception as e:
+                    logger.debug(f"Frame analysis/generation failed: {e}")
+                    return dash.no_update
 
             logger.info("Starting Dash server at http://127.0.0.1:8050")
             logger.info("Opening browser automatically...")

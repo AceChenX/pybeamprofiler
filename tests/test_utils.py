@@ -11,7 +11,7 @@ def _mock_harvesters_core() -> tuple[ModuleType, Mock]:
     """Return a fake harvesters.core module and its Harvester class mock."""
     mock_harvester_class = Mock()
     fake_core = ModuleType("harvesters.core")
-    fake_core.Harvester = mock_harvester_class  # type: ignore[attr-defined]
+    fake_core.Harvester = mock_harvester_class  # type: ignore
     return fake_core, mock_harvester_class
 
 
@@ -99,7 +99,7 @@ class TestListCameras:
 
         # Ensure both the parent package and the core submodule are present in sys.modules
         fake_parent = ModuleType("harvesters")
-        fake_parent.core = fake_core  # type: ignore[attr-defined]
+        fake_parent.core = fake_core  # type: ignore
 
         with patch.dict(sys.modules, {"harvesters": fake_parent, "harvesters.core": fake_core}):
             with patch("pybeamprofiler.utils.os.path.exists", return_value=True):
