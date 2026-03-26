@@ -3,6 +3,7 @@
 import logging
 import os
 import platform
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -62,7 +63,7 @@ def find_cti_files() -> list[str]:
                 if file.endswith(".cti"):
                     full_path = os.path.join(base_path, file)
                     # Verify the file is actually within base_path
-                    if os.path.realpath(full_path).startswith(base_path):
+                    if os.path.commonpath([os.path.realpath(full_path), base_path]) == base_path:
                         cti_files.append(full_path)
         except (OSError, PermissionError) as e:
             logger.debug(f"Could not list directory {base_path}: {e}")
@@ -70,14 +71,14 @@ def find_cti_files() -> list[str]:
     return cti_files
 
 
-def list_cameras(cti_file: str | None = None) -> list[dict[str, str]]:
+def list_cameras(cti_file: str | None = None) -> list[dict[str, Any]]:
     """List all available GenICam cameras.
 
     Args:
         cti_file: Path to specific CTI file, or None to search all
 
     Returns:
-        List of camera info dictionaries with keys: vendor, model, serial_number, id
+        List of camera info dictionaries with keys: vendor, model, serial_number, id, index
     """
     try:
         from harvesters.core import Harvester
@@ -106,7 +107,11 @@ def list_cameras(cti_file: str | None = None) -> list[dict[str, str]]:
                 except Exception as e:
                     logger.warning(f"Could not load {cti}: {e}")
 
-        h.update()
+        try:
+            h.update()
+        except Exception as e:
+            logger.error(f"Error updating Harvester: {e}")
+            return []
 
         cameras = []
         for i, device in enumerate(h.device_info_list):

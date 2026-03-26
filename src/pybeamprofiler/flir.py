@@ -59,32 +59,39 @@ class FlirCamera(HarvesterCamera):
         """Search for FLIR Spinnaker CTI in platform-specific SDK installation paths.
 
         Searches common Spinnaker SDK installation locations by platform.
+        Dynamically scans directories to support any Spinnaker version.
 
         Returns:
             Path to first found CTI file, or None if not found
         """
         system = platform.system()
-        search_paths = []
+        search_dirs = []
 
         if system == "Windows":
-            base = r"C:\Program Files\Teledyne\Spinnaker"
-            search_paths = [
-                os.path.join(base, "cti64", "vs2015", "Spinnaker_v140.cti"),
-                os.path.join(base, "cti64", "vs2017", "Spinnaker_v141.cti"),
-            ]
+            base = r"C:\Program Files\Teledyne\Spinnaker\cti64"
+            if os.path.exists(base):
+                try:
+                    for subdir in os.listdir(base):
+                        dir_path = os.path.join(base, subdir)
+                        if os.path.isdir(dir_path):
+                            search_dirs.append(dir_path)
+                except OSError:
+                    pass
         elif system == "Linux":
-            search_paths = [
-                "/opt/spinnaker/lib/flir-gentl/Spinnaker_GenTL.cti",
-                "/opt/spinnaker/lib/flir-gentl/FLIR_GenTL_v140.cti",
-            ]
+            search_dirs = ["/opt/spinnaker/lib/flir-gentl"]
         elif system == "Darwin":
-            search_paths = [
-                "/usr/local/lib/spinnaker-gentl/Spinnaker_GenTL.cti",
-                "/usr/local/lib/spinnaker-gentl/FLIR_GenTL_v140.cti",
+            search_dirs = [
+                "/usr/local/lib/spinnaker-gentl",
+                "/Library/Application Support/FLIR/Spinnaker/lib",
             ]
 
-        for path in search_paths:
-            if os.path.exists(path):
-                return path
+        for d in search_dirs:
+            if os.path.isdir(d):
+                try:
+                    for f in os.listdir(d):
+                        if f.endswith(".cti"):
+                            return os.path.join(d, f)
+                except OSError:
+                    continue
 
         return None
