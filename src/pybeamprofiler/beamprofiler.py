@@ -1069,7 +1069,15 @@ class BeamProfiler:
                             else:
                                 img = self.last_img
                             if img is None:
-                                break
+                                # If camera is still acquiring but returned no frame (timeout etc), keep trying
+                                if (
+                                    self._mode == "camera"
+                                    and self.camera is not None
+                                    and not self.camera.is_acquiring
+                                ):
+                                    break
+                                await asyncio.sleep(0.01)
+                                continue
 
                             # Offload Gaussian fitting
                             popt_x, popt_y = await asyncio.to_thread(self.analyze, img)
@@ -1099,8 +1107,11 @@ class BeamProfiler:
                             display(fig)
 
                         except Exception as e:
-                            logger.error(f"Unexpected error in stream loop: {e}", exc_info=True)
-                            break
+                            # Frame failure (e.g., camera timeout or corrupted frame).
+                            # Log and continue instead of breaking to keep stream alive.
+                            logger.debug(f"Frame error in stream loop: {e}")
+                            await asyncio.sleep(0.01)
+                            continue
 
                 except asyncio.CancelledError:
                     pass
@@ -1346,10 +1357,10 @@ class BeamProfiler:
                 except Exception as e:
                     # Camera fetch failed (likely stopped), return empty figure
                     logger.debug(f"Failed to get image: {e}")
-                    return go.Figure()
+                    return dash.no_update
 
                 if img is None:
-                    return go.Figure()
+                    return dash.no_update
 
                 try:
                     # Offload to another thread to release the GIL, allowing

@@ -39,6 +39,12 @@ class TestFWHMDefinition:
         """Test FWHM width definition."""
         bp = beam_profiler
         assert bp.camera is not None
+        # Remove simulation noise for tight bounds
+        setattr(bp.camera, "_noise_center", 0.0)
+        setattr(bp.camera, "_noise_sigma", 0.0)
+        setattr(bp.camera, "_noise_amp", 0.0)
+        setattr(bp.camera, "_noise_bg", 0.0)
+        setattr(bp.camera, "_noise_image", 0.0)
         bp.fit_method = "1d"
         bp.definition = "fwhm"
 
@@ -52,7 +58,7 @@ class TestFWHMDefinition:
         assert popt_y is not None
         assert bp.width_x > 0
         assert bp.width_y > 0
-        assert 500 < bp.width_x < 2000
+        assert 1750 < bp.width_x < 1770
 
 
 class TestD4SigmaDefinition:
@@ -62,6 +68,12 @@ class TestD4SigmaDefinition:
         """Test D4σ width definition."""
         bp = beam_profiler
         assert bp.camera is not None
+        # Remove simulation noise for tight bounds
+        setattr(bp.camera, "_noise_center", 0.0)
+        setattr(bp.camera, "_noise_sigma", 0.0)
+        setattr(bp.camera, "_noise_amp", 0.0)
+        setattr(bp.camera, "_noise_bg", 0.0)
+        setattr(bp.camera, "_noise_image", 0.0)
         bp.fit_method = "1d"
         bp.definition = "d4s"
 
@@ -73,7 +85,7 @@ class TestD4SigmaDefinition:
 
         assert bp.width_x > 0
         assert bp.width_y > 0
-        assert 1000 < bp.width_x < 3100
+        assert 2930 < bp.width_x < 2950
 
 
 class TestDefinitionComparisons:
@@ -210,6 +222,11 @@ class TestWidthDefinitions:
         """Test FWHM (Full Width at Half Maximum) definition."""
         bp = BeamProfiler(camera="simulated", fit="1d", definition="fwhm")
         assert bp.camera is not None
+        setattr(bp.camera, "_noise_center", 0.0)
+        setattr(bp.camera, "_noise_sigma", 0.0)
+        setattr(bp.camera, "_noise_amp", 0.0)
+        setattr(bp.camera, "_noise_bg", 0.0)
+        setattr(bp.camera, "_noise_image", 0.0)
         bp.camera.start_acquisition()
         img = bp.camera.get_image()
         bp.camera.stop_acquisition()
@@ -222,16 +239,9 @@ class TestWidthDefinitions:
         assert bp.width_y > 0
 
         # FWHM is measured directly from half-maximum points, not from Gaussian fit
-        # Just verify it's in a reasonable range
-        assert 500 < bp.width_x < 2000  # Typical beam width range
-        assert 500 < bp.width_y < 2000
-        assert bp.width_x > 0
-        assert bp.width_y > 0
-
-        # D4σ is measured using second moment method, not from Gaussian fit
-        # Just verify it's in a reasonable range
-        assert 1000 < bp.width_x < 3000  # D4σ should be larger than FWHM
-        assert 1000 < bp.width_y < 3000
+        # FWHM expected to be ~2.355 * sigma * pixel_size = 2.355 * 20 * 25 = 1177.5
+        assert 1750 < bp.width_x < 1770
+        assert 1640 < bp.width_y < 1660
 
         """Test that different definitions give different widths for same beam."""
         bp_gaussian = BeamProfiler(camera="simulated", fit="1d", definition="gaussian")

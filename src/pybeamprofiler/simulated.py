@@ -35,6 +35,13 @@ class SimulatedCamera(Camera):
         self._amplitude = 250
         self._background = 10
 
+        # Noise parameters (can be overridden in tests for exact deterministic bounds)
+        self._noise_center = 50.0
+        self._noise_sigma = 20.0
+        self._noise_amp = 10.0
+        self._noise_bg = 10.0
+        self._noise_image = 10.0
+
         # Add exposure/gain ranges for compatibility
         self._exposure_min = 0.001  # 1 ms
         self._exposure_max = 1.0  # 1 s
@@ -65,15 +72,15 @@ class SimulatedCamera(Camera):
         Returns:
             2D numpy array of uint8 intensity values (1024x1024)
         """
-        cx = self._center_x + np.random.normal(0, 3)
-        cy = self._center_y + np.random.normal(0, 3)
-        sx = self._sigma_x + np.random.normal(0, 2)
-        sy = self._sigma_y + np.random.normal(0, 2)
+        cx = self._center_x + np.random.normal(0, self._noise_center)
+        cy = self._center_y + np.random.normal(0, self._noise_center)
+        sx = self._sigma_x + np.random.normal(0, self._noise_sigma)
+        sy = self._sigma_y + np.random.normal(0, self._noise_sigma)
         # Ensure amplitude stays positive
-        amp = max(1.0, self._amplitude + np.random.normal(0, 5))
+        amp = max(1.0, self._amplitude + np.random.normal(0, self._noise_amp))
         # Ensure background stays positive
-        bg = max(0.0, self._background + np.random.normal(0, 1))
-        noise = np.random.normal(0, 2, (self.height, self.width))
+        bg = max(0.0, self._background + np.random.normal(0, self._noise_bg))
+        noise = np.random.normal(0, self._noise_image, (self.height, self.width))
 
         x = np.arange(0, self.width)
         y = np.arange(0, self.height)

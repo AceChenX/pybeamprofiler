@@ -440,7 +440,7 @@ class HarvesterCamera(Camera):
         if not self.ia:
             raise RuntimeError("Camera not opened.")
 
-        with self.ia.fetch(timeout=3.0) as buffer:  # ty:ignore[invalid-context-manager]
+        with self.ia.fetch(timeout=2.0) as buffer:  # ty:ignore[invalid-context-manager]
             component = buffer.payload.components[0]
 
             if component.data_format == "Mono8":
