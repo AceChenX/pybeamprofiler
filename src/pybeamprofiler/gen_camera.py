@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import platform
 from typing import Any
 
 import numpy as np
@@ -80,7 +81,9 @@ class HarvesterCamera(Camera):
         super().__init__()
         if Harvester is None:
             raise ImportError(
-                "harvesters package is not installed. Install with: pip install harvesters"
+                "harvesters/genicam is not available. On macOS, install the camera SDK "
+                "(Pylon or Spinnaker) and ensure its genicam Python bindings are on the path. "
+                "On Linux/Windows: pip install harvesters"
             )
         self.h = Harvester()
 
@@ -180,6 +183,7 @@ class HarvesterCamera(Camera):
         self.ia = self.h.create(device_to_open)
         self.node_map = self.ia.remote_device.node_map
 
+        self._configure_gige_stream()
         self._configure_camera_settings()
 
         try:
@@ -278,6 +282,26 @@ class HarvesterCamera(Camera):
             logger.debug(f"Could not lookup sensor pixel size: {e}")
 
         return None
+
+    def _configure_gige_stream(self) -> None:
+        """Switch GigE Vision streams to SocketDriver on macOS.
+
+        Pylon's default GigEAccelerator transport requires a proprietary kernel
+        extension that is unavailable on macOS, resulting in zero received packets.
+        The SocketDriver transport uses standard OS UDP sockets and works reliably.
+        """
+        if platform.system() != "Darwin" or not self.ia.data_streams:
+            return
+        try:
+            ds_nm = self.ia.data_streams[0].node_map
+            if getattr(ds_nm, "Type", None) is None:
+                return
+            current = ds_nm.Type.value
+            if current != "SocketDriver" and ds_nm.TypeIsSocketDriverAvailable.value:
+                ds_nm.Type.value = "SocketDriver"
+                logger.info(f"GigE stream transport: {current} -> SocketDriver")
+        except Exception as e:
+            logger.debug(f"Could not configure GigE stream transport: {e}")
 
     def _configure_camera_settings(self) -> None:
         """Configure camera settings for manual control.
@@ -408,18 +432,32 @@ class HarvesterCamera(Camera):
     def get_image(self) -> np.ndarray:
         """Retrieve image from camera.
 
+        Automatically starts acquisition if not already running.
+
         Returns:
             2D numpy array of image data
         """
         if not self.ia:
             raise RuntimeError("Camera not opened.")
 
-        with self.ia.fetch(timeout=2.0) as buffer:
-            component = buffer.payload.components[0]
-            image = component.data.reshape(component.height, component.width).copy()
-            self.width_pixels = component.width
-            self.height_pixels = component.height
-            return image
+        if not self.is_acquiring:
+            self.start_acquisition()
+
+        try:
+            with self.ia.fetch(timeout=2.0) as buffer:
+                component = buffer.payload.components[0]
+                image = component.data.reshape(component.height, component.width).copy()
+                self.width_pixels = component.width
+                self.height_pixels = component.height
+                return image
+        except Exception as exc:
+            if type(exc).__name__ == "TimeoutException":
+                raise TimeoutError(
+                    "Camera did not deliver a frame within 2 s. "
+                    "Check that the camera is connected, powered, and not in use "
+                    "by another application."
+                ) from exc
+            raise
 
     def set_exposure(self, exposure_time: float) -> None:
         """Set exposure time.

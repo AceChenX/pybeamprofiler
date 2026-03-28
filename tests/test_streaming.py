@@ -34,34 +34,40 @@ def test_plot_stream_jupyter_task():
 
     async def run_test():
         # Setup mock IPython environment
-        with patch("pybeamprofiler.beamprofiler.get_ipython", create=True):
-            display_mock = MagicMock()
-            clear_output_mock = MagicMock()
+        mock_get_ipython = MagicMock(return_value=MagicMock())
+        display_mock = MagicMock()
+        clear_output_mock = MagicMock()
 
-            mock_ipython_display = MagicMock()
-            mock_ipython_display.display = display_mock
-            mock_ipython_display.clear_output = clear_output_mock
+        mock_ipython = MagicMock()
+        mock_ipython.get_ipython = mock_get_ipython
 
-            with patch.dict("sys.modules", {"IPython.display": mock_ipython_display}):
-                # Run plot_stream
-                task = bp.plot(heatmap_only=True)
+        mock_ipython_display = MagicMock()
+        mock_ipython_display.display = display_mock
+        mock_ipython_display.clear_output = clear_output_mock
 
-                # Should return a task
-                assert isinstance(task, asyncio.Task)
+        with patch.dict(
+            "sys.modules",
+            {"IPython": mock_ipython, "IPython.display": mock_ipython_display},
+        ):
+            # Run plot_stream
+            task = bp.plot(heatmap_only=True)
 
-                # Let it render the first frame
-                await asyncio.sleep(0.01)
+            # Should return a task
+            assert isinstance(task, asyncio.Task)
 
-                # Cancel the task since it now continues on dropped frames
-                task.cancel()
-                try:
-                    await task
-                except asyncio.CancelledError:
-                    pass
+            # Let it render the first frame
+            await asyncio.sleep(0.01)
 
-                # Check clear_output and display were called for at least 1 successful frame
-                assert clear_output_mock.call_count >= 1
-                assert display_mock.call_count >= 1
+            # Cancel the task since it now continues on dropped frames
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+            # Check clear_output and display were called for at least 1 successful frame
+            assert clear_output_mock.call_count >= 1
+            assert display_mock.call_count >= 1
 
     asyncio.run(run_test())
 
@@ -77,33 +83,39 @@ def test_plot_stream_jupyter_cancellation():
     bp._create_fast_figure = MagicMock(return_value=MagicMock())  # type: ignore
 
     async def run_cancel_test():
-        with patch("pybeamprofiler.beamprofiler.get_ipython", create=True):
-            display_mock = MagicMock()
-            clear_output_mock = MagicMock()
+        mock_get_ipython = MagicMock(return_value=MagicMock())
+        display_mock = MagicMock()
+        clear_output_mock = MagicMock()
 
-            mock_ipython_display = MagicMock()
-            mock_ipython_display.display = display_mock
-            mock_ipython_display.clear_output = clear_output_mock
+        mock_ipython = MagicMock()
+        mock_ipython.get_ipython = mock_get_ipython
 
-            with patch.dict("sys.modules", {"IPython.display": mock_ipython_display}):
-                task = bp.plot(heatmap_only=True)
-                assert isinstance(task, asyncio.Task)
+        mock_ipython_display = MagicMock()
+        mock_ipython_display.display = display_mock
+        mock_ipython_display.clear_output = clear_output_mock
 
-                # Give it a tiny bit of time to start and loop once
-                await asyncio.sleep(0.01)
+        with patch.dict(
+            "sys.modules",
+            {"IPython": mock_ipython, "IPython.display": mock_ipython_display},
+        ):
+            task = bp.plot(heatmap_only=True)
+            assert isinstance(task, asyncio.Task)
 
-                # Cancel the task
-                task.cancel()
+            # Give it a tiny bit of time to start and loop once
+            await asyncio.sleep(0.01)
 
-                try:
-                    await task
-                except asyncio.CancelledError:
-                    pass
+            # Cancel the task
+            task.cancel()
 
-                # The task should be cleanly finished (since it catches CancelledError internally)
-                assert task.done()
-                # Should have run at least once
-                assert display_mock.call_count > 0
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+            # The task should be cleanly finished (since it catches CancelledError internally)
+            assert task.done()
+            # Should have run at least once
+            assert display_mock.call_count > 0
 
     asyncio.run(run_cancel_test())
 
@@ -133,34 +145,40 @@ def test_plot_stream_jupyter_robustness():
     bp._create_fast_figure = MagicMock(return_value=MagicMock())  # type: ignore
 
     async def run_robustness_test():
-        with patch("pybeamprofiler.beamprofiler.get_ipython", create=True):
-            display_mock = MagicMock()
-            clear_output_mock = MagicMock()
+        mock_get_ipython = MagicMock(return_value=MagicMock())
+        display_mock = MagicMock()
+        clear_output_mock = MagicMock()
 
-            mock_ipython_display = MagicMock()
-            mock_ipython_display.display = display_mock
-            mock_ipython_display.clear_output = clear_output_mock
+        mock_ipython = MagicMock()
+        mock_ipython.get_ipython = mock_get_ipython
 
-            with patch.dict("sys.modules", {"IPython.display": mock_ipython_display}):
-                task = bp.plot(heatmap_only=True)
-                assert isinstance(task, asyncio.Task)
+        mock_ipython_display = MagicMock()
+        mock_ipython_display.display = display_mock
+        mock_ipython_display.clear_output = clear_output_mock
 
-                # Wait for the loop to process the errors and output the valid frames
-                # Note: It sleeps for 0.01s on Exception and 0.01s on None
-                await asyncio.sleep(0.05)
+        with patch.dict(
+            "sys.modules",
+            {"IPython": mock_ipython, "IPython.display": mock_ipython_display},
+        ):
+            task = bp.plot(heatmap_only=True)
+            assert isinstance(task, asyncio.Task)
 
-                # Should not be done (loop still running)
-                assert not task.done()
+            # Wait for the loop to process the errors and output the valid frames
+            # Note: It sleeps for 0.01s on Exception and 0.01s on None
+            await asyncio.sleep(0.05)
 
-                # Cancel the task
-                task.cancel()
-                try:
-                    await task
-                except asyncio.CancelledError:
-                    pass
+            # Should not be done (loop still running)
+            assert not task.done()
 
-                # Should have survived the initial exceptions/Nones and processed the valid frames
-                assert display_mock.call_count >= 1
+            # Cancel the task
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+            # Should have survived the initial exceptions/Nones and processed the valid frames
+            assert display_mock.call_count >= 1
 
     asyncio.run(run_robustness_test())
 
@@ -171,9 +189,12 @@ def test_plot_stream_dash_robustness():
     assert bp.camera is not None
     mock_img = np.ones((10, 10))
 
+    mock_ipython = MagicMock()
+    mock_ipython.get_ipython = MagicMock(return_value=None)
+
     with (
         patch("dash.Dash") as MockDash,
-        patch("pybeamprofiler.beamprofiler.get_ipython", side_effect=NameError, create=True),
+        patch.dict("sys.modules", {"IPython": mock_ipython}),
         patch("threading.Thread"),
         patch("asyncio.to_thread") as mock_to_thread,
     ):
@@ -263,19 +284,20 @@ def test_plot_stream_matplotlib_fallback():
     mock_matplotlib.animation = mock_animation
     mock_matplotlib.patches = mock_patches
 
-    with (
-        patch("pybeamprofiler.beamprofiler.get_ipython", side_effect=NameError, create=True),
-        patch.dict(
-            sys.modules,
-            {
-                "dash": None,
-                "dash.dependencies": None,
-                "matplotlib": mock_matplotlib,
-                "matplotlib.pyplot": mock_plt,
-                "matplotlib.animation": mock_animation,
-                "matplotlib.patches": mock_patches,
-            },
-        ),
+    mock_ipython = MagicMock()
+    mock_ipython.get_ipython = MagicMock(return_value=None)
+
+    with patch.dict(
+        sys.modules,
+        {
+            "IPython": mock_ipython,
+            "dash": None,
+            "dash.dependencies": None,
+            "matplotlib": mock_matplotlib,
+            "matplotlib.pyplot": mock_plt,
+            "matplotlib.animation": mock_animation,
+            "matplotlib.patches": mock_patches,
+        },
     ):
         bp._plot_stream()
         mock_plt.subplots.assert_called_once()
@@ -289,19 +311,20 @@ def test_plot_stream_no_visualization_available():
     bp = BeamProfiler(camera="simulated")
     assert bp.camera is not None
 
-    with (
-        patch("pybeamprofiler.beamprofiler.get_ipython", side_effect=NameError, create=True),
-        patch.dict(
-            sys.modules,
-            {
-                "dash": None,
-                "dash.dependencies": None,
-                "matplotlib": None,
-                "matplotlib.pyplot": None,
-                "matplotlib.animation": None,
-                "matplotlib.patches": None,
-            },
-        ),
+    mock_ipython = MagicMock()
+    mock_ipython.get_ipython = MagicMock(return_value=None)
+
+    with patch.dict(
+        sys.modules,
+        {
+            "IPython": mock_ipython,
+            "dash": None,
+            "dash.dependencies": None,
+            "matplotlib": None,
+            "matplotlib.pyplot": None,
+            "matplotlib.animation": None,
+            "matplotlib.patches": None,
+        },
     ):
         result = bp._plot_stream()
         assert result is None
@@ -315,9 +338,12 @@ def test_plot_stream_dash_non_heatmap():
     assert bp.camera is not None
     mock_img = np.ones((10, 10))
 
+    mock_ipython = MagicMock()
+    mock_ipython.get_ipython = MagicMock(return_value=None)
+
     with (
         patch("dash.Dash") as MockDash,
-        patch("pybeamprofiler.beamprofiler.get_ipython", side_effect=NameError, create=True),
+        patch.dict("sys.modules", {"IPython": mock_ipython}),
         patch("threading.Thread"),
         patch("asyncio.to_thread") as mock_to_thread,
     ):
@@ -369,9 +395,12 @@ def test_plot_stream_camera_not_acquiring_restart():
     assert bp.camera is not None
     mock_img = np.ones((10, 10))
 
+    mock_ipython = MagicMock()
+    mock_ipython.get_ipython = MagicMock(return_value=None)
+
     with (
         patch("dash.Dash") as MockDash,
-        patch("pybeamprofiler.beamprofiler.get_ipython", side_effect=NameError, create=True),
+        patch.dict("sys.modules", {"IPython": mock_ipython}),
         patch("threading.Thread"),
         patch("asyncio.to_thread") as mock_to_thread,
     ):
@@ -434,9 +463,12 @@ def test_plot_stream_static_mode():
 
         bp = BeamProfiler(file=img_path, pixel_size=5.0)
 
+        mock_ipython = MagicMock()
+        mock_ipython.get_ipython = MagicMock(return_value=None)
+
         with (
             patch("dash.Dash") as MockDash,
-            patch("pybeamprofiler.beamprofiler.get_ipython", side_effect=NameError, create=True),
+            patch.dict("sys.modules", {"IPython": mock_ipython}),
             patch("threading.Thread"),
             patch("asyncio.to_thread") as mock_to_thread,
         ):
@@ -517,19 +549,20 @@ def test_plot_stream_matplotlib_update_frame():
 
     mock_animation.FuncAnimation = capture_update_frame
 
-    with (
-        patch("pybeamprofiler.beamprofiler.get_ipython", side_effect=NameError, create=True),
-        patch.dict(
-            sys.modules,
-            {
-                "dash": None,
-                "dash.dependencies": None,
-                "matplotlib": mock_matplotlib,
-                "matplotlib.pyplot": mock_plt,
-                "matplotlib.animation": mock_animation,
-                "matplotlib.patches": mock_patches,
-            },
-        ),
+    mock_ipython = MagicMock()
+    mock_ipython.get_ipython = MagicMock(return_value=None)
+
+    with patch.dict(
+        sys.modules,
+        {
+            "IPython": mock_ipython,
+            "dash": None,
+            "dash.dependencies": None,
+            "matplotlib": mock_matplotlib,
+            "matplotlib.pyplot": mock_plt,
+            "matplotlib.animation": mock_animation,
+            "matplotlib.patches": mock_patches,
+        },
     ):
         bp._plot_stream()
 
@@ -552,28 +585,34 @@ def test_plot_stream_jupyter_non_heatmap():
     bp._create_figure = MagicMock(return_value=MagicMock())  # type: ignore
 
     async def run_test():
-        with patch("pybeamprofiler.beamprofiler.get_ipython", create=True):
-            display_mock = MagicMock()
-            clear_output_mock = MagicMock()
+        mock_get_ipython = MagicMock(return_value=MagicMock())
+        display_mock = MagicMock()
+        clear_output_mock = MagicMock()
 
-            mock_ipython_display = MagicMock()
-            mock_ipython_display.display = display_mock
-            mock_ipython_display.clear_output = clear_output_mock
+        mock_ipython = MagicMock()
+        mock_ipython.get_ipython = mock_get_ipython
 
-            with patch.dict("sys.modules", {"IPython.display": mock_ipython_display}):
-                task = bp.plot(heatmap_only=False)
+        mock_ipython_display = MagicMock()
+        mock_ipython_display.display = display_mock
+        mock_ipython_display.clear_output = clear_output_mock
 
-                assert isinstance(task, asyncio.Task)
+        with patch.dict(
+            "sys.modules",
+            {"IPython": mock_ipython, "IPython.display": mock_ipython_display},
+        ):
+            task = bp.plot(heatmap_only=False)
 
-                await asyncio.sleep(0.02)
+            assert isinstance(task, asyncio.Task)
 
-                task.cancel()
-                try:
-                    await task
-                except asyncio.CancelledError:
-                    pass
+            await asyncio.sleep(0.02)
 
-                assert bp._create_figure.call_count >= 1  # ty: ignore[unresolved-attribute]
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+            assert bp._create_figure.call_count >= 1  # ty: ignore[unresolved-attribute]
 
     asyncio.run(run_test())
     bp.camera.close()

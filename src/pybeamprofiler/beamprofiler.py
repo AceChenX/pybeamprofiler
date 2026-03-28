@@ -8,7 +8,6 @@ import logging
 import os
 import threading
 import time
-import traceback
 import webbrowser
 from types import TracebackType
 from typing import Any
@@ -1088,9 +1087,11 @@ class BeamProfiler:
 
         try:
             # Check if running in Jupyter
+            from IPython import get_ipython  # ty: ignore[unresolved-import]
             from IPython.display import clear_output, display
 
-            get_ipython()  # ty: ignore[unresolved-reference]
+            if get_ipython() is None:
+                raise ImportError("Not in IPython")
 
             # Use clear_output for live updates
             if heatmap_only:
@@ -1559,10 +1560,8 @@ def main() -> None:
 
     try:
         bp.plot(num_img=args.num_img, heatmap_only=args.heatmap_only)
-    except Exception as e:
-        logger.error(f"\nERROR: {e}")
-        if args.verbose:
-            traceback.print_exc()
+    except Exception:
+        logger.error("Fatal error during plotting", exc_info=True)
     finally:
         if hasattr(bp, "camera") and bp.camera:
             try:

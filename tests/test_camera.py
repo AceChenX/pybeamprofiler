@@ -525,9 +525,10 @@ class TestBaslerCameraInit:
         mock_find.assert_called_once()
 
     @patch("pybeamprofiler.basler.os.environ", {"GENICAM_GENTL64_PATH": "/some/path"})
+    @patch("pybeamprofiler.basler.BaslerCamera._find_basler_cti", return_value=None)
     @patch("pybeamprofiler.basler.HarvesterCamera._parse_gentl_path")
-    def test_basler_init_uses_env_var(self, mock_parse):
-        """Test BaslerCamera uses GENICAM_GENTL64_PATH when set."""
+    def test_basler_init_uses_env_var(self, mock_parse, _mock_find):
+        """Test BaslerCamera uses GENICAM_GENTL64_PATH when vendor search fails."""
         from pybeamprofiler.basler import BaslerCamera
 
         mock_parse.return_value = "/some/path/test.cti"
@@ -612,9 +613,10 @@ class TestFlirCameraInit:
         mock_find.assert_called_once()
 
     @patch("pybeamprofiler.flir.os.environ", {"GENICAM_GENTL64_PATH": "/flir/path"})
+    @patch("pybeamprofiler.flir.FlirCamera._find_flir_cti", return_value=None)
     @patch("pybeamprofiler.flir.HarvesterCamera._parse_gentl_path")
-    def test_flir_init_uses_env_var(self, mock_parse):
-        """Test FlirCamera uses GENICAM_GENTL64_PATH when set."""
+    def test_flir_init_uses_env_var(self, mock_parse, _mock_find):
+        """Test FlirCamera uses GENICAM_GENTL64_PATH when vendor search fails."""
         from pybeamprofiler.flir import FlirCamera
 
         mock_parse.return_value = "/flir/path/FLIR_GenTL.cti"
