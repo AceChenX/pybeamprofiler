@@ -1452,26 +1452,27 @@ class BeamProfiler:
                 shutdown_flag["stop"] = True
 
 
-if __name__ == "__main__":
+def main() -> None:
+    """CLI entry point for pyBeamprofiler."""
     parser = argparse.ArgumentParser(
         description="pyBeamprofiler - Laser beam profiler with Gaussian fitting",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
         Examples:
         # Simulated camera with continuous streaming
-        python -m pybeamprofiler.beamprofiler
+        pybeamprofiler
 
         # FLIR camera, single shot
-        python -m pybeamprofiler.beamprofiler --camera flir --num-img 1
+        pybeamprofiler --camera flir --num-img 1
 
         # Static image file
-        python -m pybeamprofiler.beamprofiler --file beam.png
+        pybeamprofiler --file beam.png
 
         # Basler camera with 2D fitting and FWHM definition
-        python -m pybeamprofiler.beamprofiler --camera basler --fit 2d --definition fwhm
+        pybeamprofiler --camera basler --fit 2d --definition fwhm
 
         # Fast mode (heatmap only)
-        python -m pybeamprofiler.beamprofiler --heatmap-only
+        pybeamprofiler --heatmap-only
         """,
     )
 
@@ -1572,3 +1573,7 @@ if __name__ == "__main__":
                 logger.info("Camera closed")
             except Exception:
                 pass
+
+
+if __name__ == "__main__":
+    main()
