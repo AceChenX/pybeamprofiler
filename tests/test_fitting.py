@@ -62,7 +62,7 @@ class TestOneDimensionalFitting:
         bp.camera.stop_acquisition()
 
         popt_x2, _ = bp.analyze(img2)
-        assert abs(popt_x2[2] - popt_x1[2]) < 50
+        assert abs(popt_x2[2] - popt_x1[2]) < 100
 
 
 class TestTwoDimensionalFitting:

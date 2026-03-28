@@ -1,3 +1,5 @@
+"""pybeamprofiler — Laser beam profiler with Gaussian fitting."""
+
 from .basler import BaslerCamera
 from .beamprofiler import BeamProfiler
 from .camera import Camera

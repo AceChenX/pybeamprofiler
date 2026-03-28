@@ -1,17 +1,20 @@
 """Shared pytest fixtures for pybeamprofiler tests."""
 
 import os
+from collections.abc import Iterator
 
 import numpy as np
 import pytest
 from PIL import Image
+
+from pybeamprofiler import BeamProfiler
 
 # Disable browser auto-opening during tests
 os.environ["PYBEAMPROFILER_NO_BROWSER"] = "1"
 
 
 @pytest.fixture
-def simulated_image():
+def simulated_image() -> np.ndarray:
     """Generate a synthetic Gaussian beam image for testing."""
     size = 500
     x = np.linspace(0, size, size)
@@ -29,10 +32,8 @@ def simulated_image():
 
 
 @pytest.fixture
-def beam_profiler():
+def beam_profiler() -> Iterator[BeamProfiler]:
     """Create a BeamProfiler instance with simulated camera."""
-    from pybeamprofiler import BeamProfiler
-
     bp = BeamProfiler(camera="simulated")
     assert bp.camera is not None
     yield bp
@@ -40,7 +41,7 @@ def beam_profiler():
 
 
 @pytest.fixture
-def test_image_file(tmp_path, simulated_image):
+def test_image_file(tmp_path, simulated_image) -> str:
     """Create a temporary test image file."""
     img_path = tmp_path / "test_beam.png"
     Image.fromarray(simulated_image).save(img_path)

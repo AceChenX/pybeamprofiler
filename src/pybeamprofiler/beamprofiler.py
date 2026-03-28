@@ -1,5 +1,7 @@
 """Laser beam profiler with Gaussian fitting and visualization."""
 
+from __future__ import annotations
+
 import argparse
 import asyncio
 import logging
@@ -8,6 +10,8 @@ import threading
 import time
 import traceback
 import webbrowser
+from types import TracebackType
+from typing import Any
 
 import numpy as np
 import plotly.graph_objs as go
@@ -18,22 +22,32 @@ from scipy.optimize import curve_fit
 try:
     from .basler import BaslerCamera
     from .camera import Camera
+    from .constants import (
+        D4SIGMA_FACTOR,
+        DEFAULT_DASH_PORT,
+        GAUSSIAN_TO_FWHM,
+        MAX_FIT_ITERATIONS,
+    )
     from .flir import FlirCamera
     from .simulated import SimulatedCamera
 except ImportError:
-    # Running as a script, use absolute imports
     import sys
     from pathlib import Path
 
-    # Add parent directory to path
     script_dir = Path(__file__).resolve().parent
     if str(script_dir.parent) not in sys.path:
         sys.path.insert(0, str(script_dir.parent))
 
-    from pybeamprofiler.basler import BaslerCamera
-    from pybeamprofiler.camera import Camera
-    from pybeamprofiler.flir import FlirCamera
-    from pybeamprofiler.simulated import SimulatedCamera
+    from pybeamprofiler.basler import BaslerCamera  # type: ignore[no-redef]  # noqa: I001
+    from pybeamprofiler.camera import Camera  # type: ignore[no-redef]
+    from pybeamprofiler.constants import (
+        D4SIGMA_FACTOR,
+        DEFAULT_DASH_PORT,
+        GAUSSIAN_TO_FWHM,
+        MAX_FIT_ITERATIONS,
+    )  # type: ignore[no-redef]
+    from pybeamprofiler.flir import FlirCamera  # type: ignore[no-redef]
+    from pybeamprofiler.simulated import SimulatedCamera  # type: ignore[no-redef]
 
 logger = logging.getLogger(__name__)
 
@@ -69,38 +83,40 @@ class BeamProfiler:
         definition: str = "gaussian",
         exposure_time: float | None = None,
         pixel_size: float | None = None,
-    ):
+    ) -> None:
         """Initialize the beam profiler.
 
+        If neither ``file`` nor ``camera`` is provided, a
+        :class:`SimulatedCamera` is used by default.
+
         Raises:
-            ValueError: If neither camera nor file is provided or successfully loaded
-            RuntimeError: If physical camera (FLIR/Basler) fails to open
-            AssertionError: If pixel_size not provided for static image files
+            ValueError: If ``pixel_size`` is not provided for static image files,
+                or if neither camera nor file is successfully loaded.
+            RuntimeError: If a physical camera (FLIR/Basler) fails to open.
         """
         self.camera: Camera | None = None
-        self.fit_method = fit
-        self.definition = definition
+        self.fit_method: str = fit
+        self.definition: str = definition
 
-        # Results
-        self.width_x = 0.0
-        self.width_y = 0.0
-        self.center_x = 0.0
-        self.center_y = 0.0
-        self.angle_deg = 0.0
-        self.peak_value = 0.0
+        self.width_x: float = 0.0
+        self.width_y: float = 0.0
+        self.center_x: float = 0.0
+        self.center_y: float = 0.0
+        self.angle_deg: float = 0.0
+        self.peak_value: float = 0.0
 
-        # Caching for initial guesses
-        self._last_popt_x = None
-        self._last_popt_y = None
-        self._last_popt_2d = None
-        self._stream_task = None  # Reference to Jupyter streaming background task
+        self._last_popt_x: np.ndarray | list[Any] | None = None
+        self._last_popt_y: np.ndarray | list[Any] | None = None
+        self._last_popt_2d: np.ndarray | list[Any] | None = None
+        self._stream_task: asyncio.Task[None] | None = None
 
-        self.last_img = None  # Initialize before file/camera loading
+        self.last_img: np.ndarray | None = None
 
         if file:
             self._load_file(file)
             self._mode = "static"
-            assert pixel_size is not None, "Pixel size must be provided for static beam image files"
+            if pixel_size is None:
+                raise ValueError("Pixel size must be provided for static beam image files")
             self.pixel_size = pixel_size
         elif camera:
             self._initialize_camera(camera)
@@ -113,11 +129,9 @@ class BeamProfiler:
             self.width_pixels = self.camera.width
             self.height_pixels = self.camera.height
             self.pixel_size = self.camera.pixel_size
-            # Set exposure time if provided
             if exposure_time is not None:
                 self.camera.set_exposure(exposure_time)
         elif file and self.last_img is not None:
-            # For static files, dimensions already set in _load_file
             pass
         else:
             raise ValueError("Either camera or file must be provided and successfully loaded")
@@ -172,12 +186,17 @@ class BeamProfiler:
             logger.error(f"Error loading image file {filename}: {e}")
             raise
 
-    def __enter__(self):
+    def __enter__(self) -> BeamProfiler:
         """Context manager entry."""
         return self
 
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        """Context manager exit - ensure camera is closed."""
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: TracebackType | None,
+    ) -> bool:
+        """Context manager exit — ensures camera is closed."""
         if self.camera:
             try:
                 self.camera.close()
@@ -185,10 +204,15 @@ class BeamProfiler:
                 logger.warning(f"Error closing camera: {e}")
         return False
 
-    def __getattr__(self, name: str):
-        """Proxy camera attributes."""
-        if self.camera and hasattr(self.camera, name):
-            return getattr(self.camera, name)
+    def __getattr__(self, name: str) -> object:
+        try:
+            camera = object.__getattribute__(self, "camera")
+        except AttributeError:
+            raise AttributeError(
+                f"'{type(self).__name__}' object has no attribute '{name}'"
+            ) from None
+        if camera and hasattr(camera, name):
+            return getattr(camera, name)
         raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
 
     @staticmethod
@@ -259,39 +283,46 @@ class BeamProfiler:
         """Beam radius (μm)."""
         return self.width / 2
 
+    def _to_sigma(self, width: float) -> float:
+        """Convert a reported width back to sigma (μm) based on the current definition.
+
+        This allows all derived width properties to work correctly regardless
+        of which definition was used for the primary width measurement.
+        """
+        if self.definition == "fwhm":
+            return width / GAUSSIAN_TO_FWHM
+        # Both 'gaussian' (1/e²) and 'd4s' use 4*sigma
+        return width / D4SIGMA_FACTOR
+
     @property
     def fwhm_x(self) -> float:
         """Full Width at Half Maximum in X direction (μm)."""
-        sigma_x = self.width_x / 4.0
-        return 2.355 * sigma_x
+        return GAUSSIAN_TO_FWHM * self._to_sigma(self.width_x)
 
     @property
     def fwhm_y(self) -> float:
         """Full Width at Half Maximum in Y direction (μm)."""
-        sigma_y = self.width_y / 4.0
-        return 2.355 * sigma_y
+        return GAUSSIAN_TO_FWHM * self._to_sigma(self.width_y)
 
     @property
     def fw_1e_x(self) -> float:
         """Full Width at 1/e in X direction (μm)."""
-        sigma_x = self.width_x / 4.0
-        return 2.0 * sigma_x
+        return 2.0 * self._to_sigma(self.width_x)
 
     @property
     def fw_1e_y(self) -> float:
         """Full Width at 1/e in Y direction (μm)."""
-        sigma_y = self.width_y / 4.0
-        return 2.0 * sigma_y
+        return 2.0 * self._to_sigma(self.width_y)
 
     @property
     def fw_1e2_x(self) -> float:
-        """Full Width at 1/e² in X direction (μm) - same as width_x."""
-        return self.width_x
+        """Full Width at 1/e² in X direction (μm)."""
+        return D4SIGMA_FACTOR * self._to_sigma(self.width_x)
 
     @property
     def fw_1e2_y(self) -> float:
-        """Full Width at 1/e² in Y direction (μm) - same as width_y."""
-        return self.width_y
+        """Full Width at 1/e² in Y direction (μm)."""
+        return D4SIGMA_FACTOR * self._to_sigma(self.width_y)
 
     @property
     def height_x(self) -> float:
@@ -378,7 +409,11 @@ class BeamProfiler:
 
         return center, d4sigma
 
-    def _fit_1d_gaussian(self, profile: np.ndarray, last_popt: list | None = None) -> list:
+    def _fit_1d_gaussian(
+        self,
+        profile: np.ndarray,
+        last_popt: np.ndarray | list[Any] | None = None,
+    ) -> np.ndarray | list[Any]:
         """Fit 1D Gaussian to profile.
 
         Args:
@@ -386,7 +421,7 @@ class BeamProfiler:
             last_popt: Previous fit parameters for initial guess
 
         Returns:
-            Fit parameters [amplitude, center, sigma, offset]
+            Fit parameters ``[amplitude, center, sigma, offset]``
         """
         n = len(profile)
         if n == 0:
@@ -403,20 +438,22 @@ class BeamProfiler:
             # Bounds constrain parameters for faster convergence:
             # amplitude > 0, center in [0, n], sigma in [0.1, n], offset unbounded
             bounds = ([0, 0, 0.1, -np.inf], [np.inf, n, n, np.inf])
-            popt, _ = curve_fit(BeamProfiler.gaussian, x, profile, p0=p0, bounds=bounds, maxfev=100)
+            popt, _ = curve_fit(
+                BeamProfiler.gaussian, x, profile, p0=p0, bounds=bounds, maxfev=MAX_FIT_ITERATIONS
+            )
             return popt
         except (RuntimeError, ValueError) as e:
             logger.warning(f"1D fit failed: {e}, using initial guess")
             return p0
 
-    def _fit_2d_gaussian(self, image: np.ndarray) -> list:
+    def _fit_2d_gaussian(self, image: np.ndarray) -> np.ndarray | list[Any]:
         """Fit 2D Gaussian to image.
 
         Args:
             image: 2D intensity array
 
         Returns:
-            Fit parameters [amplitude, x0, y0, sigma_x, sigma_y, theta, offset]
+            Fit parameters ``[amplitude, x0, y0, sigma_x, sigma_y, theta, offset]``
         """
         h, w = image.shape
 
@@ -440,7 +477,7 @@ class BeamProfiler:
                 image.ravel(),
                 p0=p0,
                 bounds=bounds,
-                maxfev=100,
+                maxfev=MAX_FIT_ITERATIONS,
             )
             self._last_popt_2d = popt
             return popt
@@ -448,7 +485,9 @@ class BeamProfiler:
             logger.warning(f"2D fit failed: {e}, using initial guess")
             return p0
 
-    def analyze(self, image: np.ndarray) -> tuple[list | None, list | None]:
+    def analyze(
+        self, image: np.ndarray
+    ) -> tuple[np.ndarray | list[Any] | None, np.ndarray | list[Any] | None]:
         """Analyze beam image and extract parameters.
 
         Args:
@@ -552,20 +591,15 @@ class BeamProfiler:
     def _update_widths(self, sigma_x: float, sigma_y: float) -> None:
         """Update width parameters from Gaussian sigma values.
 
-        Converts sigma to the selected width definition (gaussian/fwhm/d4s).
+        Only called from Gaussian-based fitting paths (definition='gaussian'),
+        where the reported width is 1/e² = 4*sigma.
 
         Args:
             sigma_x: Gaussian sigma in x (pixels)
             sigma_y: Gaussian sigma in y (pixels)
         """
-        if self.definition == "fwhm":
-            factor = 2.355  # 2*sqrt(2*ln(2))
-        elif self.definition == "d4s":
-            factor = 4.0  # 4 sigma
-        else:  # 'gaussian' - 1/e²
-            factor = 4.0  # 4.0 sigma for 1/e² width
-        self.width_x = factor * sigma_x * self.pixel_size
-        self.width_y = factor * sigma_y * self.pixel_size
+        self.width_x = D4SIGMA_FACTOR * sigma_x * self.pixel_size
+        self.width_y = D4SIGMA_FACTOR * sigma_y * self.pixel_size
 
     def stop(self) -> None:
         """Stop any active continuous streams and stop camera acquisition."""
@@ -604,7 +638,10 @@ class BeamProfiler:
             return self._plot_stream()
 
     def _create_fast_figure(
-        self, image: np.ndarray, popt_x: list | None, popt_y: list | None
+        self,
+        image: np.ndarray,
+        popt_x: np.ndarray | list[Any] | None,
+        popt_y: np.ndarray | list[Any] | None,
     ) -> go.Figure:
         """Create simplified figure with heatmap only for faster rendering.
 
@@ -750,7 +787,10 @@ class BeamProfiler:
         return fig
 
     def _create_figure(
-        self, image: np.ndarray, popt_x: list | None, popt_y: list | None
+        self,
+        image: np.ndarray,
+        popt_x: np.ndarray | list[Any] | None,
+        popt_y: np.ndarray | list[Any] | None,
     ) -> go.Figure:
         """Create complete figure with beam image and projection plots.
 
@@ -1014,7 +1054,8 @@ class BeamProfiler:
     def _plot_single(self) -> None:
         """Capture and plot single image."""
         if self._mode == "camera":
-            assert self.camera is not None
+            if self.camera is None:
+                raise RuntimeError("Camera is not initialized")
             self.camera.start_acquisition()
             img = self.camera.get_image()
             self.camera.stop_acquisition()
@@ -1028,12 +1069,17 @@ class BeamProfiler:
         fig = self._create_figure(img, popt_x, popt_y)
         fig.show()
 
-    def _plot_stream(self) -> asyncio.Task | None:
-        """Start continuous streaming with live updates."""
+    def _plot_stream(self) -> asyncio.Task[None] | None:
+        """Start continuous streaming with live updates.
 
+        In a Jupyter environment, returns a background ``asyncio.Task`` driving
+        the live loop.  Outside Jupyter, falls back to Dash or matplotlib and
+        returns ``None`` (blocks until interrupted).
+        """
         # Ensure camera is ready for continuous acquisition
         if self._mode == "camera":
-            assert self.camera is not None
+            if self.camera is None:
+                raise RuntimeError("Camera is not initialized")
             if not self.camera.is_acquiring:
                 self.camera.start_acquisition()
 
@@ -1331,7 +1377,7 @@ class BeamProfiler:
                 Output("live-update-graph", "figure"),
                 Input("interval-component", "n_intervals"),
             )
-            async def update_graph_live(n):
+            async def update_graph_live(n: int):
                 # Check if shutdown requested
                 if shutdown_flag["stop"]:
                     return go.Figure()
@@ -1384,33 +1430,29 @@ class BeamProfiler:
                     logger.debug(f"Frame analysis/generation failed: {e}")
                     return dash.no_update
 
-            logger.info("Starting Dash server at http://127.0.0.1:8050")
+            logger.info(f"Starting Dash server at http://127.0.0.1:{DEFAULT_DASH_PORT}")
             logger.info("Opening browser automatically...")
             logger.info("Press Ctrl+C to stop")
 
-            # Suppress Flask/Werkzeug logs for cleaner output
             logging.getLogger("werkzeug").setLevel(logging.ERROR)
             logging.getLogger("dash").setLevel(logging.ERROR)
 
-            # Open browser automatically after a short delay (unless disabled for testing)
             if os.environ.get("PYBEAMPROFILER_NO_BROWSER") != "1":
 
-                def open_browser():
-                    time.sleep(0.5)  # Give server time to start
-                    webbrowser.open("http://127.0.0.1:8050")
+                def open_browser() -> None:
+                    time.sleep(0.5)
+                    webbrowser.open(f"http://127.0.0.1:{DEFAULT_DASH_PORT}")
 
                 threading.Thread(target=open_browser, daemon=True).start()
 
             try:
-                app.run(debug=False, port=8050, use_reloader=False)
+                app.run(debug=False, port=DEFAULT_DASH_PORT, use_reloader=False)
             except KeyboardInterrupt:
                 logger.info("\n\nStopping Dash server...")
                 shutdown_flag["stop"] = True
 
 
 if __name__ == "__main__":
-    """Main entry point for command-line interface."""
-
     parser = argparse.ArgumentParser(
         description="pyBeamprofiler - Laser beam profiler with Gaussian fitting",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -1433,7 +1475,6 @@ if __name__ == "__main__":
         """,
     )
 
-    # BeamProfiler arguments
     parser.add_argument(
         "--camera",
         type=str,
@@ -1468,7 +1509,6 @@ if __name__ == "__main__":
         help="Camera exposure time in seconds (set during initialization)",
     )
 
-    # plot() arguments
     parser.add_argument(
         "--num-img",
         type=int,
@@ -1481,7 +1521,6 @@ if __name__ == "__main__":
         help="Show only heatmap for faster display (~8-12 Hz in Jupyter)",
     )
 
-    # Additional options
     parser.add_argument(
         "--verbose",
         "-v",
@@ -1491,13 +1530,11 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    # Configure logging
     if args.verbose:
         logging.basicConfig(level=logging.INFO)
     else:
         logging.basicConfig(level=logging.WARNING)
 
-    # Create BeamProfiler instance
     logger.info("Initializing pyBeamprofiler...")
     logger.info(f"   Camera: {args.file if args.file else args.camera}")
     logger.info(f"   Fitting: {args.fit} ({args.definition})")
@@ -1513,7 +1550,6 @@ if __name__ == "__main__":
     logger.info(f"   Sensor: {bp.width_pixels}×{bp.height_pixels} pixels")
     logger.info(f"   Pixel size: {bp.pixel_size:.2f} μm")
 
-    # Start acquisition
     if args.num_img == 1:
         logger.info("Single shot acquisition...")
     else:
@@ -1527,7 +1563,6 @@ if __name__ == "__main__":
         if args.verbose:
             traceback.print_exc()
     finally:
-        # Ensure camera is properly closed
         if hasattr(bp, "camera") and bp.camera:
             try:
                 if bp.camera.is_acquiring:

@@ -14,36 +14,29 @@ PYLON_PRODUCERS = ("ProducerGEV.cti", "ProducerU3V.cti")
 class BaslerCamera(HarvesterCamera):
     """Basler camera using Harvesters GenICam interface.
 
-    Automatically locates Basler Pylon GenTL producer (.cti file).
-    Requires Pylon SDK. Supports USB3 and GigE cameras.
+    Automatically locates Basler Pylon GenTL producer (``.cti`` file).
+    Requires Pylon SDK.  Supports USB3 and GigE cameras.
 
-    Args:
-        cti_file: Path to Basler Pylon GenTL producer. If None, searches
-                  common installation paths.
-        serial_number: Camera serial number to select specific device
-
-    Discovery order:
-        1. Explicit cti_file parameter
-        2. GENICAM_GENTL64_PATH environment variable
-        3. Platform-specific installation paths
+    CTI discovery order: explicit ``cti_file`` parameter →
+    ``GENICAM_GENTL64_PATH`` environment variable → platform-specific
+    Pylon SDK installation paths.
     """
 
-    def __init__(self, cti_file: str | None = None, serial_number: str | None = None):
+    def __init__(self, cti_file: str | None = None, serial_number: str | None = None) -> None:
         """Initialize Basler camera with Pylon GenTL.
 
         Args:
-            cti_file: Path to CTI file. If None, searches GENICAM_GENTL64_PATH then platform paths
-            serial_number: Camera serial number for device selection
+            cti_file: Path to Basler Pylon GenTL producer.  If ``None``,
+                searches ``GENICAM_GENTL64_PATH`` then platform paths.
+            serial_number: Camera serial number for device selection.
         """
         cti_file_resolved: str | list[str] | None = cti_file
         if cti_file_resolved is None:
-            # Try GENICAM_GENTL64_PATH first (user-configured)
             gentl_path = os.environ.get("GENICAM_GENTL64_PATH")
             if gentl_path:
                 logger.info(f"Using GENICAM_GENTL64_PATH: {gentl_path}")
                 cti_file_resolved = HarvesterCamera._parse_gentl_path(gentl_path)
 
-            # Fall back to platform-specific Pylon SDK paths
             if not cti_file_resolved:
                 cti_file_resolved = self._find_basler_cti()
                 if cti_file_resolved:

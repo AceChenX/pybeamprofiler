@@ -12,36 +12,29 @@ logger = logging.getLogger(__name__)
 class FlirCamera(HarvesterCamera):
     """FLIR camera using Harvesters GenICam interface.
 
-    Automatically locates FLIR Spinnaker GenTL producer (.cti file).
+    Automatically locates FLIR Spinnaker GenTL producer (``.cti`` file).
     Requires Spinnaker SDK to be installed.
 
-    Args:
-        cti_file: Path to FLIR Spinnaker GenTL producer. If None, uses
-                  GENICAM_GENTL64_PATH or searches common paths.
-        serial_number: Camera serial number to select specific device
-
-    Discovery order:
-        1. Explicit cti_file parameter
-        2. GENICAM_GENTL64_PATH environment variable
-        3. Platform-specific installation paths
+    CTI discovery order: explicit ``cti_file`` parameter →
+    ``GENICAM_GENTL64_PATH`` environment variable → platform-specific
+    Spinnaker SDK installation paths.
     """
 
-    def __init__(self, cti_file: str | None = None, serial_number: str | None = None):
+    def __init__(self, cti_file: str | None = None, serial_number: str | None = None) -> None:
         """Initialize FLIR camera with Spinnaker GenTL.
 
         Args:
-            cti_file: Path to CTI file. If None, searches GENICAM_GENTL64_PATH then platform paths
-            serial_number: Camera serial number for device selection
+            cti_file: Path to FLIR Spinnaker GenTL producer.  If ``None``,
+                searches ``GENICAM_GENTL64_PATH`` then platform paths.
+            serial_number: Camera serial number for device selection.
         """
         cti_file_resolved: str | list[str] | None = cti_file
         if cti_file_resolved is None:
-            # Try GENICAM_GENTL64_PATH first (user-configured)
             gentl_path = os.environ.get("GENICAM_GENTL64_PATH")
             if gentl_path:
                 logger.info(f"Using GENICAM_GENTL64_PATH: {gentl_path}")
                 cti_file_resolved = HarvesterCamera._parse_gentl_path(gentl_path)
 
-            # Fall back to platform-specific Spinnaker SDK paths
             if not cti_file_resolved:
                 cti_file_resolved = self._find_flir_cti()
                 if cti_file_resolved:

@@ -1,13 +1,13 @@
 """Base camera interface for beam profiler."""
 
+from __future__ import annotations
+
 import logging
 import math
 from abc import ABC, abstractmethod
 from typing import Any, cast
 
-import ipywidgets as widgets
 import numpy as np
-from IPython.display import display
 
 logger = logging.getLogger(__name__)
 
@@ -17,71 +17,81 @@ class Camera(ABC):
 
     Defines the common interface for all camera types (simulated,
     FLIR, Basler, etc.).
+
+    Attributes:
+        exposure_time: Current exposure time in seconds.
+        gain: Current gain value.
+        is_acquiring: Whether the camera is actively acquiring images.
+        width: Sensor width in pixels.
+        height: Sensor height in pixels.
+        pixel_size: Pixel pitch in micrometers.
+        image_buffer: Last captured image, or ``None``.
     """
 
-    def __init__(self):
-        self.exposure_time = 0.01  # seconds
-        self.gain = 0.0
-        self.is_acquiring = False
-        self.width = 0
-        self.height = 0
-        self.pixel_size = 1.0  # um
-        self.image_buffer = None
+    def __init__(self) -> None:
+        self.exposure_time: float = 0.01
+        self.gain: float = 0.0
+        self.is_acquiring: bool = False
+        self.width: int = 0
+        self.height: int = 0
+        self.pixel_size: float = 1.0
+        self.image_buffer: np.ndarray | None = None
 
     @abstractmethod
-    def open(self):
+    def open(self) -> None:
         """Open connection to the camera."""
-        pass
+        ...
 
     @abstractmethod
-    def close(self):
+    def close(self) -> None:
         """Close connection to the camera."""
-        pass
+        ...
 
     @abstractmethod
-    def start_acquisition(self):
+    def start_acquisition(self) -> None:
         """Start image acquisition."""
-        pass
+        ...
 
     @abstractmethod
-    def stop_acquisition(self):
+    def stop_acquisition(self) -> None:
         """Stop image acquisition."""
-        pass
+        ...
 
     @abstractmethod
     def get_image(self) -> np.ndarray:
         """Get a single image from the camera."""
-        pass
+        ...
 
     @abstractmethod
-    def set_exposure(self, exposure_time: float):
+    def set_exposure(self, exposure_time: float) -> None:
         """Set exposure time in seconds."""
-        pass
+        ...
 
     @abstractmethod
-    def set_gain(self, gain: float):
+    def set_gain(self, gain: float) -> None:
         """Set gain."""
-        pass
+        ...
 
-    def setting(self, **kwargs):
+    def setting(self, **kwargs: Any) -> None:
         """Display interactive camera controls in Jupyter Notebook.
 
-        Creates tabbed interface with exposure, gain, and acquisition controls.
-        Dynamically populates controls from GenICam node_map for real cameras.
+        Creates a tabbed interface with exposure, gain, and acquisition controls.
+        Dynamically populates controls from the GenICam ``node_map`` for real cameras.
 
         Args:
-            **kwargs: Optional keyword arguments to set camera parameters.
-                     Parameter names should match node_map feature names.
-                     Examples: ExposureTime=0.01, Gain=10.0, BlackLevel=0
+            **kwargs: Camera parameters to apply before showing the UI.
+                Parameter names should match ``node_map`` feature names
+                (e.g. ``ExposureTime=0.01``, ``Gain=10.0``, ``BlackLevel=0``).
         """
-        # Apply settings from kwargs if provided
+        import ipywidgets as widgets
+        from IPython.display import display
+
         if kwargs:
             self._apply_settings_from_kwargs(kwargs)
 
         style = {"description_width": "initial"}
 
-        # Get exposure range from camera if available
-        exposure_min, exposure_max = 1e-6, 1.0  # Default: 1us to 1s
+        exposure_min, exposure_max = 1e-6, 1.0
         if hasattr(self, "exposure_range"):
             exposure_min, exposure_max = cast(tuple[float, float], self.exposure_range)
 
@@ -110,7 +120,6 @@ class Camera(ABC):
             layout=widgets.Layout(width="100px"),
         )
 
-        # Gain settings
         gain_slider = widgets.FloatSlider(
             value=self.gain,
             min=gain_min,
@@ -138,26 +147,26 @@ class Camera(ABC):
             disabled=True,
         )
 
-        def on_exposure_change(change):
+        def on_exposure_change(change: dict[str, Any]) -> None:
             self.set_exposure(change["new"])
             exposure_input.value = change["new"]
 
-        def on_gain_change(change):
+        def on_gain_change(change: dict[str, Any]) -> None:
             self.set_gain(change["new"])
             gain_input.value = change["new"]
 
-        def on_exposure_input_change(change):
+        def on_exposure_input_change(change: dict[str, Any]) -> None:
             exposure_slider.value = change["new"]
 
-        def on_gain_input_change(change):
+        def on_gain_input_change(change: dict[str, Any]) -> None:
             gain_slider.value = change["new"]
 
-        def on_start_click(b):
+        def on_start_click(b: Any) -> None:
             self.start_acquisition()
             start_button.disabled = True
             stop_button.disabled = False
 
-        def on_stop_click(b):
+        def on_stop_click(b: Any) -> None:
             self.stop_acquisition()
             start_button.disabled = False
             stop_button.disabled = True
@@ -178,17 +187,14 @@ class Camera(ABC):
         analog_accordion = widgets.Accordion(children=[gain_box])
         analog_accordion.set_title(0, "Gain")
 
-        # Additional GenICam controls (populated dynamically from node_map)
         genicam_controls = self._create_genicam_controls(style)
         advanced_controls = self._create_advanced_controls(style)
 
-        # Camera information display
-        camera_info = []
+        camera_info: list[Any] = []
         camera_info.append(widgets.HTML(f"<b>Camera Type:</b> {type(self).__name__}"))
         camera_info.append(widgets.HTML(f"<b>Sensor Size:</b> {self.width}×{self.height} pixels"))
         camera_info.append(widgets.HTML(f"<b>Pixel Size:</b> {self.pixel_size:.2f} μm"))
 
-        # Add sensor description
         if hasattr(self, "node_map") and self.node_map:
             try:
                 if hasattr(self.node_map, "SensorDescription"):
@@ -205,8 +211,7 @@ class Camera(ABC):
 
         camera_info_box = widgets.VBox(camera_info)
 
-        # ROI controls
-        roi_controls = None
+        roi_controls: Any = None
         if hasattr(self, "roi_info") and hasattr(self, "set_roi"):
             roi = cast(dict[str, Any], self.roi_info)
 
@@ -231,7 +236,7 @@ class Camera(ABC):
                 description="Full Sensor", button_style="info", icon="arrows-alt"
             )
 
-            def on_roi_apply(b):
+            def on_roi_apply(b: Any) -> None:
                 try:
                     self.set_roi(
                         offset_x_input.value,
@@ -239,7 +244,6 @@ class Camera(ABC):
                         width_input.value,
                         height_input.value,
                     )  # ty:ignore[call-non-callable]
-                    # Update info display
                     updated_roi = cast(dict[str, Any], self.roi_info)
                     camera_info[
                         1
@@ -249,7 +253,7 @@ class Camera(ABC):
                 except Exception as e:
                     logger.error(f"Error setting ROI: {e}")
 
-            def on_roi_reset(b):
+            def on_roi_reset(b: Any) -> None:
                 try:
                     roi_max = cast(dict[str, Any], self.roi_info)
                     self.set_roi(0, 0, roi_max["max_width"], roi_max["max_height"])  # ty:ignore[call-non-callable]
@@ -279,10 +283,8 @@ class Camera(ABC):
                 ]
             )
 
-        # Build tab layout
         settings_children = [timing_accordion, analog_accordion]
 
-        # Add GenICam controls if available
         if genicam_controls:
             settings_children.extend(genicam_controls)
 
@@ -294,14 +296,12 @@ class Camera(ABC):
         info_accordion = widgets.Accordion(children=[camera_info_box])
         info_accordion.set_title(0, "Camera Information")
 
-        # Create tabs
         tab = widgets.Tab()
         tab_children = [
             widgets.VBox(settings_children),
             info_accordion,
         ]
 
-        # Add advanced tab if there are advanced controls
         if advanced_controls:
             advanced_tab = widgets.VBox(advanced_controls)
             tab_children.append(advanced_tab)
@@ -314,21 +314,22 @@ class Camera(ABC):
 
         display(tab)
 
-    def _create_genicam_controls(self, style):
-        """Create dynamic controls from GenICam node_map features.
+    def _create_genicam_controls(self, style: dict[str, str]) -> list[Any]:
+        """Create dynamic controls from GenICam ``node_map`` features.
 
         Args:
-            style: Widget style dict
+            style: Widget style dict (e.g. ``{"description_width": "initial"}``)
 
         Returns:
             List of accordion widgets for common GenICam features
         """
+        import ipywidgets as widgets
+
         if not hasattr(self, "node_map") or not self.node_map:
             return []
 
         accordions = []
 
-        # Common GenICam features (most frequently used)
         feature_groups = {
             "Image Quality": ["Gamma", "GammaEnable", "Sharpness", "Hue", "Saturation"],
             "Black & White Level": [
@@ -354,8 +355,8 @@ class Camera(ABC):
 
         return accordions
 
-    def _create_advanced_controls(self, style):
-        """Create advanced/rarely-used controls from GenICam node_map.
+    def _create_advanced_controls(self, style: dict[str, str]) -> list[Any]:
+        """Create advanced/rarely-used controls from GenICam ``node_map``.
 
         Args:
             style: Widget style dict
@@ -363,12 +364,13 @@ class Camera(ABC):
         Returns:
             List of accordion widgets for advanced GenICam features
         """
+        import ipywidgets as widgets
+
         if not hasattr(self, "node_map") or not self.node_map:
             return []
 
         accordions = []
 
-        # Advanced/rarely-used features
         feature_groups = {
             "Trigger": [
                 "TriggerMode",
@@ -420,11 +422,11 @@ class Camera(ABC):
 
         return accordions
 
-    def _create_feature_controls(self, features, style):
+    def _create_feature_controls(self, features: list[str], style: dict[str, str]) -> list[Any]:
         """Create widgets for a list of GenICam features.
 
         Args:
-            features: List of feature names
+            features: Feature names to look up in the ``node_map``
             style: Widget style dict
 
         Returns:
@@ -439,11 +441,9 @@ class Camera(ABC):
             try:
                 node = getattr(self.node_map, feature_name)  # ty:ignore[unresolved-attribute]
 
-                # Check if readable
                 if not hasattr(node, "value"):
                     continue
 
-                # Boolean/Enable/Auto features (checkboxes or dropdowns)
                 if feature_name.endswith("Enable") or feature_name.endswith("Auto"):
                     try:
                         current_val = node.value
@@ -459,7 +459,6 @@ class Camera(ABC):
                     except Exception as e:
                         logger.debug(f"Could not create checkbox for {feature_name}: {e}")
 
-                # Numeric features (sliders)
                 elif hasattr(node, "min") and hasattr(node, "max"):
                     try:
                         slider_box = self._create_slider(node, feature_name, style)
@@ -468,7 +467,6 @@ class Camera(ABC):
                     except Exception as e:
                         logger.debug(f"Could not create slider for {feature_name}: {e}")
 
-                # Enum features (dropdowns)
                 else:
                     try:
                         dropdown = self._create_enum_dropdown(node, feature_name, style)
@@ -482,11 +480,13 @@ class Camera(ABC):
 
         return controls
 
-    def _create_checkbox(self, node, feature_name, current_val):
-        """Create checkbox widget for boolean GenICam feature."""
+    def _create_checkbox(self, node: Any, feature_name: str, current_val: bool) -> Any:
+        """Create checkbox widget for a boolean GenICam feature."""
+        import ipywidgets as widgets
+
         checkbox = widgets.Checkbox(value=bool(current_val), description=feature_name, indent=False)
 
-        def on_change(change):
+        def on_change(change: dict[str, Any]) -> None:
             try:
                 node.value = change["new"]
             except Exception as e:
@@ -495,14 +495,15 @@ class Camera(ABC):
         checkbox.observe(on_change, names="value")
         return checkbox
 
-    def _create_slider(self, node, feature_name, style):
-        """Create slider widget for numeric GenICam feature."""
+    def _create_slider(self, node: Any, feature_name: str, style: dict[str, str]) -> Any | None:
+        """Create slider widget for a numeric GenICam feature."""
+        import ipywidgets as widgets
+
         try:
             min_val = float(node.min)
             max_val = float(node.max)
             current_val = float(node.value)
 
-            # Determine if integer or float
             is_int = isinstance(node.value, int) or feature_name in ["BlackLevel"]
 
             if is_int:
@@ -529,14 +530,14 @@ class Camera(ABC):
                     value=current_val, layout=widgets.Layout(width="100px")
                 )
 
-            def on_slider_change(change):
+            def on_slider_change(change: dict[str, Any]) -> None:
                 try:
                     node.value = change["new"]
                     input_widget.value = change["new"]
                 except Exception as e:
                     logger.error(f"Error setting {feature_name}: {e}")
 
-            def on_input_change(change):
+            def on_input_change(change: dict[str, Any]) -> None:
                 slider.value = change["new"]
 
             slider.observe(on_slider_change, names="value")
@@ -547,13 +548,16 @@ class Camera(ABC):
         except Exception:
             return None
 
-    def _create_enum_dropdown(self, node, feature_name, style):
-        """Create dropdown widget for enumeration GenICam feature."""
+    def _create_enum_dropdown(
+        self, node: Any, feature_name: str, style: dict[str, str]
+    ) -> Any | None:
+        """Create dropdown widget for an enumeration GenICam feature."""
+        import ipywidgets as widgets
+
         try:
             current_val = str(node.value)
 
-            # Try to get available options (GenICam enums)
-            options = []
+            options: list[str] = []
             if hasattr(node, "symbolics"):
                 options = list(node.symbolics)
             elif feature_name.endswith("Enable"):
@@ -573,7 +577,7 @@ class Camera(ABC):
                 style=style,
             )
 
-            def on_change(change):
+            def on_change(change: dict[str, Any]) -> None:
                 try:
                     node.value = change["new"]
                 except Exception as e:
@@ -585,17 +589,17 @@ class Camera(ABC):
         except Exception:
             return None
 
-    def _apply_settings_from_kwargs(self, kwargs):
+    def _apply_settings_from_kwargs(self, kwargs: dict[str, Any]) -> None:
         """Apply camera settings from keyword arguments.
 
+        Handles both standard camera attributes (``exposure_time``, ``gain``)
+        and GenICam ``node_map`` features.
+
         Args:
-            kwargs: Dictionary of parameter names and values to set.
-                   Handles both standard camera attributes (exposure_time, gain)
-                   and GenICam node_map features.
+            kwargs: Mapping of parameter names to values.
         """
         for param_name, value in kwargs.items():
-            # Handle standard camera attributes
-            if param_name == "exposure_time" or param_name == "ExposureTime":
+            if param_name in ("exposure_time", "ExposureTime"):
                 try:
                     self.set_exposure(value)
                     logger.info(f"Set exposure_time = {value}")
@@ -603,7 +607,7 @@ class Camera(ABC):
                     logger.error(f"Error setting exposure_time: {e}")
                 continue
 
-            if param_name == "gain" or param_name == "Gain":
+            if param_name in ("gain", "Gain"):
                 try:
                     self.set_gain(value)
                     logger.info(f"Set gain = {value}")
@@ -611,25 +615,21 @@ class Camera(ABC):
                     logger.error(f"Error setting gain: {e}")
                 continue
 
-            # Handle GenICam node_map features
             if hasattr(self, "node_map") and self.node_map:
                 if hasattr(self.node_map, param_name):
                     try:
                         node = getattr(self.node_map, param_name)
 
-                        # Convert string boolean representations to actual booleans
                         if isinstance(value, str):
                             if param_name.endswith("Enable") or param_name.endswith("Auto"):
                                 # Check if this is actually a boolean node
                                 try:
                                     current_val = node.value
                                     if isinstance(current_val, bool):
-                                        # It's a boolean node, convert string to bool
                                         if value.lower() in ["on", "true", "1", "yes"]:
                                             value = True
                                         elif value.lower() in ["off", "false", "0", "no"]:
                                             value = False
-                                        # else keep as string (might be enum like 'Once', 'Continuous')
                                 except Exception as e:
                                     logger.debug(
                                         f"Could not check boolean type for {param_name}: {e}"
