@@ -18,8 +18,8 @@ class BaslerCamera(HarvesterCamera):
     Requires Pylon SDK.  Supports USB3 and GigE cameras.
 
     CTI discovery order: explicit ``cti_file`` parameter →
-    ``GENICAM_GENTL64_PATH`` environment variable → platform-specific
-    Pylon SDK installation paths.
+    platform-specific Pylon SDK installation paths →
+    ``GENICAM_GENTL64_PATH`` environment variable (fallback).
     """
 
     def __init__(self, cti_file: str | None = None, serial_number: str | None = None) -> None:
@@ -27,7 +27,7 @@ class BaslerCamera(HarvesterCamera):
 
         Args:
             cti_file: Path to Basler Pylon GenTL producer.  If ``None``,
-                searches ``GENICAM_GENTL64_PATH`` then platform paths.
+                searches platform SDK paths then ``GENICAM_GENTL64_PATH``.
             serial_number: Camera serial number for device selection.
         """
         cti_file_resolved: str | list[str] | None = cti_file
@@ -81,8 +81,8 @@ class BaslerCamera(HarvesterCamera):
         elif system == "Linux":
             # Check standard pylon (symlink to latest)
             bases = [
-                "/opt/pylon/lib64/gentlproducer/gtl",
-                "/opt/pylon5/lib64/gentlproducer/gtl",
+                "/opt/pylon/lib/gentlproducer/gtl",
+                "/opt/pylon5/lib/gentlproducer/gtl",
             ]
             for base in bases:
                 if os.path.isdir(base):

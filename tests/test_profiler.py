@@ -706,6 +706,80 @@ class TestCreateFigure:
         bp.camera.close()
 
 
+class TestDownsampleForDisplay:
+    """Test display-only downsampling."""
+
+    def test_small_image_unchanged(self):
+        """Images within MAX_DISPLAY_DIM are returned as-is (zero copy)."""
+        img = np.random.randint(0, 255, (512, 512), dtype=np.uint8)
+        result = BeamProfiler._downsample_for_display(img)
+        assert result is img
+
+    def test_large_image_downsampled(self):
+        """Images exceeding MAX_DISPLAY_DIM are reduced on the longest edge."""
+        img = np.random.randint(0, 255, (3000, 4000), dtype=np.uint8)
+        result = BeamProfiler._downsample_for_display(img, max_dim=1024)
+        assert result.shape[1] == 1024
+        assert result.shape[0] < 3000
+
+    def test_aspect_ratio_preserved(self):
+        """Downsampled image preserves the original aspect ratio."""
+        img = np.random.randint(0, 255, (2000, 4000), dtype=np.uint8)
+        result = BeamProfiler._downsample_for_display(img, max_dim=1024)
+        orig_ratio = 2000 / 4000
+        new_ratio = result.shape[0] / result.shape[1]
+        assert abs(orig_ratio - new_ratio) < 0.02
+
+    def test_portrait_image(self):
+        """Downsampling works when height is the longest dimension."""
+        img = np.random.randint(0, 255, (4000, 2000), dtype=np.uint8)
+        result = BeamProfiler._downsample_for_display(img, max_dim=1024)
+        assert result.shape[0] == 1024
+        assert result.shape[1] < 2000
+
+    def test_exact_boundary(self):
+        """Image exactly at MAX_DISPLAY_DIM is returned unchanged."""
+        img = np.random.randint(0, 255, (1024, 768), dtype=np.uint8)
+        result = BeamProfiler._downsample_for_display(img, max_dim=1024)
+        assert result is img
+
+    def test_figure_uses_downsampled_heatmap(self):
+        """_create_fast_figure uses downsampled data but original coordinate range."""
+        bp = BeamProfiler(camera="simulated")
+        assert bp.camera is not None
+        img = np.random.randint(0, 255, (2000, 3000), dtype=np.uint8).astype(float)
+        bp.pixel_size = 5.0
+        popt_x, popt_y = bp.analyze(img)
+
+        fig = bp._create_fast_figure(img, popt_x, popt_y)
+        heatmap = [t for t in fig.data if isinstance(t, type(fig.data[0]))][0]
+        z_shape = np.array(heatmap.z).shape
+        assert z_shape[0] < 2000
+        assert z_shape[1] <= 1024
+        assert max(heatmap.x) == pytest.approx((3000 - 1) * 5.0, rel=0.01)
+        assert max(heatmap.y) == pytest.approx((2000 - 1) * 5.0, rel=0.01)
+        bp.camera.close()
+
+    def test_full_figure_uses_downsampled_heatmap(self):
+        """_create_figure uses downsampled heatmap but full-res projections."""
+        bp = BeamProfiler(camera="simulated")
+        assert bp.camera is not None
+        img = np.random.randint(0, 255, (2000, 3000), dtype=np.uint8).astype(float)
+        bp.pixel_size = 5.0
+        popt_x, popt_y = bp.analyze(img)
+
+        fig = bp._create_figure(img, popt_x, popt_y)
+        heatmaps = [t for t in fig.data if hasattr(t, "z") and t.z is not None]
+        assert len(heatmaps) >= 1
+        z_shape = np.array(heatmaps[0].z).shape
+        assert z_shape[1] <= 1024
+
+        data_x_traces = [t for t in fig.data if t.name == "Data X"]
+        assert len(data_x_traces) == 1
+        assert len(data_x_traces[0].x) == 3000
+        bp.camera.close()
+
+
 class TestAnalyzeMethod:
     """Test analyze method with various configurations."""
 

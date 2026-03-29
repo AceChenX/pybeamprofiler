@@ -16,8 +16,8 @@ class FlirCamera(HarvesterCamera):
     Requires Spinnaker SDK to be installed.
 
     CTI discovery order: explicit ``cti_file`` parameter →
-    ``GENICAM_GENTL64_PATH`` environment variable → platform-specific
-    Spinnaker SDK installation paths.
+    platform-specific Spinnaker SDK installation paths →
+    ``GENICAM_GENTL64_PATH`` environment variable (fallback).
     """
 
     def __init__(self, cti_file: str | None = None, serial_number: str | None = None) -> None:
@@ -25,7 +25,7 @@ class FlirCamera(HarvesterCamera):
 
         Args:
             cti_file: Path to FLIR Spinnaker GenTL producer.  If ``None``,
-                searches ``GENICAM_GENTL64_PATH`` then platform paths.
+                searches platform SDK paths then ``GENICAM_GENTL64_PATH``.
             serial_number: Camera serial number for device selection.
         """
         cti_file_resolved: str | list[str] | None = cti_file

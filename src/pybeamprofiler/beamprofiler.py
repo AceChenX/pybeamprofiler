@@ -16,6 +16,7 @@ import numpy as np
 import plotly.graph_objs as go
 from PIL import Image
 from plotly.subplots import make_subplots
+from scipy.ndimage import zoom as _ndimage_zoom
 from scipy.optimize import curve_fit
 
 try:
@@ -25,6 +26,7 @@ try:
         D4SIGMA_FACTOR,
         DEFAULT_DASH_PORT,
         GAUSSIAN_TO_FWHM,
+        MAX_DISPLAY_DIM,
         MAX_FIT_ITERATIONS,
     )
     from .flir import FlirCamera
@@ -43,6 +45,7 @@ except ImportError:
         D4SIGMA_FACTOR,
         DEFAULT_DASH_PORT,
         GAUSSIAN_TO_FWHM,
+        MAX_DISPLAY_DIM,
         MAX_FIT_ITERATIONS,
     )  # type: ignore[no-redef]
     from pybeamprofiler.flir import FlirCamera  # type: ignore[no-redef]
@@ -636,6 +639,26 @@ class BeamProfiler:
         else:
             return self._plot_stream()
 
+    @staticmethod
+    def _downsample_for_display(image: np.ndarray, max_dim: int = MAX_DISPLAY_DIM) -> np.ndarray:
+        """Downsample an image for browser display while preserving visual quality.
+
+        Uses bilinear interpolation to reduce the largest dimension to *max_dim*.
+        Images already within the limit are returned unchanged (zero-copy).
+
+        Args:
+            image: 2-D intensity array (full camera resolution).
+            max_dim: Maximum pixels on the longest edge.
+
+        Returns:
+            Downsampled copy, or the original array if no reduction is needed.
+        """
+        h, w = image.shape
+        if max(h, w) <= max_dim:
+            return image
+        scale = max_dim / max(h, w)
+        return _ndimage_zoom(image, scale, order=1)
+
     def _create_fast_figure(
         self,
         image: np.ndarray,
@@ -657,15 +680,16 @@ class BeamProfiler:
 
         fig = go.Figure()
 
-        # Create physical coordinate arrays for heatmap
         h, w = image.shape
+        display_img = self._downsample_for_display(image)
+        dh, dw = display_img.shape
 
-        x_coords = np.arange(w) * self.pixel_size
-        y_coords = np.arange(h) * self.pixel_size
+        x_coords = np.linspace(0, (w - 1) * self.pixel_size, dw)
+        y_coords = np.linspace(0, (h - 1) * self.pixel_size, dh)
 
         fig.add_trace(
             go.Heatmap(
-                z=image,
+                z=display_img,
                 x=x_coords,
                 y=y_coords,
                 colorscale="Hot",
@@ -680,10 +704,8 @@ class BeamProfiler:
             and hasattr(self, "_linecut_x")
             and hasattr(self, "_linecut_y")
         ):
-            # Convert linecut positions to physical dimensions
             linecut_x_um = self._linecut_x * self.pixel_size
             linecut_y_um = self._linecut_y * self.pixel_size
-            h, w = image.shape
 
             # Vertical line at linecut_x
             fig.add_trace(
@@ -758,10 +780,9 @@ class BeamProfiler:
 
         fig.update_layout(
             uirevision="constant",
-            height=600,
-            width=600,
             title_text=title,
             title_font_size=16,
+            autosize=True,
             yaxis=dict(
                 scaleanchor="x",
                 scaleratio=1,
@@ -818,15 +839,16 @@ class BeamProfiler:
             vertical_spacing=0.02,
         )
 
-        # Beam Image (heatmap)
-        # Create physical coordinate arrays for heatmap
+        # Beam Image (heatmap) — display-only downsampling
         h, w = image.shape
-        x_coords = np.arange(w) * self.pixel_size
-        y_coords = np.arange(h) * self.pixel_size
+        display_img = self._downsample_for_display(image)
+        dh, dw = display_img.shape
+        x_coords = np.linspace(0, (w - 1) * self.pixel_size, dw)
+        y_coords = np.linspace(0, (h - 1) * self.pixel_size, dh)
 
         fig.add_trace(
             go.Heatmap(
-                z=image,
+                z=display_img,
                 x=x_coords,
                 y=y_coords,
                 colorscale="Hot",
@@ -843,10 +865,8 @@ class BeamProfiler:
             and hasattr(self, "_linecut_x")
             and hasattr(self, "_linecut_y")
         ):
-            # Convert linecut positions to physical dimensions
             linecut_x_um = self._linecut_x * self.pixel_size
             linecut_y_um = self._linecut_y * self.pixel_size
-            h, w = image.shape
 
             # Vertical line at linecut_x
             fig.add_trace(
@@ -983,8 +1003,7 @@ class BeamProfiler:
 
         fig.update_layout(
             uirevision="constant",
-            height=700,
-            width=900,
+            autosize=True,
             title_text=title,
             title_font_size=16,
             showlegend=True,
@@ -1087,7 +1106,7 @@ class BeamProfiler:
 
         try:
             # Check if running in Jupyter
-            from IPython import get_ipython  # ty: ignore[unresolved-import]
+            from IPython import get_ipython
             from IPython.display import clear_output, display
 
             if get_ipython() is None:
@@ -1337,8 +1356,8 @@ class BeamProfiler:
             </html>
             """
 
-            # Flag to signal shutdown
             shutdown_flag = {"stop": False}
+            _callback_busy = threading.Lock()
 
             # Start acquisition before Dash server
             if self._mode == "camera" and self.camera is not None and not self.camera.is_acquiring:
@@ -1364,14 +1383,16 @@ class BeamProfiler:
                     dcc.Graph(
                         id="live-update-graph",
                         figure=initial_fig,
-                        style={"height": "700px"},
+                        style={"height": "92vh", "width": "96vw"},
+                        config={"responsive": True},
                     ),
                     dcc.Interval(
                         id="interval-component",
-                        interval=100,  # Update every 100ms (10 Hz) for reliable streaming
+                        interval=100,
                         n_intervals=0,
                     ),
-                ]
+                ],
+                style={"margin": "0 auto", "padding": "4px"},
             )
 
             @app.callback(
@@ -1379,10 +1400,18 @@ class BeamProfiler:
                 Input("interval-component", "n_intervals"),
             )
             async def update_graph_live(n: int):
-                # Check if shutdown requested
                 if shutdown_flag["stop"]:
-                    return go.Figure()
+                    return dash.no_update
 
+                if not _callback_busy.acquire(blocking=False):
+                    return dash.no_update
+
+                try:
+                    return await _do_update(n)
+                finally:
+                    _callback_busy.release()
+
+            async def _do_update(n: int):
                 if n % 10 == 0:
                     logger.debug(f"Processing frame {n}")
 
@@ -1402,7 +1431,6 @@ class BeamProfiler:
                     else:
                         img = self.last_img
                 except Exception as e:
-                    # Camera fetch failed (likely stopped), return empty figure
                     logger.debug(f"Failed to get image: {e}")
                     return dash.no_update
 
@@ -1410,17 +1438,13 @@ class BeamProfiler:
                     return dash.no_update
 
                 try:
-                    # Offload to another thread to release the GIL, allowing
-                    # the camera stream loop to read frames cleanly in the background.
                     popt_x, popt_y = await asyncio.to_thread(self.analyze, img)
 
-                    # Use heatmap_only mode if set
                     if heatmap_only:
                         fig = await asyncio.to_thread(self._create_fast_figure, img, popt_x, popt_y)
                     else:
                         fig = await asyncio.to_thread(self._create_figure, img, popt_x, popt_y)
 
-                    # Always add frame number to show updates
                     current_title = fig.layout.title.text if fig.layout.title else ""
                     fig.update_layout(
                         title_text=f"{current_title}<br><span style='font-size:11px; color:#666'>Frame #{n}</span>"
@@ -1446,11 +1470,26 @@ class BeamProfiler:
 
                 threading.Thread(target=open_browser, daemon=True).start()
 
+            import signal
+
+            def _sigint_handler(signum: int, frame: Any) -> None:
+                shutdown_flag["stop"] = True
+                if self._mode == "camera" and self.camera is not None:
+                    try:
+                        if self.camera.is_acquiring:
+                            self.camera.stop_acquisition()
+                    except Exception:
+                        pass
+                raise KeyboardInterrupt
+
+            prev_handler = signal.getsignal(signal.SIGINT)
+            signal.signal(signal.SIGINT, _sigint_handler)
             try:
                 app.run(debug=False, port=DEFAULT_DASH_PORT, use_reloader=False)
             except KeyboardInterrupt:
-                logger.info("\n\nStopping Dash server...")
-                shutdown_flag["stop"] = True
+                logger.info("\nStopping Dash server...")
+            finally:
+                signal.signal(signal.SIGINT, prev_handler)
 
 
 def main() -> None:
@@ -1560,6 +1599,8 @@ def main() -> None:
 
     try:
         bp.plot(num_img=args.num_img, heatmap_only=args.heatmap_only)
+    except KeyboardInterrupt:
+        pass
     except Exception:
         logger.error("Fatal error during plotting", exc_info=True)
     finally:
@@ -1567,11 +1608,10 @@ def main() -> None:
             try:
                 if bp.camera.is_acquiring:
                     bp.camera.stop_acquisition()
-                    logger.info("Camera acquisition stopped")
                 bp.camera.close()
                 logger.info("Camera closed")
             except Exception:
-                pass
+                logger.debug("Camera cleanup error (already released)", exc_info=True)
 
 
 if __name__ == "__main__":

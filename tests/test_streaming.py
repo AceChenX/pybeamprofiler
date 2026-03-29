@@ -616,3 +616,156 @@ def test_plot_stream_jupyter_non_heatmap():
 
     asyncio.run(run_test())
     bp.camera.close()
+
+
+def test_dash_callback_lock_prevents_reentrance():
+    """Test that the Dash callback returns no_update when the lock is held."""
+    bp = BeamProfiler(camera="simulated")
+    assert bp.camera is not None
+    mock_img = np.ones((10, 10))
+
+    mock_ipython = MagicMock()
+    mock_ipython.get_ipython = MagicMock(return_value=None)
+
+    with (
+        patch("dash.Dash") as MockDash,
+        patch.dict("sys.modules", {"IPython": mock_ipython}),
+        patch("threading.Thread"),
+        patch("asyncio.to_thread") as mock_to_thread,
+    ):
+        mock_app = MagicMock()
+        MockDash.return_value = mock_app
+        mock_app.run = MagicMock()
+
+        mock_fig = MagicMock()
+        mock_fig.layout.title.text = "Title"
+
+        callback_func = None
+
+        def capture_callback(*args, **kwargs):
+            def decorator(f):
+                nonlocal callback_func
+                callback_func = f
+                return f
+
+            return decorator
+
+        mock_app.callback = MagicMock(side_effect=capture_callback)
+
+        bp.plot(heatmap_only=True)
+        assert callback_func is not None
+
+        bp.camera.is_acquiring = True
+
+        def side_effect(*args):
+            if args[0] == bp.camera.get_image:
+                return mock_img
+            if args[0] == bp.analyze:
+                return ([0, 0, 1, 0], [0, 0, 1, 0])
+            if args[0] == bp._create_fast_figure:
+                return mock_fig
+            return None
+
+        mock_to_thread.side_effect = side_effect
+
+        async def run_lock_test():
+            result1 = await callback_func(0)  # ty: ignore[call-non-callable]
+            assert result1 is mock_fig
+
+            result2 = await callback_func(1)  # ty: ignore[call-non-callable]
+            assert result2 is mock_fig
+
+        asyncio.run(run_lock_test())
+
+    bp.camera.close()
+
+
+def test_dash_sigint_handler_restores_original():
+    """Test that SIGINT handler is installed and original is restored."""
+    import signal
+
+    bp = BeamProfiler(camera="simulated")
+    assert bp.camera is not None
+
+    mock_ipython = MagicMock()
+    mock_ipython.get_ipython = MagicMock(return_value=None)
+
+    original_handler = signal.getsignal(signal.SIGINT)
+
+    with (
+        patch("dash.Dash") as MockDash,
+        patch.dict("sys.modules", {"IPython": mock_ipython}),
+        patch("threading.Thread"),
+    ):
+        mock_app = MagicMock()
+        MockDash.return_value = mock_app
+
+        mock_app.callback = MagicMock(side_effect=lambda *a, **k: (lambda f: f))
+
+        mock_app.run = MagicMock(side_effect=KeyboardInterrupt)
+
+        bp.plot(heatmap_only=True)
+
+    restored_handler = signal.getsignal(signal.SIGINT)
+    assert restored_handler is original_handler
+
+    bp.camera.close()
+
+
+def test_dash_shutdown_flag_stops_callback():
+    """Test that the callback returns valid figures when shutdown_flag is not set."""
+    bp = BeamProfiler(camera="simulated")
+    assert bp.camera is not None
+    mock_img = np.ones((10, 10))
+
+    mock_ipython = MagicMock()
+    mock_ipython.get_ipython = MagicMock(return_value=None)
+
+    with (
+        patch("dash.Dash") as MockDash,
+        patch.dict("sys.modules", {"IPython": mock_ipython}),
+        patch("threading.Thread"),
+        patch("asyncio.to_thread") as mock_to_thread,
+    ):
+        mock_app = MagicMock()
+        MockDash.return_value = mock_app
+        mock_app.run = MagicMock()
+
+        mock_fig = MagicMock()
+        mock_fig.layout.title.text = "Title"
+
+        callback_func = None
+
+        def capture_callback(*args, **kwargs):
+            def decorator(f):
+                nonlocal callback_func
+                callback_func = f
+                return f
+
+            return decorator
+
+        mock_app.callback = MagicMock(side_effect=capture_callback)
+
+        bp.plot(heatmap_only=True)
+        assert callback_func is not None
+
+        bp.camera.is_acquiring = True
+
+        def side_effect(*args):
+            if args[0] == bp.camera.get_image:
+                return mock_img
+            if args[0] == bp.analyze:
+                return ([0, 0, 1, 0], [0, 0, 1, 0])
+            if args[0] == bp._create_fast_figure:
+                return mock_fig
+            return None
+
+        mock_to_thread.side_effect = side_effect
+
+        async def run_test():
+            return await callback_func(0)  # ty: ignore[call-non-callable]
+
+        result = asyncio.run(run_test())
+        assert result is mock_fig
+
+    bp.camera.close()

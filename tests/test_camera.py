@@ -329,6 +329,69 @@ class TestGenCameraInit:
             assert mock_harvester.return_value.add_file.call_count == 2
 
 
+class TestGigEStreamConfig:
+    """Test _configure_gige_stream for macOS SocketDriver fallback."""
+
+    def _make_mock_camera(self):
+        """Create a HarvesterCamera with mocked internals."""
+        from pybeamprofiler.gen_camera import HarvesterCamera
+
+        mock_harvester = MagicMock()
+        with patch("pybeamprofiler.gen_camera.Harvester", mock_harvester):
+            cam = HarvesterCamera(cti_file="/fake.cti")
+        cam.ia = MagicMock()
+        return cam
+
+    @patch("pybeamprofiler.gen_camera.platform.system", return_value="Darwin")
+    def test_switches_to_socket_driver_on_macos(self, _mock_sys):
+        """On macOS with GigEAccelerator, stream is switched to SocketDriver."""
+        cam = self._make_mock_camera()
+        ds_nm = MagicMock()
+        ds_nm.Type.value = "GigEAccelerator"
+        ds_nm.TypeIsSocketDriverAvailable.value = True
+        cam.ia.data_streams = [MagicMock(node_map=ds_nm)]
+
+        cam._configure_gige_stream()
+        assert ds_nm.Type.value == "SocketDriver"
+
+    @patch("pybeamprofiler.gen_camera.platform.system", return_value="Darwin")
+    def test_noop_when_already_socket_driver(self, _mock_sys):
+        """No change if stream is already using SocketDriver."""
+        cam = self._make_mock_camera()
+        ds_nm = MagicMock()
+        ds_nm.Type.value = "SocketDriver"
+        cam.ia.data_streams = [MagicMock(node_map=ds_nm)]
+
+        cam._configure_gige_stream()
+        assert ds_nm.Type.value == "SocketDriver"
+
+    @patch("pybeamprofiler.gen_camera.platform.system", return_value="Linux")
+    def test_noop_on_linux(self, _mock_sys):
+        """No change on non-Darwin platforms."""
+        cam = self._make_mock_camera()
+        ds_nm = MagicMock()
+        ds_nm.Type.value = "GigEAccelerator"
+        cam.ia.data_streams = [MagicMock(node_map=ds_nm)]
+
+        cam._configure_gige_stream()
+        assert ds_nm.Type.value == "GigEAccelerator"
+
+    @patch("pybeamprofiler.gen_camera.platform.system", return_value="Darwin")
+    def test_noop_when_no_data_streams(self, _mock_sys):
+        """No error when data_streams is empty (e.g. USB camera)."""
+        cam = self._make_mock_camera()
+        cam.ia.data_streams = []
+        cam._configure_gige_stream()
+
+    @patch("pybeamprofiler.gen_camera.platform.system", return_value="Darwin")
+    def test_graceful_on_missing_type_attr(self, _mock_sys):
+        """Handles cameras whose data-stream node map lacks the Type attribute."""
+        cam = self._make_mock_camera()
+        ds_nm = MagicMock(spec=[])
+        cam.ia.data_streams = [MagicMock(node_map=ds_nm)]
+        cam._configure_gige_stream()
+
+
 class TestGenCameraExposureGain:
     """Test HarvesterCamera exposure/gain methods without hardware."""
 

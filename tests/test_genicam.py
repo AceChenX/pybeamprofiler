@@ -1,6 +1,9 @@
 """Tests for GenICam camera implementations (FLIR, Basler, Harvester)."""
 
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock, Mock, patch
+
+import numpy as np
+import pytest
 
 
 class TestHarvesterCamera:
@@ -287,3 +290,55 @@ class TestHarvesterCameraErrors:
             assert False, "Should have raised RuntimeError"
         except RuntimeError as e:
             assert "not found" in str(e)
+
+
+class TestHarvesterCameraGetImage:
+    """Test get_image auto-start and timeout wrapping."""
+
+    def _make_camera(self):
+        from pybeamprofiler.gen_camera import HarvesterCamera
+
+        mock_harvester = MagicMock()
+        with patch("pybeamprofiler.gen_camera.Harvester", mock_harvester):
+            cam = HarvesterCamera(cti_file="/fake.cti")
+        cam.ia = MagicMock()
+        return cam
+
+    def test_get_image_auto_starts_acquisition(self):
+        """get_image starts acquisition if not already running."""
+        cam = self._make_camera()
+        cam.is_acquiring = False
+        cam.ia.start = MagicMock()
+
+        mock_component = MagicMock()
+        mock_component.data = np.ones(100)
+        mock_component.height = 10
+        mock_component.width = 10
+        mock_buffer = MagicMock()
+        mock_buffer.payload.components = [mock_component]
+        mock_buffer.__enter__ = lambda s: mock_buffer
+        mock_buffer.__exit__ = lambda s, *a: None
+        cam.ia.fetch.return_value = mock_buffer
+
+        cam.get_image()
+        cam.ia.start.assert_called_once()
+
+    def test_get_image_raises_runtime_when_not_opened(self):
+        """get_image raises RuntimeError if camera has not been opened."""
+        cam = self._make_camera()
+        cam.ia = None
+        with pytest.raises(RuntimeError, match="not opened"):
+            cam.get_image()
+
+    def test_get_image_wraps_timeout_exception(self):
+        """get_image wraps GenTL TimeoutException as TimeoutError."""
+        cam = self._make_camera()
+        cam.is_acquiring = True
+
+        class TimeoutException(Exception):
+            pass
+
+        cam.ia.fetch.side_effect = TimeoutException("timed out")
+
+        with pytest.raises(TimeoutError, match="did not deliver a frame"):
+            cam.get_image()
