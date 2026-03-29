@@ -26,3 +26,6 @@ D4SIGMA_FACTOR = 4.0  # D4σ = 4 * sigma
 # Web interface
 DEFAULT_DASH_PORT = 8050
 DEFAULT_UPDATE_INTERVAL_MS = 100  # milliseconds
+
+# Display
+MAX_DISPLAY_DIM = 1024

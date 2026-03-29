@@ -5,6 +5,17 @@ import logging
 import numpy as np
 
 from .camera import Camera
+from .constants import (
+    DEFAULT_EXPOSURE_TIME,
+    DEFAULT_GAIN,
+    SIMULATED_AMPLITUDE,
+    SIMULATED_BACKGROUND,
+    SIMULATED_HEIGHT,
+    SIMULATED_PIXEL_SIZE,
+    SIMULATED_SIGMA_X,
+    SIMULATED_SIGMA_Y,
+    SIMULATED_WIDTH,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -13,45 +24,47 @@ class SimulatedCamera(Camera):
     """Simulated camera generating dynamic Gaussian beam patterns.
 
     Generates realistic beam images with random fluctuations for testing
-    and demonstration purposes without requiring hardware.
-
-    Attributes:
-        width: Sensor width in pixels (1024)
-        height: Sensor height in pixels (1024)
-        pixel_size: Pixel pitch in micrometers (5.0)
+    and demonstration purposes without requiring hardware.  Sensor
+    dimensions and pixel size default to the values in
+    :mod:`pybeamprofiler.constants`.
     """
 
-    def __init__(self):
+    def __init__(self) -> None:
         super().__init__()
-        self.width = 1024
-        self.height = 1024
-        self.pixel_size = 5.0
-        self.exposure_time = 0.01
-        self.gain = 0.0
+        self.width = SIMULATED_WIDTH
+        self.height = SIMULATED_HEIGHT
+        self.pixel_size = SIMULATED_PIXEL_SIZE
+        self.exposure_time = DEFAULT_EXPOSURE_TIME
+        self.gain = DEFAULT_GAIN
         self._center_x = self.width / 2
         self._center_y = self.height / 2
-        self._sigma_x = 150
-        self._sigma_y = 140  # Slightly elliptical
-        self._amplitude = 250
-        self._background = 10
+        self._sigma_x = SIMULATED_SIGMA_X
+        self._sigma_y = SIMULATED_SIGMA_Y
+        self._amplitude = SIMULATED_AMPLITUDE
+        self._background = SIMULATED_BACKGROUND
 
-        # Add exposure/gain ranges for compatibility
-        self._exposure_min = 0.001  # 1 ms
-        self._exposure_max = 1.0  # 1 s
+        self._noise_center = 50.0
+        self._noise_sigma = 20.0
+        self._noise_amp = 10.0
+        self._noise_bg = 10.0
+        self._noise_image = 10.0
+
+        self._exposure_min = 0.001
+        self._exposure_max = 1.0
         self._gain_min = 0.0
         self._gain_max = 24.0
 
-    def open(self):
+    def open(self) -> None:
         logger.info("Simulated camera opened.")
 
-    def close(self):
+    def close(self) -> None:
         logger.info("Simulated camera closed.")
 
-    def start_acquisition(self):
+    def start_acquisition(self) -> None:
         self.is_acquiring = True
         logger.info("Simulated acquisition started.")
 
-    def stop_acquisition(self):
+    def stop_acquisition(self) -> None:
         self.is_acquiring = False
         logger.info("Simulated acquisition stopped.")
 
@@ -59,21 +72,19 @@ class SimulatedCamera(Camera):
         """Generate simulated beam image with random fluctuations.
 
         Creates realistic Gaussian beam patterns with dynamic noise to simulate
-        real camera behavior without hardware. No artificial delay - runs at
-        native frame rate limited only by computation.
+        real camera behaviour without hardware.
 
         Returns:
-            2D numpy array of uint8 intensity values (1024x1024)
+            2D numpy array of uint8 intensity values shaped
+            ``(height, width)`` as configured in :mod:`~pybeamprofiler.constants`.
         """
-        cx = self._center_x + np.random.normal(0, 3)
-        cy = self._center_y + np.random.normal(0, 3)
-        sx = self._sigma_x + np.random.normal(0, 2)
-        sy = self._sigma_y + np.random.normal(0, 2)
-        # Ensure amplitude stays positive
-        amp = max(1.0, self._amplitude + np.random.normal(0, 5))
-        # Ensure background stays positive
-        bg = max(0.0, self._background + np.random.normal(0, 1))
-        noise = np.random.normal(0, 2, (self.height, self.width))
+        cx = self._center_x + np.random.normal(0, self._noise_center)
+        cy = self._center_y + np.random.normal(0, self._noise_center)
+        sx = self._sigma_x + np.random.normal(0, self._noise_sigma)
+        sy = self._sigma_y + np.random.normal(0, self._noise_sigma)
+        amp = max(1.0, self._amplitude + np.random.normal(0, self._noise_amp))
+        bg = max(0.0, self._background + np.random.normal(0, self._noise_bg))
+        noise = np.random.normal(0, self._noise_image, (self.height, self.width))
 
         x = np.arange(0, self.width)
         y = np.arange(0, self.height)
@@ -86,17 +97,21 @@ class SimulatedCamera(Camera):
         self.image_buffer = image
         return image
 
-    def set_exposure(self, exposure_time: float | None):
-        """Set exposure time and adjust simulated signal amplitude."""
-        if exposure_time is None:
-            exposure_time = 0.01
-        self.exposure_time = exposure_time
-        self._amplitude = 250 * (exposure_time / 0.01)
+    def set_exposure(self, exposure_time: float) -> None:  # type: ignore[override]
+        """Set exposure time and adjust simulated signal amplitude.
 
-    def set_gain(self, gain: float):
+        Accepts ``None`` for convenience (resets to the default), though the
+        base-class signature specifies ``float``.
+        """
+        if exposure_time is None:
+            exposure_time = DEFAULT_EXPOSURE_TIME
+        self.exposure_time = exposure_time
+        self._amplitude = SIMULATED_AMPLITUDE * (exposure_time / DEFAULT_EXPOSURE_TIME)
+
+    def set_gain(self, gain: float) -> None:
         """Set gain and adjust simulated signal amplitude."""
         self.gain = gain
-        self._amplitude = 250 * (1 + gain / 10)
+        self._amplitude = SIMULATED_AMPLITUDE * (1 + gain / 10)
 
     @property
     def exposure_range(self) -> tuple[float, float]:

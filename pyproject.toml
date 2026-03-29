@@ -30,7 +30,7 @@ dependencies = [
     "numpy",
     "scipy",
     "plotly",
-    "dash",
+    "dash[async]",
     "ipywidgets",
     "Pillow",
     "harvesters>=1.4.0",
@@ -41,28 +41,29 @@ requires-python = ">=3.10"
 "Homepage" = "https://github.com/acechenx/pybeamprofiler"
 "Bug Tracker" = "https://github.com/acechenx/pybeamprofiler/issues"
 
+[project.scripts]
+pybeamprofiler = "pybeamprofiler.beamprofiler:main"
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/pybeamprofiler"]
 
 [tool.uv]
-# harvesters depends on the `genicam` PyPI package, which has no macOS wheel.
-# On macOS, genicam is provided by the camera SDK (Pylon, Spinnaker) installed
-# into the Python environment. This override tells uv to skip resolving the
-# PyPI genicam wheel on macOS so `uv sync` succeeds.
+# genicam 1.5.1 dropped all macOS wheels; 1.5.0 is the last version with
+# macosx_13_0_arm64 wheels (cp310/cp312/cp313). Pin to that on macOS with
+# Python <3.14 (no cp314 wheels exist for any genicam release on macOS).
 override-dependencies = [
-    "genicam>=0 ; sys_platform != 'darwin'",
+    "genicam==1.5.0 ; sys_platform == 'darwin' and python_version < '3.14'",
 ]
 
 [project.optional-dependencies]
 test = [
-    "pytest>=7.0",
-    "pytest-cov>=4.0",
+    "pytest>=9.0",
+    "pytest-cov>=7.0",
 ]
 dev = [
-    "pytest>=7.0",
-    "pytest-cov>=4.0",
-    "ruff>=0.14.0",
-    "ty>=0.0.1a6",
+    "pybeamprofiler[test]",
+    "ruff>=0.15.0",
+    "ty>=0.0.25",
     "pre-commit>=4.5.0",
 ]
 matplotlib = [

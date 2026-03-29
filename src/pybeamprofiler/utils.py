@@ -1,5 +1,7 @@
 """Utility functions for pybeamprofiler."""
 
+from __future__ import annotations
+
 import logging
 import os
 import platform
@@ -19,11 +21,10 @@ def find_cti_files() -> list[str]:
     search_paths = []
 
     if system == "Windows":
-        search_paths.extend(
-            [
-                r"C:\Program Files\FLIR Systems\Spinnaker\cti64",
-            ]
-        )
+        # Teledyne/FLIR Spinnaker (check both old and new vendor names)
+        search_paths.append(r"C:\Program Files\Teledyne\Spinnaker\cti64")
+        search_paths.append(r"C:\Program Files\FLIR Systems\Spinnaker\cti64")
+        # Basler Pylon SDK
         for version in ["7", "6", "5"]:
             search_paths.append(rf"C:\Program Files\Basler\pylon {version}\Runtime\x64")
 
@@ -39,6 +40,7 @@ def find_cti_files() -> list[str]:
     elif system == "Darwin":
         search_paths.extend(
             [
+                "/usr/local/lib/spinnaker-gentl",
                 "/usr/local/lib",
                 "/Library/Application Support/FLIR/Spinnaker/lib",
                 "/Library/Frameworks/pylon.framework/Libraries",
@@ -49,20 +51,18 @@ def find_cti_files() -> list[str]:
         if not os.path.exists(base_path):
             continue
 
-        # Resolve path to prevent symlink attacks
         try:
             base_path = os.path.realpath(base_path)
         except (OSError, ValueError) as e:
             logger.debug(f"Could not resolve path {base_path}: {e}")
             continue
 
-        # Only search immediate directory, not recursive for security
         try:
             for file in os.listdir(base_path):
                 if file.endswith(".cti"):
                     full_path = os.path.join(base_path, file)
                     # Verify the file is actually within base_path
-                    if os.path.realpath(full_path).startswith(base_path):
+                    if os.path.commonpath([os.path.realpath(full_path), base_path]) == base_path:
                         cti_files.append(full_path)
         except (OSError, PermissionError) as e:
             logger.debug(f"Could not list directory {base_path}: {e}")
@@ -70,14 +70,15 @@ def find_cti_files() -> list[str]:
     return cti_files
 
 
-def list_cameras(cti_file: str | None = None) -> list[dict[str, str]]:
+def list_cameras(cti_file: str | None = None) -> list[dict[str, str | int]]:
     """List all available GenICam cameras.
 
     Args:
-        cti_file: Path to specific CTI file, or None to search all
+        cti_file: Path to specific CTI file, or ``None`` to search all.
 
     Returns:
-        List of camera info dictionaries with keys: vendor, model, serial_number, id
+        List of dicts with keys ``vendor``, ``model``, ``serial_number``
+        (all ``str``), ``id`` (GenTL device id string), and ``index`` (``int``).
     """
     try:
         from harvesters.core import Harvester
@@ -106,7 +107,11 @@ def list_cameras(cti_file: str | None = None) -> list[dict[str, str]]:
                 except Exception as e:
                     logger.warning(f"Could not load {cti}: {e}")
 
-        h.update()
+        try:
+            h.update()
+        except Exception as e:
+            logger.error(f"Error updating Harvester: {e}")
+            return []
 
         cameras = []
         for i, device in enumerate(h.device_info_list):
@@ -127,7 +132,7 @@ def list_cameras(cti_file: str | None = None) -> list[dict[str, str]]:
 
 
 def print_camera_info(cti_file: str | None = None) -> None:
-    """Print information about all available cameras.
+    """Print information about all available cameras to stdout.
 
     Args:
         cti_file: Path to specific CTI file, or None to search all available
@@ -135,17 +140,17 @@ def print_camera_info(cti_file: str | None = None) -> None:
     cameras = list_cameras(cti_file)
 
     if not cameras:
-        logger.info("No cameras found.")
-        logger.info("\nMake sure:")
-        logger.info("  1. Camera is connected")
-        logger.info("  2. GenTL producer (.cti) is installed:")
-        logger.info("     - FLIR: Spinnaker SDK")
-        logger.info("     - Basler: Pylon SDK")
+        print("No cameras found.")
+        print("\nMake sure:")
+        print("  1. Camera is connected")
+        print("  2. GenTL producer (.cti) is installed:")
+        print("     - FLIR: Spinnaker SDK")
+        print("     - Basler: Pylon SDK")
         return
 
-    logger.info(f"Found {len(cameras)} camera(s):\n")
+    print(f"Found {len(cameras)} camera(s):\n")
     for cam in cameras:
-        logger.info(f"[{cam['index']}] {cam['vendor']} {cam['model']}")
-        logger.info(f"    Serial Number: {cam['serial_number']}")
-        logger.info(f"    Device ID: {cam['id']}")
-        logger.info("")
+        print(f"[{cam['index']}] {cam['vendor']} {cam['model']}")
+        print(f"    Serial Number: {cam['serial_number']}")
+        print(f"    Device ID: {cam['id']}")
+        print()

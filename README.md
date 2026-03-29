@@ -25,7 +25,7 @@ Real-time laser beam profiler with Gaussian fitting for GenICam cameras.
 uv sync
 
 # Run with simulated camera (no hardware needed)
-uv run python -m pybeamprofiler.beamprofiler --camera simulated
+uv run pybeamprofiler --camera simulated
 
 # Browser opens automatically at http://127.0.0.1:8050
 ```
@@ -63,30 +63,33 @@ uv sync --extra dev         # All development tools
 
 ```bash
 # Simulated camera (no hardware needed)
-python -m pybeamprofiler.beamprofiler --camera simulated
+pybeamprofiler --camera simulated
 
 # Real cameras (requires SDK installation)
-python -m pybeamprofiler.beamprofiler --camera flir    # FLIR/Spinnaker
-python -m pybeamprofiler.beamprofiler --camera basler  # Basler/Pylon
+pybeamprofiler --camera flir    # FLIR/Spinnaker
+pybeamprofiler --camera basler  # Basler/Pylon
 
 # Single shot acquisition
-python -m pybeamprofiler.beamprofiler --num-img 1
+pybeamprofiler --num-img 1
 
 # Static image analysis
-python -m pybeamprofiler.beamprofiler --file beam.png
+pybeamprofiler --file beam.png
 
 # Custom fitting and definitions
-python -m pybeamprofiler.beamprofiler --fit 2d --definition fwhm
+pybeamprofiler --fit 2d --definition fwhm
 
 # Set exposure time (in seconds)
-python -m pybeamprofiler.beamprofiler --exposure-time 0.05
+pybeamprofiler --exposure-time 0.05
 
 # Fast display mode (heatmap only)
-python -m pybeamprofiler.beamprofiler --heatmap-only
+pybeamprofiler --heatmap-only
 
 # See all options
-python -m pybeamprofiler.beamprofiler --help
+pybeamprofiler --help
 ```
+
+> **Tip:** If you installed via `uv sync`, prefix commands with `uv run` (e.g., `uv run pybeamprofiler --help`).
+> You can also use `python -m pybeamprofiler` as an alternative.
 
 **Continuous streaming** automatically opens a browser with live beam profile and fitting results at http://127.0.0.1:8050.
 
@@ -212,9 +215,9 @@ bp.camera.set_roi(offset_x=0, offset_y=0, width=None, height=None)
 
 ## Jupyter Notebook
 
-See [pybeamprofiler_demo.ipynb](pybeamprofiler_demo.ipynb) for interactive examples with:
+pyBeamprofiler works natively in Jupyter notebooks with interactive widgets:
 - Camera discovery and initialization
-- Interactive controls with widgets
+- Interactive controls with widgets (`bp.setting()`)
 - Single-shot and continuous acquisition
 - Multiple fitting methods and width definitions
 - Programmatic camera control
@@ -300,17 +303,14 @@ Automatic pixel size detection for 40+ sensor models including:
 ## Testing
 
 ```bash
-# Run all tests
+# Run all tests (coverage is enabled by default via pyproject.toml)
 uv run pytest
 
-# Run with coverage
-uv run pytest --cov=pybeamprofiler --cov-report=html
+# Run with HTML coverage report
+uv run pytest --cov-report=html
 
 # Run specific test file
-uv run pytest tests/test_fitting.py
-
-# Run with verbose output
-uv run pytest -v
+uv run pytest tests/test_fitting.py -v
 ```
 
 ## Development
@@ -382,8 +382,8 @@ Contributions welcome! Please:
 1. Fork the repository
 2. Create a feature branch
 3. Add tests for new functionality
-4. Ensure all tests pass: `pytest`
-5. Run code quality checks: `ruff check` and `ruff format`
+4. Ensure all tests pass: `uv run pytest`
+5. Run code quality checks: `uv run ruff check src tests` and `uv run ruff format src tests`
 6. Submit a pull request
 
 ## Acknowledgments
