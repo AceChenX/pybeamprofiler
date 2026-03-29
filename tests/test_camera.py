@@ -609,9 +609,7 @@ class TestBaslerCameraInit:
 
         mock_system.return_value = "Linux"
         mock_isdir.side_effect = lambda p: p == "/opt/pylon/lib/gentlproducer/gtl"
-        mock_exists.side_effect = lambda p: (
-            p == "/opt/pylon/lib/gentlproducer/gtl/ProducerGEV.cti"
-        )
+        mock_exists.side_effect = lambda p: p == "/opt/pylon/lib/gentlproducer/gtl/ProducerGEV.cti"
 
         result = BaslerCamera._find_basler_cti()
         assert result is not None

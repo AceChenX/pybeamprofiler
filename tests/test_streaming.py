@@ -700,7 +700,7 @@ def test_dash_sigint_handler_restores_original():
         mock_app = MagicMock()
         MockDash.return_value = mock_app
 
-        mock_app.callback = MagicMock(side_effect=lambda *a, **k: (lambda f: f))
+        mock_app.callback = MagicMock(side_effect=lambda *a, **k: lambda f: f)
 
         mock_app.run = MagicMock(side_effect=KeyboardInterrupt)
 
