@@ -659,6 +659,42 @@ class BeamProfiler:
         scale = max_dim / max(h, w)
         return _ndimage_zoom(image, scale, order=1)
 
+    def _camera_info_html(self) -> str:
+        """Build an HTML snippet summarising the camera and current settings."""
+        parts: list[str] = []
+        cam = self.camera
+        if cam is None:
+            return ""
+
+        model = getattr(cam, "device_model", None)
+        vendor = getattr(cam, "device_vendor", None)
+        serial = getattr(cam, "serial_number", None)
+        if vendor and model:
+            parts.append(f"{vendor} {model}")
+        elif model:
+            parts.append(model)
+        elif isinstance(cam, SimulatedCamera):
+            parts.append("Simulated")
+
+        if serial:
+            parts.append(f"S/N: {serial}")
+
+        w = getattr(cam, "width", None) or getattr(cam, "width_pixels", None)
+        h = getattr(cam, "height", None) or getattr(cam, "height_pixels", None)
+        if w and h:
+            parts.append(f"{w}×{h}")
+
+        if cam.exposure_time is not None:
+            exp_ms = cam.exposure_time * 1000
+            parts.append(f"Exp: {exp_ms:.2f} ms")
+
+        if cam.gain is not None:
+            parts.append(f"Gain: {cam.gain:.1f}")
+
+        if not parts:
+            return ""
+        return "<span style='font-size:12px; color:#888'>" + " | ".join(parts) + "</span><br>"
+
     def _create_fast_figure(
         self,
         image: np.ndarray,
@@ -760,10 +796,10 @@ class BeamProfiler:
                 )
             )
 
-        # Compact title with coordinates in physical dimensions
         center_x_um = self.center_x * self.pixel_size
         center_y_um = self.center_y * self.pixel_size
         title = "<b>Beam Profile</b><br>"
+        title += self._camera_info_html()
         title += (
             f"<span style='font-size:14px'>Width: X={self.width_x:.1f}μm, Y={self.width_y:.1f}μm | "
         )
@@ -773,7 +809,6 @@ class BeamProfiler:
             title += f" | Angle={self.angle_deg:.1f}°"
         title += "</span>"
 
-        # Convert image coordinates to physical dimensions for axes
         h, w = image.shape
         x_range = [0, w * self.pixel_size]
         y_range = [0, h * self.pixel_size]
@@ -781,8 +816,9 @@ class BeamProfiler:
         fig.update_layout(
             uirevision="constant",
             title_text=title,
-            title_font_size=16,
+            title_font_size=14,
             autosize=True,
+            margin=dict(l=40, r=20, t=110, b=40),
             yaxis=dict(
                 scaleanchor="x",
                 scaleratio=1,
@@ -834,7 +870,7 @@ class BeamProfiler:
                 [{"type": "xy"}, {"type": "xy"}],
                 [{"type": "heatmap"}, {"type": "xy"}],
             ],
-            subplot_titles=("X Profile", "", "Beam Image", "Y Profile"),
+            subplot_titles=("", "", "", ""),
             horizontal_spacing=0.02,
             vertical_spacing=0.02,
         )
@@ -992,6 +1028,7 @@ class BeamProfiler:
         center_y_um = self.center_y * self.pixel_size
 
         title = f"<b>Beam Profile Analysis - {self.definition.upper()}</b><br>"
+        title += self._camera_info_html()
         title += (
             f"<span style='font-size:14px'>Width: X={self.width_x:.1f}μm, Y={self.width_y:.1f}μm | "
         )
@@ -1005,7 +1042,7 @@ class BeamProfiler:
             uirevision="constant",
             autosize=True,
             title_text=title,
-            title_font_size=16,
+            title_font_size=14,
             showlegend=True,
             legend=dict(
                 orientation="h",
@@ -1015,7 +1052,7 @@ class BeamProfiler:
                 x=0.5,
                 font=dict(size=11),
             ),
-            margin=dict(l=40, r=20, t=100, b=60),
+            margin=dict(l=40, r=20, t=130, b=60),
             plot_bgcolor="rgba(245,245,245,0.5)",
         )
 

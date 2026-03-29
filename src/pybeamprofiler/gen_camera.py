@@ -101,6 +101,8 @@ class HarvesterCamera(Camera):
             )
 
         self.serial_number: str | None = serial_number
+        self.device_model: str | None = None
+        self.device_vendor: str | None = None
         self.ia: Any = None
         self.node_map: Any = None
         self._exposure_min: float = 1e-6  # safe default (avoids log10(0) in UI)
@@ -179,6 +181,10 @@ class HarvesterCamera(Camera):
         else:
             device_to_open = self.h.device_info_list[0]
             logger.info(f"Using first camera: {device_to_open.model}")
+
+        self.device_model = getattr(device_to_open, "model", None)
+        self.device_vendor = getattr(device_to_open, "vendor", None)
+        self.serial_number = getattr(device_to_open, "serial_number", self.serial_number)
 
         self.ia = self.h.create(device_to_open)
         self.node_map = self.ia.remote_device.node_map
