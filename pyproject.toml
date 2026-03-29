@@ -49,9 +49,10 @@ packages = ["src/pybeamprofiler"]
 
 [tool.uv]
 # genicam 1.5.1 dropped all macOS wheels; 1.5.0 is the last version with
-# macosx_13_0_arm64 wheels (cp39/cp312/cp313). Pin to that on macOS.
+# macosx_13_0_arm64 wheels (cp310/cp312/cp313). Pin to that on macOS with
+# Python <3.14 (no cp314 wheels exist for any genicam release on macOS).
 override-dependencies = [
-    "genicam==1.5.0 ; sys_platform == 'darwin'",
+    "genicam==1.5.0 ; sys_platform == 'darwin' and python_version < '3.14'",
 ]
 
 [project.optional-dependencies]
