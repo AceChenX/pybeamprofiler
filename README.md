@@ -8,17 +8,16 @@ Real-time laser beam profiler with Gaussian fitting for GenICam cameras.
 
 ## Features
 
-* **Fast Gaussian fitting:** 850+ fps for 1D, 95 fps for 2D
-* **Live streaming:** Dash web interface (10 Hz) or Jupyter notebooks (6-10 Hz)
-* **Browser-based GUI:** Dark-themed control panel with real-time fitting results, color scale selection, auto-range, and camera settings
-* **Multiple fitting methods:** 1D projections, 2D Gaussian, linecut
-* **Multiple width definitions:** Gaussian (1/e²), FWHM, D4σ (ISO 11146)
-* **Interactive controls:** Dash GUI for streaming, Jupyter widgets for notebooks
-* **Flexible inputs:** Static images or camera streams
-* **Hardware support:** FLIR, Basler cameras via GenICam/[Harvesters](https://github.com/genicam/harvesters)
-* **Simulated camera:** Included for testing without hardware — supports exposure, gain, and ROI
-* **Auto-configuration:** Pixel size detection, auto-exposure/gain disabled by default
-* **ROI support:** Region of Interest with full sensor default
+- **Real-time Gaussian fitting** — 1D projections (230+ fps), 2D with rotation (50+ fps), linecut (300+ fps)
+- **Browser-based GUI** — Dash web interface with dark/light theme toggle, 30+ Plotly color scales, auto-range controls, and live fitted results (FW@1/e², FW@1/e, FWHM, center, peak, angle)
+- **Camera controls in GUI** — Fitting and Setting tabs: play/pause, save frame, exposure/gain sliders, ROI controls, all matching GenICam categories via accordion layout
+- **Multiple width definitions** — Gaussian (1/e²), FWHM, D4σ (ISO 11146 second moment)
+- **Jupyter notebook support** — Live streaming with interactive widgets (`bp.setting()`) for camera control
+- **Flexible inputs** — Live camera streams, static image files, or the built-in simulated camera
+- **Hardware support** — FLIR (Spinnaker) and Basler (Pylon) cameras via GenICam/[Harvesters](https://github.com/genicam/harvesters)
+- **Simulated camera** — Gaussian beam with noise, controllable exposure, gain, and ROI — no hardware needed
+- **Auto-configuration** — Pixel size detection for 40+ sensor models, auto-exposure/gain disabled by default
+- **Performance optimized** — 2D fits use adaptive downsampling and Levenberg-Marquardt warm starts for consistent low-latency updates
 
 ## Quick Start
 
@@ -68,7 +67,7 @@ pybeamprofiler --fit 2d --definition fwhm
 # Set exposure time (in seconds)
 pybeamprofiler --exposure-time 0.05
 
-# Fast display mode (heatmap only)
+# Heatmap-only mode (skips fitting overlays in Jupyter/Matplotlib)
 pybeamprofiler --heatmap-only
 
 # See all options
@@ -76,9 +75,9 @@ pybeamprofiler --help
 ```
 
 **Continuous streaming** automatically opens a browser GUI at http://127.0.0.1:8050 with:
-- Live beam profile heatmap and X/Y projection fits (left panel)
-- **Fitting tab:** play/pause, save frame, color scale, auto-range, analysis method, and fitted results
-- **Setting tab:** exposure, gain, and ROI controls (accordion layout matching GenICam categories)
+- Live beam profile heatmap with overlaid X/Y projection fits (left panel)
+- **Fitting tab:** play/pause, save frame, color/greyscale toggle, 30+ color scales, auto-range with min/max override, dark/light theme, analysis method, fit definition, pixel scale override, and fitted results (FW@1/e², FW@1/e, FWHM, center, peak, angle)
+- **Setting tab:** camera info, exposure/gain sliders, and ROI controls (accordion layout matching GenICam categories)
 
 ### Python API
 
@@ -152,7 +151,7 @@ bp.setting()  # Opens interactive control panel
 #### Fitting Methods
 
 ```python
-# 1D Gaussian fitting (fastest, 850+ fps)
+# 1D Gaussian fitting (fastest)
 bp.fit_method = '1d'
 bp.plot(num_img=1)
 
@@ -263,24 +262,27 @@ Automatic pixel size detection for 40+ sensor models including:
 
 ## Performance
 
-- **Gaussian fitting:** 850+ fps (1D), 95 fps (2D) - Not the bottleneck!
-- **Display rates:**
-  - Jupyter notebook: 6-10 Hz (standard), 25-30 Hz (heatmap only)
+- **Gaussian fitting (analysis only):**
+  - 1D projections: 230+ fps
+  - 2D with rotation: 50+ fps (adaptive downsampling + LM warm starts)
+  - Linecut: 300+ fps
+- **Display rates (full pipeline: acquire + fit + render):**
   - Dash web interface: 10 Hz
+  - Jupyter notebook: 6–10 Hz (standard), 25–30 Hz (heatmap only)
   - Matplotlib fallback: ~5 Hz
 
 ## Dependencies
 
 **Core:**
-- numpy, scipy - Numerical computing and optimization
-- plotly, dash - Interactive visualization and web interface
-- dash-bootstrap-components - Responsive GUI layout and controls
-- ipywidgets - Jupyter notebook controls
-- Pillow - Image file loading
-- harvesters - GenICam camera interface
+- numpy, scipy — Numerical computing and Gaussian fitting
+- plotly, dash — Interactive visualization and web interface
+- dash-bootstrap-components — Responsive GUI layout with dark/light theme
+- ipywidgets — Jupyter notebook controls
+- Pillow — Image file loading
+- harvesters — GenICam camera interface
 
 **Optional:**
-- matplotlib - Fallback plotting (CLI only)
+- matplotlib — Fallback plotting (CLI only)
 
 ## Troubleshooting
 
@@ -308,10 +310,11 @@ Automatic pixel size detection for 40+ sensor models including:
 ### GigE vs USB3
 - Basler cameras: Code auto-detects and prefers GigE over USB3
 - For USB3 cameras, explicitly pass the USB3 CTI file path:
-  ```python
-  from pybeamprofiler.basler import BaslerCamera
-  cam = BaslerCamera(cti_file="/path/to/ProducerU3V.cti")
-  ```
+
+```python
+from pybeamprofiler.basler import BaslerCamera
+cam = BaslerCamera(cti_file="/path/to/ProducerU3V.cti")
+```
 
 ### Jupyter Kernel Restart
 When re-initializing cameras in Jupyter, restart the kernel first:
@@ -357,7 +360,7 @@ uv run pytest
 uv run pytest --cov-report=html
 
 # Run specific test file
-uv run pytest tests/test_fitting.py -v
+uv run pytest tests/test_profiler.py -v
 ```
 
 ### Contributing
