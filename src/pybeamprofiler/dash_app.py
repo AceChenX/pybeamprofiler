@@ -953,10 +953,12 @@ def _register_callbacks(app: dash.Dash, bp: BeamProfiler) -> None:
     # -- Pixel scale override -------------------------------------------------
     @app.callback(
         Output("input-pixel-scale", "value"),
-        Input("input-pixel-scale", "value"),
+        Input("input-pixel-scale", "n_submit"),
+        Input("input-pixel-scale", "n_blur"),
+        State("input-pixel-scale", "value"),
         prevent_initial_call=True,
     )
-    def set_pixel_scale(val: float | None) -> float:
+    def set_pixel_scale(_n_submit: int | None, _n_blur: int | None, val: float | None) -> float:
         if val is not None and val > 0:
             bp.pixel_size = val
         return round(bp.pixel_size, 4)
