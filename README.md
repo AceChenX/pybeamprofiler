@@ -2,6 +2,7 @@
 
 Real-time laser beam profiler with Gaussian fitting for GenICam cameras.
 
+[![PyPI](https://img.shields.io/pypi/v/pybeamprofiler.svg)](https://pypi.org/project/pybeamprofiler/)
 [![Python 3.10–3.14](https://img.shields.io/badge/python-3.10--3.14-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
@@ -9,52 +10,38 @@ Real-time laser beam profiler with Gaussian fitting for GenICam cameras.
 
 * **Fast Gaussian fitting:** 850+ fps for 1D, 95 fps for 2D
 * **Live streaming:** Dash web interface (10 Hz) or Jupyter notebooks (6-10 Hz)
+* **Browser-based GUI:** Dark-themed control panel with real-time fitting results, color scale selection, auto-range, and camera settings
 * **Multiple fitting methods:** 1D projections, 2D Gaussian, linecut
 * **Multiple width definitions:** Gaussian (1/e²), FWHM, D4σ (ISO 11146)
-* **Interactive controls:** Jupyter widgets for camera settings
+* **Interactive controls:** Dash GUI for streaming, Jupyter widgets for notebooks
 * **Flexible inputs:** Static images or camera streams
 * **Hardware support:** FLIR, Basler cameras via GenICam/[Harvesters](https://github.com/genicam/harvesters)
-* **Simulated camera:** Included for testing without hardware
+* **Simulated camera:** Included for testing without hardware — supports exposure, gain, and ROI
 * **Auto-configuration:** Pixel size detection, auto-exposure/gain disabled by default
 * **ROI support:** Region of Interest with full sensor default
 
 ## Quick Start
 
 ```bash
-# Install (creates/updates a reproducible environment from the lockfile)
-uv sync
+# Install from PyPI
+pip install pybeamprofiler
 
 # Run with simulated camera (no hardware needed)
-uv run pybeamprofiler --camera simulated
+pybeamprofiler --camera simulated
 
 # Browser opens automatically at http://127.0.0.1:8050
 ```
 
 ## Installation
 
-### Basic Installation
-
 ```bash
-uv sync
+pip install pybeamprofiler
 ```
 
-`uv sync` installs the exact versions recorded in `uv.lock`, giving you a reproducible environment. This is the recommended path for both users and CI.
-
-> **Installing into an existing environment?** If you are managing your own virtualenv or conda environment and do not want to use the lockfile, you can run `uv pip install .` (or plain `pip install .`) instead. Be aware that this resolves dependencies independently and may produce a different set of package versions than the lockfile.
-
-### Development Installation
+With optional Matplotlib fallback for CLI:
 
 ```bash
-uv sync --extra dev
-pre-commit install  # Optional: enable git hooks
-```
-
-### Optional Dependencies
-
-```bash
-uv sync --extra matplotlib  # Matplotlib fallback for CLI
-uv sync --extra test        # Testing tools only
-uv sync --extra dev         # All development tools
+pip install pybeamprofiler[matplotlib]
 ```
 
 ## Usage
@@ -88,10 +75,10 @@ pybeamprofiler --heatmap-only
 pybeamprofiler --help
 ```
 
-> **Tip:** If you installed via `uv sync`, prefix commands with `uv run` (e.g., `uv run pybeamprofiler --help`).
-> You can also use `python -m pybeamprofiler` as an alternative.
-
-**Continuous streaming** automatically opens a browser with live beam profile and fitting results at http://127.0.0.1:8050.
+**Continuous streaming** automatically opens a browser GUI at http://127.0.0.1:8050 with:
+- Live beam profile heatmap and X/Y projection fits (left panel)
+- **Fitting tab:** play/pause, save frame, color scale, auto-range, analysis method, and fitted results
+- **Setting tab:** exposure, gain, and ROI controls (accordion layout matching GenICam categories)
 
 ### Python API
 
@@ -287,50 +274,13 @@ Automatic pixel size detection for 40+ sensor models including:
 **Core:**
 - numpy, scipy - Numerical computing and optimization
 - plotly, dash - Interactive visualization and web interface
+- dash-bootstrap-components - Responsive GUI layout and controls
 - ipywidgets - Jupyter notebook controls
 - Pillow - Image file loading
 - harvesters - GenICam camera interface
 
 **Optional:**
 - matplotlib - Fallback plotting (CLI only)
-
-**Development:**
-- pytest, pytest-cov - Testing framework
-- ruff - Fast linter and formatter
-- ty - Static type checking
-- pre-commit - Git hooks for code quality
-
-## Testing
-
-```bash
-# Run all tests (coverage is enabled by default via pyproject.toml)
-uv run pytest
-
-# Run with HTML coverage report
-uv run pytest --cov-report=html
-
-# Run specific test file
-uv run pytest tests/test_fitting.py -v
-```
-
-## Development
-
-```bash
-# Install in development mode
-uv sync --extra dev
-
-# Install pre-commit hooks
-pre-commit install
-
-# Run linter
-uv run ruff check src tests
-
-# Run formatter
-uv run ruff format src tests
-
-# Run type checker
-uv run ty check src tests
-```
 
 ## Troubleshooting
 
@@ -368,15 +318,49 @@ When re-initializing cameras in Jupyter, restart the kernel first:
 - Kernel → Restart Kernel
 - This releases the camera hardware lock
 
-## License
+## Development
 
-MIT License - see [LICENSE](LICENSE) file for details.
+### Setup
 
-## Author
+```bash
+# Clone the repository
+git clone https://github.com/acechenx/pybeamprofiler.git
+cd pybeamprofiler
 
-C.-A. Chen (acechen@cirx.org)
+# Install with development dependencies (reproducible via lockfile)
+uv sync --extra dev
 
-## Contributing
+# Install pre-commit hooks
+uv run pre-commit install
+```
+
+### Code Quality
+
+```bash
+# Run linter
+uv run ruff check src tests
+
+# Run formatter
+uv run ruff format src tests
+
+# Run type checker
+uv run ty check src tests
+```
+
+### Testing
+
+```bash
+# Run all tests (coverage is enabled by default via pyproject.toml)
+uv run pytest
+
+# Run with HTML coverage report
+uv run pytest --cov-report=html
+
+# Run specific test file
+uv run pytest tests/test_fitting.py -v
+```
+
+### Contributing
 
 Contributions welcome! Please:
 1. Fork the repository
@@ -385,6 +369,14 @@ Contributions welcome! Please:
 4. Ensure all tests pass: `uv run pytest`
 5. Run code quality checks: `uv run ruff check src tests` and `uv run ruff format src tests`
 6. Submit a pull request
+
+## License
+
+MIT License - see [LICENSE](LICENSE) file for details.
+
+## Author
+
+C.-A. Chen (acechen@cirx.org)
 
 ## Acknowledgments
 

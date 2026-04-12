@@ -31,6 +31,7 @@ dependencies = [
     "scipy",
     "plotly",
     "dash[async]",
+    "dash-bootstrap-components",
     "ipywidgets",
     "Pillow",
     "harvesters>=1.4.0",

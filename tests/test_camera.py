@@ -175,7 +175,7 @@ class TestApplySettingsFromKwargs:
         mock_node.value = 10
         mock_node_map = MagicMock()
         mock_node_map.TestParam = mock_node
-        cam.node_map = mock_node_map  # ty: ignore[unresolved-attribute]
+        cam.node_map = mock_node_map
         cam._apply_settings_from_kwargs({"TestParam": 42})
         assert mock_node.value == 42
         cam.close()
@@ -188,7 +188,7 @@ class TestApplySettingsFromKwargs:
         mock_node.value = False  # Current value is bool
         mock_node_map = MagicMock()
         mock_node_map.TestEnable = mock_node
-        cam.node_map = mock_node_map  # ty: ignore[unresolved-attribute]
+        cam.node_map = mock_node_map
         cam._apply_settings_from_kwargs({"TestEnable": "on"})
         assert mock_node.value is True
         cam.close()
@@ -201,7 +201,7 @@ class TestApplySettingsFromKwargs:
         mock_node.value = True  # Current value is bool
         mock_node_map = MagicMock()
         mock_node_map.TestEnable = mock_node
-        cam.node_map = mock_node_map  # ty: ignore[unresolved-attribute]
+        cam.node_map = mock_node_map
         cam._apply_settings_from_kwargs({"TestEnable": "off"})
         assert mock_node.value is False
         cam.close()
@@ -211,7 +211,7 @@ class TestApplySettingsFromKwargs:
         cam = SimulatedCamera()
         cam.open()
         mock_node_map = MagicMock(spec=[])
-        cam.node_map = mock_node_map  # ty: ignore[unresolved-attribute]
+        cam.node_map = mock_node_map
         cam._apply_settings_from_kwargs({"MissingParam": 1})
         cam.close()
 
@@ -1176,15 +1176,7 @@ class TestCameraSettingMethod:
     def test_setting_with_roi(self):
         """Test setting() creates ROI controls when available."""
         cam = self._make_cam_with_mocks()
-        cam.roi_info = {
-            "offset_x": 0,
-            "offset_y": 0,
-            "width": 1024,
-            "height": 768,
-            "max_width": 2048,
-            "max_height": 1536,
-        }
-        cam.set_roi = MagicMock()
+        cam.set_roi(0, 0, 1024, 768)
         with patch("IPython.display.display"):
             cam.setting()
         cam.close()
@@ -1192,6 +1184,7 @@ class TestCameraSettingMethod:
     def test_create_genicam_controls_no_node_map(self):
         """Test _create_genicam_controls returns empty list without node_map."""
         cam = self._make_cam_with_mocks()
+        cam.node_map = None
         result = cam._create_genicam_controls({"description_width": "initial"})
         assert result == []
         cam.close()
@@ -1199,6 +1192,7 @@ class TestCameraSettingMethod:
     def test_create_advanced_controls_no_node_map(self):
         """Test _create_advanced_controls returns empty list without node_map."""
         cam = self._make_cam_with_mocks()
+        cam.node_map = None
         result = cam._create_advanced_controls({"description_width": "initial"})
         assert result == []
         cam.close()
@@ -1402,27 +1396,16 @@ class TestSettingCallbacks:
         cam.width_pixels = 1024
         cam.height_pixels = 768
 
-        cam.roi_info = {
-            "offset_x": 0,
-            "offset_y": 0,
-            "width": 1024,
-            "height": 768,
-            "max_width": 2048,
-            "max_height": 1536,
-        }
+        cam.set_roi(0, 0, 1024, 768)
 
         set_roi_calls = []
 
         def mock_set_roi(ox, oy, w, h):
             set_roi_calls.append((ox, oy, w, h))
-            cam.roi_info = {
-                "offset_x": ox,
-                "offset_y": oy,
-                "width": w,
-                "height": h,
-                "max_width": 2048,
-                "max_height": 1536,
-            }
+            cam._roi_offset_x = ox
+            cam._roi_offset_y = oy
+            cam._roi_width = w
+            cam._roi_height = h
 
         cam.set_roi = mock_set_roi
 
@@ -1565,14 +1548,7 @@ class TestSettingCallbacks:
     def test_roi_apply_error_handling(self):
         """Test ROI apply callback handles set_roi error."""
         cam = self._make_cam()
-        cam.roi_info = {
-            "offset_x": 0,
-            "offset_y": 0,
-            "width": 1024,
-            "height": 768,
-            "max_width": 2048,
-            "max_height": 1536,
-        }
+        cam.set_roi(0, 0, 1024, 768)
         cam.set_roi = MagicMock(side_effect=RuntimeError("ROI error"))
 
         displayed = []
@@ -1600,14 +1576,7 @@ class TestSettingCallbacks:
     def test_roi_reset_error_handling(self):
         """Test ROI reset callback handles set_roi error."""
         cam = self._make_cam()
-        cam.roi_info = {
-            "offset_x": 0,
-            "offset_y": 0,
-            "width": 1024,
-            "height": 768,
-            "max_width": 2048,
-            "max_height": 1536,
-        }
+        cam.set_roi(0, 0, 1024, 768)
 
         call_count = [0]
 

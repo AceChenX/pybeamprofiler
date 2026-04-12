@@ -8,6 +8,7 @@ import dash
 import numpy as np
 
 from pybeamprofiler.beamprofiler import BeamProfiler
+from pybeamprofiler.dash_app import build_figure
 
 
 def test_plot_single():
@@ -223,43 +224,47 @@ def test_plot_stream_dash_robustness():
         bp.camera.is_acquiring = True
 
         async def run_callback_error():
-            def side_effect(*args):
+            def side_effect(*args, **kwargs):
                 if args[0] == bp.camera.get_image:
                     raise RuntimeError("Camera dead")
                 return None
 
             mock_to_thread.side_effect = side_effect
-            return await callback_func(0)  # type: ignore
+            return await callback_func(
+                0, False, True, "Hot", True, None, None, 0, "1d", "gaussian", True
+            )  # type: ignore
 
-        assert asyncio.run(run_callback_error()) is dash.no_update
+        assert asyncio.run(run_callback_error())[0] is dash.no_update
 
         async def run_callback_none():
-            def side_effect(*args):
+            def side_effect(*args, **kwargs):
                 if args[0] == bp.camera.get_image:
                     return None
                 return None
 
             mock_to_thread.side_effect = side_effect
-            return await callback_func(0)  # type: ignore
+            return await callback_func(
+                0, False, True, "Hot", True, None, None, 0, "1d", "gaussian", True
+            )  # type: ignore
 
-        assert asyncio.run(run_callback_none()) is dash.no_update
+        assert asyncio.run(run_callback_none())[0] is dash.no_update
 
         async def run_callback_success():
-            def side_effect(*args):
+            def side_effect(*args, **kwargs):
                 if args[0] == bp.camera.get_image:
                     return mock_img
                 if args[0] == bp.analyze:
                     return ([0, 0, 1, 0], [0, 0, 1, 0])
-                if args[0] == bp._create_fast_figure:
-                    return mock_fig
-                if args[0] == bp._create_figure:
+                if args[0] == build_figure:
                     return mock_fig
                 return None
 
             mock_to_thread.side_effect = side_effect
-            return await callback_func(0)  # type: ignore
+            return await callback_func(
+                0, False, True, "Hot", True, None, None, 0, "1d", "gaussian", True
+            )  # type: ignore
 
-        assert asyncio.run(run_callback_success()) is mock_fig
+        assert asyncio.run(run_callback_success())[0] is mock_fig
 
 
 def test_plot_stream_matplotlib_fallback():
@@ -372,25 +377,27 @@ def test_plot_stream_dash_non_heatmap():
         bp.camera.is_acquiring = True
 
         async def run_callback_success():
-            def side_effect(*args):
+            def side_effect(*args, **kwargs):
                 if args[0] == bp.camera.get_image:
                     return mock_img
                 if args[0] == bp.analyze:
                     return ([0, 0, 1, 0], [0, 0, 1, 0])
-                if args[0] == bp._create_figure:
+                if args[0] == build_figure:
                     return mock_fig
                 return None
 
             mock_to_thread.side_effect = side_effect
-            return await callback_func(0)  # type: ignore
+            return await callback_func(
+                0, False, True, "Hot", True, None, None, 0, "1d", "gaussian", True
+            )  # type: ignore
 
-        assert asyncio.run(run_callback_success()) is mock_fig
+        assert asyncio.run(run_callback_success())[0] is mock_fig
 
     bp.camera.close()
 
 
 def test_plot_stream_camera_not_acquiring_restart():
-    """Test Dash callback restarts acquisition when camera is not acquiring."""
+    """Test Dash callback handles camera not acquiring (proceeds with get_image)."""
     bp = BeamProfiler(camera="simulated")
     assert bp.camera is not None
     mock_img = np.ones((10, 10))
@@ -428,23 +435,24 @@ def test_plot_stream_camera_not_acquiring_restart():
 
         # Camera stops acquiring mid-stream
         bp.camera.is_acquiring = False
-        bp.camera.start_acquisition = MagicMock()
 
         async def run_callback():
-            def side_effect(*args):
+            def side_effect(*args, **kwargs):
                 if args[0] == bp.camera.get_image:
                     return mock_img
                 if args[0] == bp.analyze:
                     return ([0, 0, 1, 0], [0, 0, 1, 0])
-                if args[0] == bp._create_fast_figure:
+                if args[0] == build_figure:
                     return mock_fig
                 return None
 
             mock_to_thread.side_effect = side_effect
-            return await callback_func(0)  # type: ignore
+            return await callback_func(
+                0, False, True, "Hot", True, None, None, 0, "1d", "gaussian", True
+            )  # type: ignore
 
-        asyncio.run(run_callback())
-        bp.camera.start_acquisition.assert_called_once()
+        result = asyncio.run(run_callback())
+        assert result[0] is mock_fig
 
     bp.camera.close()
 
@@ -495,18 +503,20 @@ def test_plot_stream_static_mode():
             assert callback_func is not None
 
             async def run_callback():
-                def side_effect(*args):
+                def side_effect(*args, **kwargs):
                     if args[0] == bp.analyze:
                         return ([0, 0, 1, 0], [0, 0, 1, 0])
-                    if args[0] == bp._create_figure:
+                    if args[0] == build_figure:
                         return mock_fig
                     return None
 
                 mock_to_thread.side_effect = side_effect
-                return await callback_func(0)  # type: ignore
+                return await callback_func(
+                    0, False, True, "Hot", True, None, None, 0, "1d", "gaussian", True
+                )  # type: ignore
 
             result = asyncio.run(run_callback())
-            assert result is mock_fig
+            assert result[0] is mock_fig
 
 
 def test_plot_stream_matplotlib_update_frame():
@@ -657,23 +667,27 @@ def test_dash_callback_lock_prevents_reentrance():
 
         bp.camera.is_acquiring = True
 
-        def side_effect(*args):
+        def side_effect(*args, **kwargs):
             if args[0] == bp.camera.get_image:
                 return mock_img
             if args[0] == bp.analyze:
                 return ([0, 0, 1, 0], [0, 0, 1, 0])
-            if args[0] == bp._create_fast_figure:
+            if args[0] == build_figure:
                 return mock_fig
             return None
 
         mock_to_thread.side_effect = side_effect
 
         async def run_lock_test():
-            result1 = await callback_func(0)  # ty: ignore[call-non-callable]
-            assert result1 is mock_fig
+            result1 = await callback_func(
+                0, False, True, "Hot", True, None, None, 0, "1d", "gaussian", True
+            )  # ty: ignore[call-non-callable]
+            assert result1[0] is mock_fig
 
-            result2 = await callback_func(1)  # ty: ignore[call-non-callable]
-            assert result2 is mock_fig
+            result2 = await callback_func(
+                1, False, True, "Hot", True, None, None, 0, "1d", "gaussian", True
+            )
+            assert result2[0] is mock_fig
 
         asyncio.run(run_lock_test())
 
@@ -751,21 +765,23 @@ def test_dash_shutdown_flag_stops_callback():
 
         bp.camera.is_acquiring = True
 
-        def side_effect(*args):
+        def side_effect(*args, **kwargs):
             if args[0] == bp.camera.get_image:
                 return mock_img
             if args[0] == bp.analyze:
                 return ([0, 0, 1, 0], [0, 0, 1, 0])
-            if args[0] == bp._create_fast_figure:
+            if args[0] == build_figure:
                 return mock_fig
             return None
 
         mock_to_thread.side_effect = side_effect
 
         async def run_test():
-            return await callback_func(0)  # ty: ignore[call-non-callable]
+            return await callback_func(
+                0, False, True, "Hot", True, None, None, 0, "1d", "gaussian", True
+            )  # ty: ignore[call-non-callable]
 
         result = asyncio.run(run_test())
-        assert result is mock_fig
+        assert result[0] is mock_fig
 
     bp.camera.close()

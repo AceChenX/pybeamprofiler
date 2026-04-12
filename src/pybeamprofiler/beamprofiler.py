@@ -448,8 +448,15 @@ class BeamProfiler:
             logger.warning(f"1D fit failed: {e}, using initial guess")
             return p0
 
+    _MAX_FIT_2D_DIM = 256
+
     def _fit_2d_gaussian(self, image: np.ndarray) -> np.ndarray | list[Any]:
         """Fit 2D Gaussian to image.
+
+        Large images are downsampled to at most :attr:`_MAX_FIT_2D_DIM` pixels
+        on the longest edge before fitting, then coordinates are scaled back to
+        the original resolution.  This keeps 2D fitting real-time even for
+        megapixel sensors.
 
         Args:
             image: 2D intensity array
@@ -459,32 +466,64 @@ class BeamProfiler:
         """
         h, w = image.shape
 
-        if self._last_popt_2d is not None:
-            p0 = self._last_popt_2d
+        # Downsample for performance — 2D curve_fit on 1M+ pixels is too slow
+        if max(h, w) > self._MAX_FIT_2D_DIM:
+            ds = self._MAX_FIT_2D_DIM / max(h, w)
+            fit_img = _ndimage_zoom(image.astype(float), ds, order=1)
+            inv_ds = 1.0 / ds
         else:
-            pmax, pmin = np.max(image), np.min(image)
-            y0, x0 = np.unravel_index(np.argmax(image), image.shape)
-            p0 = [pmax - pmin, x0, y0, w / 10.0, h / 10.0, 0.0, pmin]
+            fit_img = image
+            inv_ds = 1.0
+
+        fh, fw = fit_img.shape
+
+        if self._last_popt_2d is not None:
+            p0 = list(self._last_popt_2d)
+            # Scale cached params into the downsampled coordinate system
+            if inv_ds != 1.0:
+                p0[1] /= inv_ds  # x0
+                p0[2] /= inv_ds  # y0
+                p0[3] /= inv_ds  # sigma_x
+                p0[4] /= inv_ds  # sigma_y
+        else:
+            pmax, pmin = np.max(fit_img), np.min(fit_img)
+            y0, x0 = np.unravel_index(np.argmax(fit_img), fit_img.shape)
+            p0 = [pmax - pmin, x0, y0, fw / 10.0, fh / 10.0, 0.0, pmin]
 
         try:
-            x, y = np.arange(w), np.arange(h)
+            x, y = np.arange(fw), np.arange(fh)
             xv, yv = np.meshgrid(x, y)
 
-            # Bounds constrain parameters for faster convergence:
-            # amplitude > 0, centers in image, sigmas > 0.1, theta in [-π, π]
-            bounds = ([0, 0, 0, 0.1, 0.1, -np.pi, -np.inf], [np.inf, w, h, w, h, np.pi, np.inf])
+            bounds = (
+                [0, 0, 0, 0.1, 0.1, -np.pi, -np.inf],
+                [np.inf, fw, fh, fw, fh, np.pi, np.inf],
+            )
             popt, _ = curve_fit(
                 BeamProfiler.gaussian_2d,
                 (xv.ravel(), yv.ravel()),
-                image.ravel(),
+                fit_img.ravel(),
                 p0=p0,
                 bounds=bounds,
                 maxfev=MAX_FIT_ITERATIONS,
             )
+
+            # Scale coordinates back to original resolution
+            if inv_ds != 1.0:
+                popt[1] *= inv_ds  # x0
+                popt[2] *= inv_ds  # y0
+                popt[3] *= inv_ds  # sigma_x
+                popt[4] *= inv_ds  # sigma_y
+
             self._last_popt_2d = popt
             return popt
         except (RuntimeError, ValueError) as e:
             logger.warning(f"2D fit failed: {e}, using initial guess")
+            # Scale p0 back if it was downsampled
+            if inv_ds != 1.0:
+                p0[1] *= inv_ds
+                p0[2] *= inv_ds
+                p0[3] *= inv_ds
+                p0[4] *= inv_ds
             return p0
 
     def analyze(
@@ -1241,9 +1280,7 @@ class BeamProfiler:
         except (NameError, ImportError):
             # Running from command line - use Dash
             try:
-                import dash
-                from dash import dcc, html
-                from dash.dependencies import Input, Output
+                import dash  # noqa: F401
             except ImportError:
                 logger.info("\nDash not available. Using matplotlib fallback.")
                 logger.info("Install dash for better performance: pip install dash\n")
@@ -1349,148 +1386,9 @@ class BeamProfiler:
 
                 return
 
-            # Dash is available, use it
-            app = dash.Dash(__name__)
+            from .dash_app import create_app
 
-            # Inject JavaScript to close tab when server disconnects (Ctrl-C)
-            # Uses the same approach as camera_streamer.py
-            app.index_string = """
-            <!DOCTYPE html>
-            <html>
-                <head>
-                    {%metas%}
-                    <title>{%title%}</title>
-                    {%favicon%}
-                    {%css%}
-                    <script>
-                        // Close tab when Dash server disconnects
-                        window.addEventListener('load', function() {
-                            var failedAttempts = 0;
-                            setInterval(function() {
-                                fetch('/_dash-component-suites/dash/dcc/async-graph.js', {
-                                    method: 'HEAD',
-                                    cache: 'no-cache'
-                                }).then(function() {
-                                    failedAttempts = 0;
-                                }).catch(function() {
-                                    failedAttempts++;
-                                    if (failedAttempts >= 2) {
-                                        window.open('', '_self').close();
-                                    }
-                                });
-                            }, 500);
-                        });
-                    </script>
-                </head>
-                <body>
-                    {%app_entry%}
-                    <footer>
-                        {%config%}
-                        {%scripts%}
-                        {%renderer%}
-                    </footer>
-                </body>
-            </html>
-            """
-
-            shutdown_flag = {"stop": False}
-            _callback_busy = threading.Lock()
-
-            # Start acquisition before Dash server
-            if self._mode == "camera" and self.camera is not None and not self.camera.is_acquiring:
-                self.camera.start_acquisition()
-
-            # Get initial image for display
-            initial_img = (
-                self.camera.get_image()
-                if self._mode == "camera" and self.camera is not None
-                else self.last_img
-            )
-            initial_popt_x, initial_popt_y = (
-                self.analyze(initial_img) if initial_img is not None else (None, None)
-            )
-            initial_fig = (
-                self._create_figure(initial_img, initial_popt_x, initial_popt_y)
-                if initial_img is not None
-                else go.Figure()
-            )
-
-            app.layout = html.Div(
-                [
-                    dcc.Graph(
-                        id="live-update-graph",
-                        figure=initial_fig,
-                        style={"height": "92vh", "width": "96vw"},
-                        config={"responsive": True},
-                    ),
-                    dcc.Interval(
-                        id="interval-component",
-                        interval=100,
-                        n_intervals=0,
-                    ),
-                ],
-                style={"margin": "0 auto", "padding": "4px"},
-            )
-
-            @app.callback(
-                Output("live-update-graph", "figure"),
-                Input("interval-component", "n_intervals"),
-            )
-            async def update_graph_live(n: int):
-                if shutdown_flag["stop"]:
-                    return dash.no_update
-
-                if not _callback_busy.acquire(blocking=False):
-                    return dash.no_update
-
-                try:
-                    return await _do_update(n)
-                finally:
-                    _callback_busy.release()
-
-            async def _do_update(n: int):
-                if n % 10 == 0:
-                    logger.debug(f"Processing frame {n}")
-
-                if (
-                    self._mode == "camera"
-                    and self.camera is not None
-                    and not self.camera.is_acquiring
-                ):
-                    try:
-                        self.camera.start_acquisition()
-                    except Exception:
-                        return go.Figure()
-
-                try:
-                    if self._mode == "camera" and self.camera is not None:
-                        img = await asyncio.to_thread(self.camera.get_image)
-                    else:
-                        img = self.last_img
-                except Exception as e:
-                    logger.debug(f"Failed to get image: {e}")
-                    return dash.no_update
-
-                if img is None:
-                    return dash.no_update
-
-                try:
-                    popt_x, popt_y = await asyncio.to_thread(self.analyze, img)
-
-                    if heatmap_only:
-                        fig = await asyncio.to_thread(self._create_fast_figure, img, popt_x, popt_y)
-                    else:
-                        fig = await asyncio.to_thread(self._create_figure, img, popt_x, popt_y)
-
-                    current_title = fig.layout.title.text if fig.layout.title else ""
-                    fig.update_layout(
-                        title_text=f"{current_title}<br><span style='font-size:11px; color:#666'>Frame #{n}</span>"
-                    )
-
-                    return fig
-                except Exception as e:
-                    logger.debug(f"Frame analysis/generation failed: {e}")
-                    return dash.no_update
+            app = create_app(self)
 
             logger.info(f"Starting Dash server at http://127.0.0.1:{DEFAULT_DASH_PORT}")
             logger.info("Opening browser automatically...")
@@ -1510,7 +1408,6 @@ class BeamProfiler:
             import signal
 
             def _sigint_handler(signum: int, frame: Any) -> None:
-                shutdown_flag["stop"] = True
                 if self._mode == "camera" and self.camera is not None:
                     try:
                         if self.camera.is_acquiring:

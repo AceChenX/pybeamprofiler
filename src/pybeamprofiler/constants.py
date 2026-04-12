@@ -11,7 +11,7 @@ SIMULATED_HEIGHT = 1024  # pixels
 SIMULATED_PIXEL_SIZE = 5.0  # micrometers
 SIMULATED_SIGMA_X = 150  # pixels, typical beam width
 SIMULATED_SIGMA_Y = 140  # pixels, slightly elliptical
-SIMULATED_AMPLITUDE = 250  # intensity units
+SIMULATED_AMPLITUDE = 200  # intensity units (below 255 to avoid saturation)
 SIMULATED_BACKGROUND = 10  # baseline intensity
 
 # Fitting parameters
