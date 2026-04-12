@@ -260,15 +260,26 @@ class BeamProfiler:
             Flattened 2D Gaussian values
         """
         x, y = xy
-        x0 = float(x0)
-        y0 = float(y0)
-        a = (np.cos(theta) ** 2) / (2 * sigma_x**2) + (np.sin(theta) ** 2) / (2 * sigma_y**2)
-        b = -(np.sin(2 * theta)) / (4 * sigma_x**2) + (np.sin(2 * theta)) / (4 * sigma_y**2)
-        c = (np.sin(theta) ** 2) / (2 * sigma_x**2) + (np.cos(theta) ** 2) / (2 * sigma_y**2)
-        g = offset + amplitude * np.exp(
-            -(a * ((x - x0) ** 2) + 2 * b * (x - x0) * (y - y0) + c * ((y - y0) ** 2))
-        )
-        return g.ravel()
+        cos_t = np.cos(theta)
+        sin_t = np.sin(theta)
+        cos2 = cos_t * cos_t
+        sin2 = sin_t * sin_t
+        sin2t = 2.0 * sin_t * cos_t
+        sx2_inv = 0.5 / (sigma_x * sigma_x)
+        sy2_inv = 0.5 / (sigma_y * sigma_y)
+
+        a = cos2 * sx2_inv + sin2 * sy2_inv
+        b = 0.5 * sin2t * (sy2_inv - sx2_inv)
+        c = sin2 * sx2_inv + cos2 * sy2_inv
+
+        dx = x - float(x0)
+        dy = y - float(y0)
+        out = a * dx * dx + 2.0 * b * dx * dy + c * dy * dy
+        np.negative(out, out=out)
+        np.exp(out, out=out)
+        out *= amplitude
+        out += offset
+        return out.ravel()
 
     @property
     def width(self) -> float:
@@ -448,7 +459,7 @@ class BeamProfiler:
             logger.warning(f"1D fit failed: {e}, using initial guess")
             return p0
 
-    _MAX_FIT_2D_DIM = 256
+    _MAX_FIT_2D_DIM = 128
 
     def _fit_2d_gaussian(self, image: np.ndarray) -> np.ndarray | list[Any]:
         """Fit 2D Gaussian to image.
@@ -493,19 +504,44 @@ class BeamProfiler:
         try:
             x, y = np.arange(fw), np.arange(fh)
             xv, yv = np.meshgrid(x, y)
-
+            xy_flat = (xv.ravel(), yv.ravel())
+            data_flat = fit_img.ravel()
             bounds = (
                 [0, 0, 0, 0.1, 0.1, -np.pi, -np.inf],
                 [np.inf, fw, fh, fw, fh, np.pi, np.inf],
             )
-            popt, _ = curve_fit(
-                BeamProfiler.gaussian_2d,
-                (xv.ravel(), yv.ravel()),
-                fit_img.ravel(),
-                p0=p0,
-                bounds=bounds,
-                maxfev=MAX_FIT_ITERATIONS,
-            )
+
+            if self._last_popt_2d is not None:
+                # Warm: try unbounded LM first (~1.8x faster), fall back to bounded
+                try:
+                    popt, _ = curve_fit(
+                        BeamProfiler.gaussian_2d,
+                        xy_flat,
+                        data_flat,
+                        p0=p0,
+                        method="lm",
+                        maxfev=MAX_FIT_ITERATIONS,
+                    )
+                    if abs(popt[3]) < 0.1 or abs(popt[4]) < 0.1 or popt[3] > fw or popt[4] > fh:
+                        raise RuntimeError("LM diverged")
+                except (RuntimeError, ValueError):
+                    popt, _ = curve_fit(
+                        BeamProfiler.gaussian_2d,
+                        xy_flat,
+                        data_flat,
+                        p0=p0,
+                        bounds=bounds,
+                        maxfev=MAX_FIT_ITERATIONS,
+                    )
+            else:
+                popt, _ = curve_fit(
+                    BeamProfiler.gaussian_2d,
+                    xy_flat,
+                    data_flat,
+                    p0=p0,
+                    bounds=bounds,
+                    maxfev=MAX_FIT_ITERATIONS,
+                )
 
             # Scale coordinates back to original resolution
             if inv_ds != 1.0:

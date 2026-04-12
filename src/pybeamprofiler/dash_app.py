@@ -928,6 +928,14 @@ def _register_callbacks(app: dash.Dash, bp: BeamProfiler) -> None:
             "base64": True,
         }
 
+    # -- Color switch disables colorscale dropdown ----------------------------
+    @app.callback(
+        Output("dropdown-colorscale", "disabled"),
+        Input("switch-color", "value"),
+    )
+    def toggle_colorscale(color_on: bool) -> bool:
+        return not color_on
+
     # -- Auto-range toggle disables min/max inputs ----------------------------
     @app.callback(
         Output("input-zmin", "disabled"),
