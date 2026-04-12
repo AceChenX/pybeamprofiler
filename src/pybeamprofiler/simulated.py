@@ -235,16 +235,12 @@ class SimulatedCamera(Camera):
             width: ROI width in pixels (``None`` for full sensor width).
             height: ROI height in pixels (``None`` for full sensor height).
         """
-        self._roi_offset_x = offset_x
-        self._roi_offset_y = offset_y
-        self._roi_width = width if width is not None else SIMULATED_WIDTH
-        self._roi_height = height if height is not None else SIMULATED_HEIGHT
-
-        # Clamp to sensor bounds
-        self._roi_offset_x = max(0, min(self._roi_offset_x, SIMULATED_WIDTH - 1))
-        self._roi_offset_y = max(0, min(self._roi_offset_y, SIMULATED_HEIGHT - 1))
-        self._roi_width = min(self._roi_width, SIMULATED_WIDTH - self._roi_offset_x)
-        self._roi_height = min(self._roi_height, SIMULATED_HEIGHT - self._roi_offset_y)
+        self._roi_offset_x = max(0, min(offset_x, SIMULATED_WIDTH - 1))
+        self._roi_offset_y = max(0, min(offset_y, SIMULATED_HEIGHT - 1))
+        w = width if width is not None else SIMULATED_WIDTH
+        h = height if height is not None else SIMULATED_HEIGHT
+        self._roi_width = max(1, min(w, SIMULATED_WIDTH - self._roi_offset_x))
+        self._roi_height = max(1, min(h, SIMULATED_HEIGHT - self._roi_offset_y))
 
         self.width = self._roi_width
         self.height = self._roi_height

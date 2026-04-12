@@ -540,6 +540,11 @@ class HarvesterCamera(Camera):
             if height is None:
                 height = self._roi_max_height
 
+            offset_x = max(0, min(offset_x, self._roi_max_width - 1))
+            offset_y = max(0, min(offset_y, self._roi_max_height - 1))
+            width = max(1, min(width, self._roi_max_width - offset_x))
+            height = max(1, min(height, self._roi_max_height - offset_y))
+
             # Order matters: set offsets before dimensions
             if hasattr(self.node_map, "OffsetX"):
                 self.node_map.OffsetX.value = offset_x
