@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
+from typing import Any
+
 import dash
 import dash_bootstrap_components as dbc
 import numpy as np
@@ -242,7 +245,7 @@ class TestBuildFigure:
         return bp
 
     def test_none_image_returns_empty_figure(self, bp):
-        fig = build_figure(bp, None, None, None)  # ty: ignore[invalid-argument-type]
+        fig = build_figure(bp, None, None, None)
         assert isinstance(fig, go.Figure)
         assert len(fig.data) == 0
 
@@ -341,12 +344,15 @@ class TestBuildSettingItems:
         assert len(items) >= 2  # Camera Info, Exposure & Gain
         assert all(isinstance(item, dbc.AccordionItem) for item in items)
 
-    def test_roi_section_present(self):
+    def test_roi_controls_in_image_format(self):
         bp = BeamProfiler(camera="simulated")
         assert bp.camera is not None
         items = _build_setting_items(bp)
         titles = [item.title for item in items]  # ty: ignore[unresolved-attribute]
-        assert "Region of Interest" in titles
+        assert "Image Format Control" in titles
+        ifc_item = next(i for i in items if i.title == "Image Format Control")  # ty: ignore[unresolved-attribute]
+        layout_str = str(ifc_item)
+        assert "input-roi-ox" in layout_str
 
     def test_no_camera_returns_empty(self):
         bp = BeamProfiler(camera="simulated")
@@ -374,6 +380,13 @@ class TestTabBuilders:
         tab = _setting_tab(bp)
         assert isinstance(tab, dbc.Tab)
         assert tab.tab_id == "tab-setting"  # ty: ignore[unresolved-attribute]
+
+    def test_setting_tab_has_container(self):
+        bp = BeamProfiler(camera="simulated")
+        assert bp.camera is not None
+        tab = _setting_tab(bp)
+        layout_str = str(tab)
+        assert "settings-container" in layout_str
 
     def test_setting_tab_no_camera(self):
         bp = BeamProfiler(camera="simulated")
@@ -477,3 +490,935 @@ class TestCallbackHelpers:
         assert len(COLORSCALES) > 0
         assert "Hot" in COLORSCALES
         assert "Viridis" in COLORSCALES
+
+
+# ─── Pause stops / Play resumes acquisition ────────────────────────────────
+
+
+class TestPauseStopsAcquisition:
+    """Verify that Pause actually stops acquisition and Play restarts it."""
+
+    @staticmethod
+    def _get_toggle_fn(bp: BeamProfiler):
+        """Extract the toggle_pause function from registered callbacks."""
+        from pybeamprofiler.dash_app import _register_callbacks
+
+        app = dash.Dash(__name__)
+        app.layout = html.Div()
+        callback_map: dict = {}
+        original_callback = app.callback
+
+        def tracking_callback(*args, **kwargs):
+            def decorator(f):
+                key = str(args)
+                callback_map[key] = f
+                return original_callback(*args, **kwargs)(f)
+
+            return decorator
+
+        app.callback = tracking_callback  # ty: ignore[invalid-assignment]
+        _register_callbacks(app, bp)
+
+        for key, func in callback_map.items():
+            if "store-paused" in key and "btn-play-pause" in key:
+                return func
+        return None
+
+    def test_pause_stops_acquisition(self):
+        bp = BeamProfiler(camera="simulated")
+        cam = bp.camera
+        assert cam is not None
+        cam.start_acquisition()
+        assert cam.is_acquiring is True
+
+        toggle = self._get_toggle_fn(bp)
+        assert toggle is not None
+        result = toggle(1, False)  # paused=False → new_paused=True (pause)
+        assert result[0] is True  # store-paused data
+        assert cam.is_acquiring is False
+
+    def test_play_restarts_acquisition(self):
+        bp = BeamProfiler(camera="simulated")
+        cam = bp.camera
+        assert cam is not None
+        cam.stop_acquisition()
+        assert cam.is_acquiring is False
+
+        toggle = self._get_toggle_fn(bp)
+        assert toggle is not None
+        result = toggle(2, True)  # paused=True → new_paused=False (play)
+        assert result[0] is False  # store-paused data
+        assert cam.is_acquiring is True
+
+    def test_pause_rebuilds_settings(self):
+        bp = BeamProfiler(camera="simulated")
+        cam = bp.camera
+        assert cam is not None
+        cam.start_acquisition()
+
+        toggle = self._get_toggle_fn(bp)
+        assert toggle is not None
+        result = toggle(1, False)
+        settings_body = result[3]
+        assert settings_body is not None
+        assert isinstance(settings_body, dbc.Accordion)
+
+
+# ─── GenICam feature controls in Dash ────────────────────────────────────────
+
+
+class TestBuildGenicamControl:
+    """Tests for _build_genicam_control helper."""
+
+    def test_boolean_feature_creates_switch(self):
+        from pybeamprofiler.dash_app import _build_genicam_control
+        from pybeamprofiler.simulated import _SimulatedNode
+
+        class MockCam:
+            class node_map:
+                ReverseX = _SimulatedNode(False)
+
+        ctrl = _build_genicam_control(MockCam(), "ReverseX")
+        assert ctrl is not None
+        layout_str = str(ctrl)
+        assert "genicam-sw" in layout_str
+
+    def test_enum_feature_creates_select(self):
+        from pybeamprofiler.dash_app import _build_genicam_control
+        from pybeamprofiler.simulated import _SimulatedNode
+
+        class MockCam:
+            class node_map:
+                PixelFormat = _SimulatedNode("Mono8", symbolics=["Mono8", "Mono12"])
+
+        ctrl = _build_genicam_control(MockCam(), "PixelFormat")
+        assert ctrl is not None
+        layout_str = str(ctrl)
+        assert "genicam-sel" in layout_str
+
+    def test_numeric_feature_creates_slider(self):
+        from pybeamprofiler.dash_app import _build_genicam_control
+        from pybeamprofiler.simulated import _SimulatedNode
+
+        class MockCam:
+            class node_map:
+                Gamma = _SimulatedNode(1.0, min_val=0.25, max_val=4.0)
+
+        ctrl = _build_genicam_control(MockCam(), "Gamma")
+        assert ctrl is not None
+        layout_str = str(ctrl)
+        assert "genicam-num" in layout_str
+        assert "Slider" in layout_str
+
+    def test_readonly_numeric_shows_text(self):
+        from pybeamprofiler.dash_app import _build_genicam_control
+        from pybeamprofiler.simulated import _SimulatedNode
+
+        class MockCam:
+            class node_map:
+                DeviceTemperature = _SimulatedNode(42.5, min_val=0.0, max_val=100.0, readonly=True)
+
+        ctrl = _build_genicam_control(MockCam(), "DeviceTemperature")
+        assert ctrl is not None
+        layout_str = str(ctrl)
+        assert "42.5" in layout_str
+        assert "genicam-num" not in layout_str
+
+    def test_string_enable_creates_select(self):
+        from pybeamprofiler.dash_app import _build_genicam_control
+        from pybeamprofiler.simulated import _SimulatedNode
+
+        class MockCam:
+            class node_map:
+                SomeEnable = _SimulatedNode("On")
+
+        ctrl = _build_genicam_control(MockCam(), "SomeEnable")
+        assert ctrl is not None
+        layout_str = str(ctrl)
+        assert "genicam-sel" in layout_str
+
+    def test_string_auto_creates_select(self):
+        from pybeamprofiler.dash_app import _build_genicam_control
+        from pybeamprofiler.simulated import _SimulatedNode
+
+        class MockCam:
+            class node_map:
+                SomeAuto = _SimulatedNode("Off")
+
+        ctrl = _build_genicam_control(MockCam(), "SomeAuto")
+        assert ctrl is not None
+
+    def test_no_node_map_returns_none(self):
+        from pybeamprofiler.dash_app import _build_genicam_control
+
+        class MockCam:
+            node_map = None
+
+        assert _build_genicam_control(MockCam(), "Anything") is None
+
+    def test_missing_feature_returns_none(self):
+        from pybeamprofiler.dash_app import _build_genicam_control
+        from pybeamprofiler.simulated import _SimulatedNode
+
+        class MockCam:
+            class node_map:
+                Gamma = _SimulatedNode(1.0, min_val=0.0, max_val=4.0)
+
+        assert _build_genicam_control(MockCam(), "NonexistentFeature") is None
+
+    def test_value_exception_returns_none(self):
+        from pybeamprofiler.dash_app import _build_genicam_control
+
+        class FailingNode:
+            @property
+            def value(self):
+                raise RuntimeError("broken")
+
+        class MockCam:
+            class node_map:
+                Bad = FailingNode()
+
+        assert _build_genicam_control(MockCam(), "Bad") is None
+
+
+class TestDashGenicamSettingItems:
+    """Tests for GenICam features in _build_setting_items."""
+
+    def test_simulated_camera_has_genicam_items(self):
+        bp = BeamProfiler(camera="simulated")
+        assert bp.camera is not None
+        items = _build_setting_items(bp)
+        titles = [item.title for item in items]  # ty: ignore[unresolved-attribute]
+        assert "Camera Info" in titles
+        assert "Acquisition Control" in titles
+        assert "Analog Control" in titles
+        assert "Image Format Control" in titles
+
+    def test_genicam_groups_are_subset_of_discovery(self):
+        bp = BeamProfiler(camera="simulated")
+        assert bp.camera is not None
+        discovered = bp.camera._discover_features()
+        items = _build_setting_items(bp)
+        titles = {item.title for item in items}  # ty: ignore[unresolved-attribute]
+        non_discovery_titles = {"Camera Info"}
+        from pybeamprofiler.dash_app import _PINNED_CATEGORIES
+
+        non_discovery_titles.update(_PINNED_CATEGORIES)
+        genicam_titles = titles - non_discovery_titles
+        for title in genicam_titles:
+            assert title in discovered
+
+    def test_no_camera_no_genicam_items(self):
+        bp = BeamProfiler(camera="simulated")
+        bp.camera = None
+        items = _build_setting_items(bp)
+        assert items == []
+
+
+class TestDashGenicamCallbacks:
+    """Tests for GenICam pattern-matching callbacks registration."""
+
+    def test_callbacks_registered_for_simulated(self):
+        bp = BeamProfiler(camera="simulated")
+        assert bp.camera is not None
+        app = create_app(bp)
+        callback_keys = list(app.callback_map.keys())
+        genicam_callbacks = [k for k in callback_keys if "genicam" in k]
+        assert len(genicam_callbacks) > 0
+
+    def test_app_with_genicam_controls_renders(self):
+        bp = BeamProfiler(camera="simulated")
+        assert bp.camera is not None
+        app = create_app(bp)
+        assert isinstance(app, dash.Dash)
+        layout_str = str(app.layout)
+        assert "genicam" in layout_str
+
+
+# ─── _normalize_profile ────────────────────────────────────────────────────
+
+
+class TestNormalizeProfile:
+    """Tests for the _normalize_profile helper."""
+
+    def test_uniform_profile(self):
+        from pybeamprofiler.dash_app import _normalize_profile
+
+        data = np.ones(100)
+        result = _normalize_profile(data, span=200.0)
+        assert np.allclose(result, 0.0)
+
+    def test_range_scaled_to_fraction(self):
+        from pybeamprofiler.dash_app import _normalize_profile
+
+        data = np.array([0.0, 50.0, 100.0])
+        result = _normalize_profile(data, span=100.0, fraction=0.25)
+        assert result.max() == pytest.approx(25.0)
+        assert result.min() == pytest.approx(0.0)
+
+    def test_default_fraction(self):
+        from pybeamprofiler.dash_app import _normalize_profile
+
+        data = np.array([0.0, 100.0])
+        result = _normalize_profile(data, span=100.0)
+        assert result.max() > 0.0
+
+
+# ─── build_figure with cached projections ──────────────────────────────────
+
+
+class TestBuildFigureCachedProjections:
+    """Verify build_figure reuses cached projections from analyze()."""
+
+    def test_cached_projections_used(self):
+        bp = BeamProfiler(camera="simulated")
+        assert bp.camera is not None
+        img = bp.camera.get_image()
+        popt_x, popt_y = bp.analyze(img)
+
+        assert bp._last_proj_x is not None
+        assert bp._last_proj_y is not None
+        assert len(bp._last_proj_x) == img.shape[1]
+        assert len(bp._last_proj_y) == img.shape[0]
+
+        fig = build_figure(bp, img, popt_x, popt_y)
+        assert isinstance(fig, go.Figure)
+        assert len(fig.data) >= 3
+
+    def test_no_cached_projections_still_works(self):
+        bp = BeamProfiler(camera="simulated")
+        assert bp.camera is not None
+        img = bp.camera.get_image()
+        bp._last_proj_x = None
+        bp._last_proj_y = None
+
+        fig = build_figure(bp, img, None, None)
+        assert isinstance(fig, go.Figure)
+        assert len(fig.data) >= 3
+
+
+# ─── _format_results ───────────────────────────────────────────────────────
+
+
+class TestFormatResultsExtended:
+    """Additional tests for _format_results."""
+
+    def test_with_2d_fit(self):
+        bp = BeamProfiler(camera="simulated")
+        assert bp.camera is not None
+        bp.fit_method = "2d"
+        img = bp.camera.get_image()
+        bp.analyze(img)
+        rows = _format_results(bp)
+        text = str(rows)
+        assert "Angle" in text
+
+    def test_zero_width_shows_no_data(self):
+        bp = BeamProfiler(camera="simulated")
+        assert bp.camera is not None
+        bp.width_x = 0.0
+        rows = _format_results(bp)
+        assert len(rows) == 1
+        assert "No fit data" in str(rows[0])
+
+
+# ─── Projection caching in analyze() ──────────────────────────────────────
+
+
+class TestAnalyzeProjectionCaching:
+    """Verify analyze() caches projections for downstream use."""
+
+    def test_1d_fit_caches_projections(self):
+        bp = BeamProfiler(camera="simulated")
+        assert bp.camera is not None
+        img = bp.camera.get_image()
+        bp.fit_method = "1d"
+        bp.analyze(img)
+        assert bp._last_proj_x is not None
+        assert bp._last_proj_y is not None
+        np.testing.assert_array_equal(bp._last_proj_x, np.sum(img, axis=0))
+        np.testing.assert_array_equal(bp._last_proj_y, np.sum(img, axis=1))
+
+    def test_2d_fit_caches_projections(self):
+        bp = BeamProfiler(camera="simulated")
+        assert bp.camera is not None
+        img = bp.camera.get_image()
+        bp.fit_method = "2d"
+        bp.analyze(img)
+        assert bp._last_proj_x is not None
+        assert bp._last_proj_y is not None
+
+    def test_fwhm_caches_projections(self):
+        bp = BeamProfiler(camera="simulated")
+        assert bp.camera is not None
+        img = bp.camera.get_image()
+        bp.definition = "fwhm"
+        bp.analyze(img)
+        assert bp._last_proj_x is not None
+        assert bp._last_proj_y is not None
+
+    def test_d4s_caches_projections(self):
+        bp = BeamProfiler(camera="simulated")
+        assert bp.camera is not None
+        img = bp.camera.get_image()
+        bp.definition = "d4s"
+        bp.analyze(img)
+        assert bp._last_proj_x is not None
+        assert bp._last_proj_y is not None
+
+    def test_linecut_no_projections(self):
+        bp = BeamProfiler(camera="simulated")
+        assert bp.camera is not None
+        img = bp.camera.get_image()
+        bp.fit_method = "linecut"
+        bp.analyze(img)
+        assert bp._last_proj_x is None
+        assert bp._last_proj_y is None
+
+
+# ─── build_figure light theme and 2D rotation ─────────────────────────────
+
+
+class TestBuildFigureThemeAndRotation:
+    """Test build_figure with light theme and 2D ellipse rotation."""
+
+    def test_light_theme(self):
+        bp = BeamProfiler(camera="simulated")
+        assert bp.camera is not None
+        img = bp.camera.get_image()
+        popt_x, popt_y = bp.analyze(img)
+        fig = build_figure(bp, img, popt_x, popt_y, dark_theme=False)
+        assert isinstance(fig, go.Figure)
+        assert fig.layout.plot_bgcolor == "#f8f8f8"
+
+    def test_2d_ellipse_rotation(self):
+        bp = BeamProfiler(camera="simulated")
+        assert bp.camera is not None
+        bp.fit_method = "2d"
+        img = bp.camera.get_image()
+        popt_x, popt_y = bp.analyze(img)
+        fig = build_figure(bp, img, popt_x, popt_y)
+        assert isinstance(fig, go.Figure)
+        assert len(fig.data) >= 5
+
+    def test_custom_zrange(self):
+        bp = BeamProfiler(camera="simulated")
+        assert bp.camera is not None
+        img = bp.camera.get_image()
+        fig = build_figure(bp, img, None, None, zmin=10.0, zmax=200.0)
+        assert fig.data[0].zmin == 10.0
+        assert fig.data[0].zmax == 200.0
+
+
+# ─── _is_readonly ──────────────────────────────────────────────────────────
+
+
+class TestIsReadonly:
+    """Tests for _is_readonly helper."""
+
+    def test_readonly_simulated_node(self):
+        from pybeamprofiler.dash_app import _is_readonly
+
+        node = _SimulatedNode("locked", readonly=True)
+        assert _is_readonly(node) is True
+
+    def test_writable_simulated_node(self):
+        from pybeamprofiler.dash_app import _is_readonly
+
+        node = _SimulatedNode(42)
+        assert _is_readonly(node) is False
+
+    def test_node_without_access_mode(self):
+        from pybeamprofiler.dash_app import _is_readonly
+
+        class PlainNode:
+            pass
+
+        assert _is_readonly(PlainNode()) is False
+
+    def test_access_mode_raises(self):
+        from pybeamprofiler.dash_app import _is_readonly
+
+        class FailNode:
+            def get_access_mode(self):
+                raise RuntimeError("broken")
+
+        assert _is_readonly(FailNode()) is False
+
+
+# ─── _humanize ─────────────────────────────────────────────────────────────
+
+
+class TestHumanize:
+    """Tests for the _humanize helper."""
+
+    def test_camel_case(self):
+        from pybeamprofiler.dash_app import _humanize
+
+        assert _humanize("AcquisitionFrameRate") == "Acquisition Frame Rate"
+
+    def test_single_word(self):
+        from pybeamprofiler.dash_app import _humanize
+
+        assert _humanize("Gain") == "Gain"
+
+    def test_consecutive_uppercase_unchanged(self):
+        from pybeamprofiler.dash_app import _humanize
+
+        assert _humanize("ROIWidth") == "ROIWidth"
+
+
+# ─── _build_genicam_control edge cases ────────────────────────────────────
+
+
+class TestBuildGenicamControlEdgeCases:
+    """Edge cases for _build_genicam_control."""
+
+    def test_readonly_string_shows_text(self):
+        from pybeamprofiler.dash_app import _build_genicam_control
+
+        ctrl = _build_genicam_control(
+            type(
+                "C",
+                (),
+                {
+                    "node_map": type(
+                        "N", (), {"DeviceID": _SimulatedNode("ABC123", readonly=True)}
+                    )()
+                },
+            )(),
+            "DeviceID",
+        )
+        assert ctrl is not None
+        layout_str = str(ctrl)
+        assert "ABC123" in layout_str
+        assert "genicam-sel" not in layout_str
+
+    def test_empty_string_shows_text(self):
+        from pybeamprofiler.dash_app import _build_genicam_control
+
+        ctrl = _build_genicam_control(
+            type("C", (), {"node_map": type("N", (), {"EmptyVal": _SimulatedNode("")})()})(),
+            "EmptyVal",
+        )
+        assert ctrl is not None
+        layout_str = str(ctrl)
+        assert "genicam-sel" not in layout_str
+
+    def test_generic_string_creates_select(self):
+        from pybeamprofiler.dash_app import _build_genicam_control
+
+        ctrl = _build_genicam_control(
+            type("C", (), {"node_map": type("N", (), {"SomeStr": _SimulatedNode("hello")})()})(),
+            "SomeStr",
+        )
+        assert ctrl is not None
+        layout_str = str(ctrl)
+        assert "genicam-sel" in layout_str
+
+
+# ─── Dash callback helpers ─────────────────────────────────────────────────
+
+
+def _extract_callback(bp: BeamProfiler, output_id: str) -> Any:
+    """Register callbacks on a throwaway Dash app and find one by output id."""
+    from pybeamprofiler.dash_app import _register_callbacks
+
+    app = dash.Dash(__name__)
+    app.layout = html.Div()
+    captured: dict[str, Any] = {}
+    original_callback = app.callback
+
+    def tracking_callback(*args, **kwargs):
+        def decorator(f):
+            key = str(args)
+            captured[key] = f
+            return original_callback(*args, **kwargs)(f)
+
+        return decorator
+
+    app.callback = tracking_callback  # ty: ignore[invalid-assignment]
+    _register_callbacks(app, bp)
+
+    for key, func in captured.items():
+        if output_id in key:
+            return func
+    return None
+
+
+# ─── save_frame callback ──────────────────────────────────────────────────
+
+
+class TestSaveFrameCallback:
+    """Tests for the save-frame callback."""
+
+    def test_save_returns_png_data(self):
+        bp = BeamProfiler(camera="simulated")
+        assert bp.camera is not None
+        bp.last_img = bp.camera.get_image()
+        fn = _extract_callback(bp, "download-png")
+        assert fn is not None
+        result = fn(1)
+        assert result is not None
+        assert result["filename"].startswith("beam_")
+        assert result["base64"] is True
+
+    def test_save_no_image(self):
+        bp = BeamProfiler(camera="simulated")
+        bp.last_img = None
+        fn = _extract_callback(bp, "download-png")
+        assert fn is not None
+        assert fn(1) is None
+
+
+# ─── toggle_colorscale callback ───────────────────────────────────────────
+
+
+class TestToggleColorscaleCallback:
+    def test_color_on_enables(self):
+        bp = BeamProfiler(camera="simulated")
+        fn = _extract_callback(bp, "dropdown-colorscale")
+        assert fn is not None
+        assert fn(True) is False
+
+    def test_color_off_disables(self):
+        bp = BeamProfiler(camera="simulated")
+        fn = _extract_callback(bp, "dropdown-colorscale")
+        assert fn is not None
+        assert fn(False) is True
+
+
+# ─── set_pixel_scale callback ─────────────────────────────────────────────
+
+
+class TestPixelScaleCallback:
+    def test_valid_pixel_scale(self):
+        bp = BeamProfiler(camera="simulated")
+        fn = _extract_callback(bp, "input-pixel-scale")
+        assert fn is not None
+        fn(1, None, 5.5)
+        assert bp.pixel_size == 5.5
+
+    def test_none_pixel_scale_keeps_existing(self):
+        bp = BeamProfiler(camera="simulated")
+        original = bp.pixel_size
+        fn = _extract_callback(bp, "input-pixel-scale")
+        assert fn is not None
+        fn(1, None, None)
+        assert bp.pixel_size == original
+
+
+# ─── set_exposure callback ────────────────────────────────────────────────
+
+
+class TestExposureCallback:
+    def test_set_exposure_via_callback(self):
+        bp = BeamProfiler(camera="simulated")
+        fn = _extract_callback(bp, "slider-exposure")
+        assert fn is not None
+        result = fn(50.0)
+        assert result == 50.0
+        assert bp.camera is not None
+        assert abs(bp.camera.exposure_time - 0.05) < 1e-6
+
+
+# ─── set_gain callback ───────────────────────────────────────────────────
+
+
+class TestGainCallback:
+    def test_set_gain_via_callback(self):
+        bp = BeamProfiler(camera="simulated")
+        fn = _extract_callback(bp, "slider-gain")
+        assert fn is not None
+        result = fn(5.0)
+        assert result == 5.0
+        assert bp.camera is not None
+        assert bp.camera.gain == 5.0
+
+
+# ─── ROI callbacks ────────────────────────────────────────────────────────
+
+
+class TestROICallbacks:
+    def test_apply_roi(self):
+        bp = BeamProfiler(camera="simulated")
+        assert bp.camera is not None
+        bp.camera.start_acquisition()
+        fn = _extract_callback(bp, "div-roi-status")
+        assert fn is not None
+        result = fn(1, 0, 0, 512, 512)
+        assert "512" in result
+
+    def test_reset_roi(self):
+        bp = BeamProfiler(camera="simulated")
+        assert bp.camera is not None
+        from pybeamprofiler.dash_app import _register_callbacks
+
+        app = dash.Dash(__name__)
+        app.layout = html.Div()
+        captured: dict[str, Any] = {}
+        original_callback = app.callback
+
+        def tracking_callback(*args, **kwargs):
+            def decorator(f):
+                key = str(args)
+                captured[key] = f
+                return original_callback(*args, **kwargs)(f)
+
+            return decorator
+
+        app.callback = tracking_callback  # ty: ignore[invalid-assignment]
+        _register_callbacks(app, bp)
+
+        for key, func in captured.items():
+            if "btn-roi-reset" in key:
+                result = func(1)
+                assert result[4] == "Reset to full sensor"
+                return
+        pytest.fail("reset_roi callback not found")
+
+
+# ─── GenicamSetCallbacks ─────────────────────────────────────────────────
+
+
+class TestGenicamSetCallbacks:
+    """Test GenICam pattern-matching callbacks."""
+
+    @staticmethod
+    def _extract_genicam_callbacks(bp: BeamProfiler) -> dict[str, Any]:
+        from pybeamprofiler.dash_app import _register_callbacks
+
+        app = dash.Dash(__name__)
+        app.layout = html.Div()
+        captured: dict[str, Any] = {}
+        original_callback = app.callback
+
+        def tracking_callback(*args, **kwargs):
+            def decorator(f):
+                key = str(args)
+                captured[key] = f
+                return original_callback(*args, **kwargs)(f)
+
+            return decorator
+
+        app.callback = tracking_callback  # ty: ignore[invalid-assignment]
+        _register_callbacks(app, bp)
+        return captured
+
+    def test_numeric_callback_sets_value(self):
+        from unittest.mock import patch
+
+        bp = BeamProfiler(camera="simulated")
+        captured = self._extract_genicam_callbacks(bp)
+        set_fn = None
+        for key, func in captured.items():
+            if "genicam-num" in key:
+                set_fn = func
+                break
+        assert set_fn is not None
+        with patch("pybeamprofiler.dash_app.ctx") as mock_ctx:
+            mock_ctx.triggered_id = {"type": "genicam-num", "feature": "ExposureTime"}
+            result = set_fn(50000.0)
+            assert result == 50000.0
+
+    def test_select_callback_sets_value(self):
+        from unittest.mock import patch
+
+        bp = BeamProfiler(camera="simulated")
+        captured = self._extract_genicam_callbacks(bp)
+        set_fn = None
+        for key, func in captured.items():
+            if "genicam-sel" in key:
+                set_fn = func
+                break
+        assert set_fn is not None
+        with patch("pybeamprofiler.dash_app.ctx") as mock_ctx:
+            mock_ctx.triggered_id = {"type": "genicam-sel", "feature": "ExposureAuto"}
+            result = set_fn("Off")
+            assert result == "Off"
+
+    def test_switch_callback_sets_value(self):
+        from unittest.mock import patch
+
+        bp = BeamProfiler(camera="simulated")
+        captured = self._extract_genicam_callbacks(bp)
+        set_fn = None
+        for key, func in captured.items():
+            if "genicam-sw" in key:
+                set_fn = func
+                break
+        assert set_fn is not None
+        with patch("pybeamprofiler.dash_app.ctx") as mock_ctx:
+            mock_ctx.triggered_id = {"type": "genicam-sw", "feature": "GammaEnable"}
+            result = set_fn(True)
+            assert result is True
+
+    def test_numeric_none_returns_no_update(self):
+        bp = BeamProfiler(camera="simulated")
+        captured = self._extract_genicam_callbacks(bp)
+        set_fn = None
+        for key, func in captured.items():
+            if "genicam-num" in key:
+                set_fn = func
+                break
+        assert set_fn is not None
+        result = set_fn(None)
+        assert isinstance(result, dash._no_update.NoUpdate)
+
+
+# ─── update_live callback ────────────────────────────────────────────────
+
+
+class TestUpdateLiveCallback:
+    """Test the async update_live callback."""
+
+    @staticmethod
+    def _get_update_fn(bp: BeamProfiler):
+        fn = _extract_callback(bp, "live-graph")
+        return fn
+
+    @staticmethod
+    def _run_async(coro):
+        loop = asyncio.new_event_loop()
+        try:
+            return loop.run_until_complete(coro)
+        finally:
+            loop.close()
+
+    def test_paused_returns_no_update(self):
+        bp = BeamProfiler(camera="simulated")
+        fn = self._get_update_fn(bp)
+        assert fn is not None
+        result = self._run_async(
+            fn(1, True, True, "Hot", True, None, None, 0, "1d", "gaussian", True)
+        )
+        assert all(isinstance(r, dash._no_update.NoUpdate) for r in result)
+
+    def test_live_update_returns_figure(self):
+        bp = BeamProfiler(camera="simulated")
+        assert bp.camera is not None
+        bp.camera.start_acquisition()
+        fn = self._get_update_fn(bp)
+        assert fn is not None
+        result = self._run_async(
+            fn(1, False, True, "Hot", True, None, None, 0, "1d", "gaussian", True)
+        )
+        assert len(result) == 4
+        fig = result[0]
+        assert hasattr(fig, "data")
+        assert result[3] == 1
+
+    def test_live_update_switches_fit_method(self):
+        bp = BeamProfiler(camera="simulated")
+        assert bp.camera is not None
+        bp.camera.start_acquisition()
+        bp.fit_method = "1d"
+        fn = self._get_update_fn(bp)
+        assert fn is not None
+        self._run_async(fn(1, False, True, "Hot", True, None, None, 0, "2d", "gaussian", True))
+        assert bp.fit_method == "2d"
+
+    def test_live_update_manual_range(self):
+        bp = BeamProfiler(camera="simulated")
+        assert bp.camera is not None
+        bp.camera.start_acquisition()
+        fn = self._get_update_fn(bp)
+        assert fn is not None
+        result = self._run_async(
+            fn(1, False, True, "Hot", False, 10.0, 200.0, 0, "1d", "gaussian", True)
+        )
+        assert len(result) == 4
+
+    def test_live_update_greyscale(self):
+        bp = BeamProfiler(camera="simulated")
+        assert bp.camera is not None
+        bp.camera.start_acquisition()
+        fn = self._get_update_fn(bp)
+        assert fn is not None
+        result = self._run_async(
+            fn(1, False, False, "Hot", True, None, None, 0, "1d", "gaussian", True)
+        )
+        assert len(result) == 4
+
+
+# ─── Exposure/Gain error branches ────────────────────────────────────────
+
+
+class TestCallbackErrorBranches:
+    """Test error handling in exposure/gain/ROI callbacks."""
+
+    def test_exposure_exception_handled(self):
+        from unittest.mock import MagicMock
+
+        bp = BeamProfiler(camera="simulated")
+        assert bp.camera is not None
+        bp.camera.set_exposure = MagicMock(  # ty: ignore[invalid-assignment]
+            side_effect=RuntimeError("boom")
+        )
+        fn = _extract_callback(bp, "slider-exposure")
+        assert fn is not None
+        result = fn(50.0)
+        assert result == 50.0
+
+    def test_gain_exception_handled(self):
+        from unittest.mock import MagicMock
+
+        bp = BeamProfiler(camera="simulated")
+        assert bp.camera is not None
+        bp.camera.set_gain = MagicMock(  # ty: ignore[invalid-assignment]
+            side_effect=RuntimeError("boom")
+        )
+        fn = _extract_callback(bp, "slider-gain")
+        assert fn is not None
+        result = fn(5.0)
+        assert result == 5.0
+
+    def test_roi_apply_no_camera(self):
+        bp = BeamProfiler(camera="simulated")
+        bp.camera = None
+        from pybeamprofiler.dash_app import _register_callbacks
+
+        app = dash.Dash(__name__)
+        app.layout = html.Div()
+        captured: dict[str, Any] = {}
+        original_callback = app.callback
+
+        def tracking_callback(*args, **kwargs):
+            def decorator(f):
+                captured[str(args)] = f
+                return original_callback(*args, **kwargs)(f)
+
+            return decorator
+
+        app2 = dash.Dash(__name__)
+        app2.layout = html.Div()
+        bp2 = BeamProfiler(camera="simulated")
+        captured2: dict[str, Any] = {}
+        original_callback2 = app2.callback
+
+        def tracking_callback2(*args, **kwargs):
+            def decorator(f):
+                captured2[str(args)] = f
+                return original_callback2(*args, **kwargs)(f)
+
+            return decorator
+
+        app2.callback = tracking_callback2  # ty: ignore[invalid-assignment]
+        _register_callbacks(app2, bp2)
+        for key, func in captured2.items():
+            if "btn-roi-apply" in key:
+                bp2.camera = None
+                result = func(1, 0, 0, 512, 512)
+                assert result == "No camera"
+                return
+        pytest.fail("apply_roi not found")
+
+    def test_pause_no_camera_items(self):
+        bp = BeamProfiler(camera="simulated")
+        bp.camera = None
+        bp._mode = "file"
+        fn = _extract_callback(bp, "store-paused")
+        if fn is not None:
+            result = fn(1, False)
+            settings_body = result[3]
+            assert "No camera" in str(settings_body) or isinstance(settings_body, dbc.Accordion)

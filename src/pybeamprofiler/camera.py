@@ -4,12 +4,80 @@ from __future__ import annotations
 
 import logging
 import math
+import re
 from abc import ABC, abstractmethod
 from typing import Any, cast
 
 import numpy as np
 
 logger = logging.getLogger(__name__)
+
+# Features handled by dedicated exposure / gain / ROI controls.
+_HANDLED_FEATURES = frozenset(
+    {
+        "ExposureTime",
+        "ExposureTimeAbs",
+        "ExposureTimeRaw",
+        "Gain",
+        "GainRaw",
+        "Width",
+        "Height",
+        "OffsetX",
+        "OffsetY",
+        "WidthMax",
+        "HeightMax",
+    }
+)
+
+# Maps a feature-name prefix to an SFNC-standard category label.
+# The names mirror the categories shown in SpinView / pylon Viewer.
+_CATEGORY_MAP: dict[str, str] = {
+    # Acquisition Control
+    "Acquisition": "Acquisition Control",
+    "Trigger": "Acquisition Control",
+    "Exposure": "Acquisition Control",
+    # Analog Control
+    "Gain": "Analog Control",
+    "BlackLevel": "Analog Control",
+    "WhiteBalance": "Analog Control",
+    "Balance": "Analog Control",
+    "Gamma": "Analog Control",
+    "Sharpness": "Analog Control",
+    "Hue": "Analog Control",
+    "Saturation": "Analog Control",
+    # Image Format Control
+    "Pixel": "Image Format Control",
+    "Binning": "Image Format Control",
+    "Decimation": "Image Format Control",
+    "Reverse": "Image Format Control",
+    "Sensor": "Image Format Control",
+    # Device Control
+    "Device": "Device Control",
+    # Digital I/O Control
+    "Line": "Digital I/O Control",
+    "UserOutput": "Digital I/O Control",
+    # Counter & Timer Control
+    "Counter": "Counter & Timer Control",
+    "Timer": "Counter & Timer Control",
+    # Other standard categories
+    "LUT": "LUT Control",
+    "Defect": "Image Quality Control",
+    "Test": "Test Control",
+    "Chunk": "Chunk Data Control",
+    "Event": "Event Control",
+}
+
+
+def _categorize_feature(name: str) -> str:
+    """Infer a UI group name from a GenICam feature name."""
+    prefixes = cast("list[str]", sorted(_CATEGORY_MAP.keys(), key=len, reverse=True))
+    for prefix in prefixes:
+        if name.startswith(prefix):
+            return _CATEGORY_MAP[prefix]
+    match = re.match(r"([A-Z][a-z]+)", name)
+    if match:
+        return match.group(1)
+    return "Other"
 
 
 class Camera(ABC):
@@ -314,39 +382,149 @@ class Camera(ABC):
 
         display(tab)
 
+    def _discover_features(self) -> dict[str, list[str]]:
+        """Discover available GenICam features from the ``node_map``.
+
+        Uses ``node_map.nodes`` (the canonical GenICam enumeration API)
+        when available, falling back to ``dir()`` for simulated node maps.
+        Nodes are filtered by interface type and visibility so that only
+        user-facing value nodes are returned.
+
+        Returns:
+            Mapping from category name to a sorted list of feature names.
+        """
+        if not hasattr(self, "node_map") or not self.node_map:
+            return {}
+
+        # ── Import GenICam helpers ────────────────────────────────────
+        # Allowlist: only these interface types represent user-settable
+        # value nodes that can be rendered as UI controls.
+        allow_iface: set[int] = set()
+        invisible_threshold: int | None = None
+        try:
+            from genicam.genapi import EInterfaceType, EVisibility
+
+            allow_iface = {
+                int(EInterfaceType.intfIFloat),
+                int(EInterfaceType.intfIInteger),
+                int(EInterfaceType.intfIBoolean),
+                int(EInterfaceType.intfIEnumeration),
+                int(EInterfaceType.intfIString),
+            }
+            invisible_threshold = int(EVisibility.Invisible)
+        except ImportError:
+            pass
+
+        # ── Enumerate candidate node names ────────────────────────────
+        # Prefer node_map.nodes (reliable for real GenICam cameras)
+        # because dir() may not list dynamically-resolved feature names.
+        # We use the *node object* from the list for type / visibility
+        # checks because get_node() may not preserve the derived type.
+        node_names: list[str] = []
+        used_nodes_api = False
+        try:
+            raw_nodes = getattr(self.node_map, "nodes", None)
+            if raw_nodes is not None:
+                for node_obj in raw_nodes:
+                    try:
+                        # The SWIG binding may report intfIValue(0) for all
+                        # nodes in the list.  When that happens the allowlist
+                        # filter is useless, so we check each node's *actual*
+                        # type by probing for a ``.value`` attribute instead.
+                        if allow_iface:
+                            iface = getattr(node_obj, "principal_interface_type", None)
+                            if iface is not None and int(iface) not in allow_iface:
+                                # intfIValue(0) is the generic base; let it through
+                                # and filter later via the .value probe.
+                                if int(iface) != 0:
+                                    continue
+                        if invisible_threshold is not None:
+                            vis = getattr(node_obj, "visibility", None)
+                            if vis is not None and int(vis) >= invisible_threshold:
+                                continue
+                        nm = getattr(node_obj, "name", None)
+                        if nm and isinstance(nm, str):
+                            node_names.append(nm)
+                    except Exception:
+                        continue
+                used_nodes_api = True
+        except Exception as exc:
+            logger.warning("node_map.nodes failed: %s", exc)
+
+        if not node_names:
+            node_names = sorted(dir(self.node_map))
+
+        logger.debug(
+            "_discover_features: %d candidates via %s (node_map type: %s)",
+            len(node_names),
+            ".nodes" if used_nodes_api else "dir()",
+            type(self.node_map).__name__,
+        )
+
+        # ── Filter & categorise ───────────────────────────────────────
+        # We cannot rely on isinstance() for nodes fetched via get_node()
+        # because the SWIG binding often returns a base INode regardless of
+        # the real C++ type.  Instead we probe for ``.value``: nodes that
+        # have it are settable value features; those that raise (categories,
+        # commands, registers) are skipped.
+        groups: dict[str, list[str]] = {}
+        for name in sorted(set(node_names)):
+            if name.startswith("_") or name in _HANDLED_FEATURES:
+                continue
+
+            try:
+                attr = getattr(self.node_map, name)
+            except Exception:
+                continue
+
+            if attr is None:
+                continue
+
+            if isinstance(attr, (str, int, float, bool, bytes)):
+                continue
+
+            # Probe for .value — the definitive test for a value feature.
+            # Categories, commands, registers, and ports will either lack
+            # the attribute or raise when it is accessed.
+            try:
+                _ = attr.value
+            except Exception:
+                continue
+
+            category = _categorize_feature(name)
+            groups.setdefault(category, []).append(name)
+
+        logger.debug(
+            "_discover_features: %d features in %d categories: %s",
+            sum(len(v) for v in groups.values()),
+            len(groups),
+            {k: v for k, v in groups.items()},
+        )
+        return groups
+
     def _create_genicam_controls(self, style: dict[str, str]) -> list[Any]:
-        """Create dynamic controls from GenICam ``node_map`` features.
+        """Create dynamic controls for all discovered GenICam features.
+
+        Uses :meth:`_discover_features` to introspect the ``node_map``
+        and automatically generate widgets for every available feature.
 
         Args:
             style: Widget style dict (e.g. ``{"description_width": "initial"}``)
 
         Returns:
-            List of accordion widgets for common GenICam features
+            List of accordion widgets grouped by feature category
         """
         import ipywidgets as widgets
 
         if not hasattr(self, "node_map") or not self.node_map:
             return []
 
+        discovered = self._discover_features()
+        if not discovered:
+            return []
+
         accordions = []
-
-        feature_groups = {
-            "Image Quality": ["Gamma", "GammaEnable", "Sharpness", "Hue", "Saturation"],
-            "Black & White Level": [
-                "BlackLevel",
-                "BlackLevelAuto",
-                "WhiteBalance",
-                "WhiteBalanceAuto",
-            ],
-            "Frame Rate": [
-                "AcquisitionFrameRate",
-                "AcquisitionFrameRateEnable",
-                "AcquisitionFrameRateAuto",
-            ],
-            "Binning": ["BinningHorizontal", "BinningVertical", "BinningSelector"],
-        }
-
-        for group_name, features in feature_groups.items():
+        for group_name, features in sorted(discovered.items()):
             controls = self._create_feature_controls(features, style)
             if controls:
                 accordion = widgets.Accordion(children=[widgets.VBox(controls)])
@@ -358,69 +536,17 @@ class Camera(ABC):
     def _create_advanced_controls(self, style: dict[str, str]) -> list[Any]:
         """Create advanced/rarely-used controls from GenICam ``node_map``.
 
+        All features are now auto-discovered by
+        :meth:`_create_genicam_controls`, so this method returns an empty
+        list.  It is retained for backward compatibility.
+
         Args:
             style: Widget style dict
 
         Returns:
-            List of accordion widgets for advanced GenICam features
+            Empty list
         """
-        import ipywidgets as widgets
-
-        if not hasattr(self, "node_map") or not self.node_map:
-            return []
-
-        accordions = []
-
-        feature_groups = {
-            "Trigger": [
-                "TriggerMode",
-                "TriggerSource",
-                "TriggerActivation",
-                "TriggerDelay",
-                "TriggerSelector",
-                "TriggerOverlap",
-            ],
-            "Pixel Format & Color": [
-                "PixelFormat",
-                "PixelSize",
-                "PixelColorFilter",
-                "ReverseX",
-                "ReverseY",
-            ],
-            "Acquisition Mode": [
-                "AcquisitionMode",
-                "AcquisitionStart",
-                "AcquisitionStop",
-                "ExposureMode",
-                "ExposureAuto",
-            ],
-            "Timing & Strobe": [
-                "LineSelector",
-                "LineMode",
-                "LineSource",
-                "CounterSelector",
-                "CounterEventSource",
-            ],
-            "Defect Correction": ["DefectivePixelCorrection", "DefectCorrectStaticEnable"],
-            "LUT & Processing": ["LUTEnable", "LUTSelector", "LUTIndex", "LUTValue"],
-            "Test Patterns": ["TestPattern", "TestPatternGeneratorSelector", "TestImageSelector"],
-            "Device Control": [
-                "DeviceReset",
-                "DeviceTemperature",
-                "DeviceTemperatureSelector",
-                "SensorShutterMode",
-                "SensorReadoutMode",
-            ],
-        }
-
-        for group_name, features in feature_groups.items():
-            controls = self._create_feature_controls(features, style)
-            if controls:
-                accordion = widgets.Accordion(children=[widgets.VBox(controls)])
-                accordion.set_title(0, group_name)
-                accordions.append(accordion)
-
-        return accordions
+        return []
 
     def _create_feature_controls(self, features: list[str], style: dict[str, str]) -> list[Any]:
         """Create widgets for a list of GenICam features.

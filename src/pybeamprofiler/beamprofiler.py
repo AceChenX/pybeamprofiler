@@ -8,6 +8,7 @@ import logging
 import os
 import threading
 import time
+import warnings
 import webbrowser
 from types import TracebackType
 from typing import Any
@@ -17,39 +18,21 @@ import plotly.graph_objs as go
 from PIL import Image
 from plotly.subplots import make_subplots
 from scipy.ndimage import zoom as _ndimage_zoom
-from scipy.optimize import curve_fit
+from scipy.optimize import OptimizeWarning, curve_fit
 
-try:
-    from .basler import BaslerCamera
-    from .camera import Camera
-    from .constants import (
-        D4SIGMA_FACTOR,
-        DEFAULT_DASH_PORT,
-        GAUSSIAN_TO_FWHM,
-        MAX_DISPLAY_DIM,
-        MAX_FIT_ITERATIONS,
-    )
-    from .flir import FlirCamera
-    from .simulated import SimulatedCamera
-except ImportError:
-    import sys
-    from pathlib import Path
+from .basler import BaslerCamera
+from .camera import Camera
+from .constants import (
+    D4SIGMA_FACTOR,
+    DEFAULT_DASH_PORT,
+    GAUSSIAN_TO_FWHM,
+    MAX_DISPLAY_DIM,
+    MAX_FIT_ITERATIONS,
+)
+from .flir import FlirCamera
+from .simulated import SimulatedCamera
 
-    script_dir = Path(__file__).resolve().parent
-    if str(script_dir.parent) not in sys.path:
-        sys.path.insert(0, str(script_dir.parent))
-
-    from pybeamprofiler.basler import BaslerCamera  # type: ignore[no-redef]  # noqa: I001
-    from pybeamprofiler.camera import Camera  # type: ignore[no-redef]
-    from pybeamprofiler.constants import (
-        D4SIGMA_FACTOR,
-        DEFAULT_DASH_PORT,
-        GAUSSIAN_TO_FWHM,
-        MAX_DISPLAY_DIM,
-        MAX_FIT_ITERATIONS,
-    )  # type: ignore[no-redef]
-    from pybeamprofiler.flir import FlirCamera  # type: ignore[no-redef]
-    from pybeamprofiler.simulated import SimulatedCamera  # type: ignore[no-redef]
+warnings.filterwarnings("ignore", category=OptimizeWarning)
 
 logger = logging.getLogger(__name__)
 
@@ -113,6 +96,8 @@ class BeamProfiler:
         self._stream_task: asyncio.Task[None] | None = None
 
         self.last_img: np.ndarray | None = None
+        self._last_proj_x: np.ndarray | None = None
+        self._last_proj_y: np.ndarray | None = None
 
         if file:
             self._load_file(file)
@@ -207,6 +192,7 @@ class BeamProfiler:
         return False
 
     def __getattr__(self, name: str) -> object:
+        """Delegate unknown attribute access to the underlying camera."""
         try:
             camera = object.__getattribute__(self, "camera")
         except AttributeError:
@@ -339,12 +325,12 @@ class BeamProfiler:
 
     @property
     def height_x(self) -> float:
-        """Peak height in X profile (intensity units)."""
+        """Peak image intensity (intensity units)."""
         return self.peak_value
 
     @property
     def height_y(self) -> float:
-        """Peak height in Y profile (intensity units)."""
+        """Peak image intensity (intensity units)."""
         return self.peak_value
 
     def _measure_fwhm(self, profile: np.ndarray) -> tuple[float, float, float]:
@@ -456,10 +442,10 @@ class BeamProfiler:
             )
             return popt
         except (RuntimeError, ValueError) as e:
-            logger.warning(f"1D fit failed: {e}, using initial guess")
+            logger.debug("1D fit failed: %s, using initial guess", e)
             return p0
 
-    _MAX_FIT_2D_DIM = 128
+    _MAX_FIT_2D_DIM = 256
 
     def _fit_2d_gaussian(self, image: np.ndarray) -> np.ndarray | list[Any]:
         """Fit 2D Gaussian to image.
@@ -553,7 +539,7 @@ class BeamProfiler:
             self._last_popt_2d = popt
             return popt
         except (RuntimeError, ValueError) as e:
-            logger.warning(f"2D fit failed: {e}, using initial guess")
+            logger.debug("2D fit failed: %s, using initial guess", e)
             # Scale p0 back if it was downsampled
             if inv_ds != 1.0:
                 p0[1] *= inv_ds
@@ -574,7 +560,8 @@ class BeamProfiler:
             tuple of (x_fit_params, y_fit_params) for 1D projections
 
         Raises:
-            ValueError: If image is None or not 2D
+            ValueError: If image is None, empty, or not 2D.
+            TypeError: If image is not a numpy array.
         """
         if image is None:
             raise ValueError("Image cannot be None")
@@ -589,11 +576,15 @@ class BeamProfiler:
             raise ValueError("Image cannot be empty")
 
         self.peak_value = float(np.max(image))
+        self._last_proj_x = None
+        self._last_proj_y = None
 
         # Use direct measurement for FWHM and D4σ (no Gaussian assumption)
         if self.definition in ["fwhm", "d4s"]:
             proj_x = np.sum(image, axis=0)
             proj_y = np.sum(image, axis=1)
+            self._last_proj_x = proj_x
+            self._last_proj_y = proj_y
 
             if self.definition == "fwhm":
                 center_x, width_x, _ = self._measure_fwhm(proj_x)
@@ -645,6 +636,8 @@ class BeamProfiler:
 
             proj_x = np.sum(image, axis=0)
             proj_y = np.sum(image, axis=1)
+            self._last_proj_x = proj_x
+            self._last_proj_y = proj_y
             popt_x = self._fit_1d_gaussian(proj_x, self._last_popt_x)
             popt_y = self._fit_1d_gaussian(proj_y, self._last_popt_y)
             self._last_popt_x, self._last_popt_y = popt_x, popt_y
@@ -654,6 +647,8 @@ class BeamProfiler:
         else:
             proj_x = np.sum(image, axis=0)
             proj_y = np.sum(image, axis=1)
+            self._last_proj_x = proj_x
+            self._last_proj_y = proj_y
 
             popt_x = self._fit_1d_gaussian(proj_x, self._last_popt_x)
             popt_y = self._fit_1d_gaussian(proj_y, self._last_popt_y)
@@ -691,7 +686,7 @@ class BeamProfiler:
         self,
         num_img: int | None = None,
         heatmap_only: bool = False,
-    ) -> asyncio.Task | None:
+    ) -> asyncio.Task[None] | None:
         """Display beam profile with Gaussian fitting visualization.
 
         Args:
@@ -1448,6 +1443,7 @@ class BeamProfiler:
                     try:
                         if self.camera.is_acquiring:
                             self.camera.stop_acquisition()
+                        self.camera.close()
                     except Exception:
                         pass
                 raise KeyboardInterrupt

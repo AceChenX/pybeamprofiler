@@ -63,6 +63,11 @@ class HarvesterCamera(Camera):
 
     Attributes:
         node_map: GenICam node map for direct feature access, or ``None``.
+        device_model: Camera model name (e.g. ``"BFS-PGE-50S5M"``).
+        device_vendor: Camera vendor name (e.g. ``"FLIR"``).
+        serial_number: Camera serial number string.
+        width_pixels: Sensor width in pixels.
+        height_pixels: Sensor height in pixels.
     """
 
     def __init__(
@@ -418,10 +423,16 @@ class HarvesterCamera(Camera):
             logger.warning(f"Could not detect gain range: {e}")
 
     def close(self) -> None:
-        """Close camera connection."""
-        if self.ia:
-            self.ia.destroy()
-        self.h.reset()
+        """Close camera connection and release hardware."""
+        try:
+            if self.ia:
+                self.ia.destroy()
+        except Exception:
+            logger.debug("Error destroying ImageAcquirer", exc_info=True)
+        try:
+            self.h.reset()
+        except Exception:
+            logger.debug("Error resetting Harvester", exc_info=True)
 
     def start_acquisition(self) -> None:
         """Start image acquisition."""
@@ -432,13 +443,18 @@ class HarvesterCamera(Camera):
     def stop_acquisition(self) -> None:
         """Stop image acquisition."""
         if self.ia:
-            self.ia.stop()
+            try:
+                self.ia.stop()
+            except Exception:
+                logger.debug("Error stopping acquisition", exc_info=True)
             self.is_acquiring = False
 
     def get_image(self) -> np.ndarray:
         """Retrieve image from camera.
 
         Automatically starts acquisition if not already running.
+        The fetch timeout adapts to the current exposure time so that
+        long-exposure frames don't cause spurious ``TimeoutError``.
 
         Returns:
             2D numpy array of image data
@@ -449,8 +465,9 @@ class HarvesterCamera(Camera):
         if not self.is_acquiring:
             self.start_acquisition()
 
+        timeout = max(2.0, (self.exposure_time or 0) + 2.0)
         try:
-            with self.ia.fetch(timeout=2.0) as buffer:
+            with self.ia.fetch(timeout=timeout) as buffer:
                 component = buffer.payload.components[0]
                 image = component.data.reshape(component.height, component.width).copy()
                 self.width_pixels = component.width
@@ -459,18 +476,22 @@ class HarvesterCamera(Camera):
         except Exception as exc:
             if type(exc).__name__ == "TimeoutException":
                 raise TimeoutError(
-                    "Camera did not deliver a frame within 2 s. "
+                    f"Camera did not deliver a frame within {timeout:.1f} s. "
                     "Check that the camera is connected, powered, and not in use "
                     "by another application."
                 ) from exc
             raise
 
     def set_exposure(self, exposure_time: float) -> None:
-        """Set exposure time.
+        """Set exposure time, restarting acquisition to flush stale buffers.
 
         Args:
             exposure_time: Exposure time in seconds
         """
+        was_acquiring = self.is_acquiring
+        if was_acquiring:
+            self.stop_acquisition()
+
         if self.node_map:
             try:
                 self.node_map.ExposureTime.value = exposure_time * 1_000_000
@@ -480,6 +501,9 @@ class HarvesterCamera(Camera):
                 except (AttributeError, ValueError, TypeError):
                     logger.error("Could not set exposure time.")
         self.exposure_time = exposure_time
+
+        if was_acquiring:
+            self.start_acquisition()
 
     def set_gain(self, gain: float) -> None:
         """Set camera gain.

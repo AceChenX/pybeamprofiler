@@ -10,6 +10,7 @@ import asyncio
 import base64
 import io
 import logging
+import re
 import threading
 import time
 from typing import TYPE_CHECKING, Any
@@ -18,8 +19,9 @@ import dash
 import dash_bootstrap_components as dbc
 import numpy as np
 import plotly.graph_objs as go
-from dash import Input, Output, State, dcc, html
+from dash import MATCH, Input, Output, State, ctx, dcc, html
 from PIL import Image
+from scipy.ndimage import zoom as _ndimage_zoom
 
 from .constants import (
     DEFAULT_UPDATE_INTERVAL_MS,
@@ -279,16 +281,328 @@ def _fitting_tab(bp: BeamProfiler) -> dbc.Tab:
     )
 
 
+def _is_readonly(node: Any) -> bool:
+    """Return ``True`` if the GenICam node is read-only."""
+    if getattr(node, "_readonly", False):
+        return True
+    try:
+        access = getattr(node, "get_access_mode", None)
+        if access is not None:
+            from genicam.genapi import EAccessMode
+
+            mode = access()
+            if mode in (EAccessMode.RO, EAccessMode.NA, EAccessMode.NI):
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def _humanize(name: str) -> str:
+    """``"AcquisitionFrameRate"`` → ``"Acquisition Frame Rate"``."""
+    return re.sub(r"(?<=[a-z])(?=[A-Z])", " ", name)
+
+
+def _build_genicam_control(cam: Any, feature_name: str) -> html.Div | None:
+    """Build a Dash control for a single GenICam ``node_map`` feature.
+
+    Returns a ``html.Div`` wrapping a label and the appropriate input widget
+    (slider for numeric, select for enums, switch for booleans), styled
+    consistently with the built-in Exposure & Gain controls.  Returns
+    ``None`` when the feature cannot be rendered.
+    """
+    node_map = getattr(cam, "node_map", None)
+    if node_map is None:
+        return None
+
+    node = getattr(node_map, feature_name, None)
+    if node is None:
+        return None
+
+    try:
+        current_val = node.value
+    except Exception:
+        return None
+
+    readonly = _is_readonly(node)
+    label = dbc.Label(_humanize(feature_name), className="small mb-1")
+
+    # ── Boolean ───────────────────────────────────────────────────
+    if isinstance(current_val, bool):
+        return html.Div(
+            [
+                label,
+                dbc.Switch(
+                    id={"type": "genicam-sw", "feature": feature_name},
+                    value=current_val,
+                    label="",
+                    disabled=readonly,
+                ),
+            ],
+            className="mb-2",
+        )
+
+    # ── Enumeration (has symbolics) ───────────────────────────────
+    symbolics = getattr(node, "symbolics", None)
+    if symbolics:
+        val_str = str(current_val)
+        return html.Div(
+            [
+                label,
+                dbc.Select(
+                    id={"type": "genicam-sel", "feature": feature_name},
+                    options=[{"label": s, "value": s} for s in symbolics],
+                    value=val_str if val_str in symbolics else symbolics[0],
+                    size="sm",
+                    disabled=readonly,
+                ),
+            ],
+            className="mb-2",
+        )
+
+    # ── Numeric with range ────────────────────────────────────────
+    node_min = getattr(node, "min", None)
+    node_max = getattr(node, "max", None)
+    if node_min is not None and node_max is not None:
+        try:
+            fmin, fmax, fval = float(node_min), float(node_max), float(current_val)
+            if readonly:
+                return html.Div(
+                    [label, html.Span(f"{fval:g}", className="small text-muted")],
+                    className="mb-2",
+                )
+            is_int = isinstance(current_val, int) and isinstance(node_min, int)
+            step = 1 if is_int else round((fmax - fmin) / 1000, 6) or 0.001
+            return html.Div(
+                [
+                    label,
+                    dcc.Slider(
+                        id={"type": "genicam-num", "feature": feature_name},
+                        min=fmin,
+                        max=fmax,
+                        value=fval,
+                        step=step,
+                        tooltip={"placement": "bottom", "always_visible": True},
+                        marks=None,
+                    ),
+                ],
+                className="mb-3",
+            )
+        except (TypeError, ValueError):
+            pass
+
+    # ── Read-only / unknown string → text display ─────────────────
+    if readonly or (isinstance(current_val, str) and not current_val):
+        return html.Div(
+            [label, html.Span(str(current_val), className="small text-muted")],
+            className="mb-2",
+        )
+
+    # ── String fallback (Enable / Auto without symbolics) ─────────
+    if isinstance(current_val, str):
+        if feature_name.endswith("Enable"):
+            opts = [{"label": s, "value": s} for s in ["On", "Off"]]
+        elif feature_name.endswith("Auto"):
+            opts = [{"label": s, "value": s} for s in ["Off", "Once", "Continuous"]]
+        else:
+            opts = [{"label": current_val, "value": current_val}]
+        return html.Div(
+            [
+                label,
+                dbc.Select(
+                    id={"type": "genicam-sel", "feature": feature_name},
+                    options=opts,
+                    value=current_val,
+                    size="sm",
+                ),
+            ],
+            className="mb-2",
+        )
+
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Dedicated control builders (Exposure / Gain / ROI)
+# ---------------------------------------------------------------------------
+
+
+def _exposure_controls(cam: Any) -> list[Any]:
+    """Build the Exposure (ms) slider — always present."""
+    exp_min, exp_max = 0.001, 1.0
+    er = getattr(cam, "exposure_range", None)
+    if er is not None:
+        try:
+            exp_min, exp_max = er
+        except Exception:
+            pass
+    exp_ms = (cam.exposure_time or 0.01) * 1000
+    return [
+        dbc.Label("Exposure (ms)", className="small mb-1"),
+        dcc.Slider(
+            id="slider-exposure",
+            min=round(exp_min * 1000, 3),
+            max=round(exp_max * 1000, 3),
+            value=round(exp_ms, 3),
+            step=0.001,
+            tooltip={"placement": "bottom", "always_visible": True},
+            marks=None,
+        ),
+        html.Div(className="mb-3"),
+    ]
+
+
+def _gain_controls(cam: Any) -> list[Any]:
+    """Build the Gain slider — always present."""
+    gain_min, gain_max = 0.0, 24.0
+    gr = getattr(cam, "gain_range", None)
+    if gr is not None:
+        try:
+            gain_min, gain_max = gr
+        except Exception:
+            pass
+    return [
+        dbc.Label("Gain", className="small mb-1"),
+        dcc.Slider(
+            id="slider-gain",
+            min=gain_min,
+            max=gain_max,
+            value=cam.gain or 0.0,
+            step=0.1,
+            tooltip={"placement": "bottom", "always_visible": True},
+            marks=None,
+        ),
+        html.Div(className="mb-3"),
+    ]
+
+
+def _roi_controls(cam: Any) -> list[Any] | None:
+    """Build the ROI panel, or ``None`` if the camera has no ROI."""
+    if not (hasattr(cam, "roi_info") and hasattr(cam, "set_roi")):
+        return None
+    try:
+        roi: dict[str, int] = getattr(cam, "roi_info")
+    except Exception:
+        return None
+
+    return [
+        html.Hr(className="my-2"),
+        dbc.Label("Region of Interest", className="small fw-bold mb-1"),
+        dbc.Row(
+            [
+                dbc.Col(
+                    [
+                        dbc.Label("Offset X", className="small"),
+                        dbc.Input(
+                            id="input-roi-ox",
+                            type="number",
+                            value=roi.get("offset_x", 0),
+                            size="sm",
+                        ),
+                    ],
+                    width=6,
+                ),
+                dbc.Col(
+                    [
+                        dbc.Label("Offset Y", className="small"),
+                        dbc.Input(
+                            id="input-roi-oy",
+                            type="number",
+                            value=roi.get("offset_y", 0),
+                            size="sm",
+                        ),
+                    ],
+                    width=6,
+                ),
+            ],
+            className="mb-2",
+        ),
+        dbc.Row(
+            [
+                dbc.Col(
+                    [
+                        dbc.Label("Width", className="small"),
+                        dbc.Input(
+                            id="input-roi-w",
+                            type="number",
+                            value=roi.get("width", 1024),
+                            size="sm",
+                        ),
+                    ],
+                    width=6,
+                ),
+                dbc.Col(
+                    [
+                        dbc.Label("Height", className="small"),
+                        dbc.Input(
+                            id="input-roi-h",
+                            type="number",
+                            value=roi.get("height", 1024),
+                            size="sm",
+                        ),
+                    ],
+                    width=6,
+                ),
+            ],
+            className="mb-2",
+        ),
+        dbc.Row(
+            [
+                dbc.Col(
+                    dbc.Button(
+                        "Apply ROI",
+                        id="btn-roi-apply",
+                        color="primary",
+                        size="sm",
+                        className="w-100",
+                    ),
+                    width=6,
+                ),
+                dbc.Col(
+                    dbc.Button(
+                        "Full Sensor",
+                        id="btn-roi-reset",
+                        color="outline-secondary",
+                        size="sm",
+                        className="w-100",
+                    ),
+                    width=6,
+                ),
+            ],
+        ),
+        html.Div(id="div-roi-status", className="small text-muted mt-2"),
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Main settings builder
+# ---------------------------------------------------------------------------
+
+# Categories that always appear (in this order) because they contain
+# dedicated Exposure / Gain / ROI controls even when no GenICam features
+# are discovered.
+_PINNED_CATEGORIES = ["Acquisition Control", "Analog Control", "Image Format Control"]
+
+
 def _build_setting_items(bp: BeamProfiler) -> list[dbc.AccordionItem]:
-    """Dynamically create accordion items from camera properties."""
+    """Build the full Setting accordion driven by GenICam feature discovery.
+
+    The layout mirrors official camera GUIs (SpinView, pylon Viewer):
+
+    * **Camera Info** — device metadata summary
+    * **Acquisition Control** — Exposure slider + discovered features
+    * **Analog Control** — Gain slider + discovered features
+    * **Image Format Control** — ROI panel + discovered features
+    * *remaining categories* — auto-discovered features only
+    """
     items: list[dbc.AccordionItem] = []
     cam = bp.camera
     if cam is None:
         return items
 
-    # ── Camera Info ──────────────────────────────────────────────
-    info_rows = []
-    for label, attr in [
+    # ── Camera Info (always first) ────────────────────────────────
+    info_rows: list[Any] = []
+    for lbl, attr in [
         ("Model", "device_model"),
         ("Vendor", "device_vendor"),
         ("Serial", "serial_number"),
@@ -300,7 +614,7 @@ def _build_setting_items(bp: BeamProfiler) -> list[dbc.AccordionItem]:
                 "Model": "DeviceModelName",
                 "Vendor": "DeviceVendorName",
                 "Serial": "DeviceSerialNumber",
-            }.get(label)
+            }.get(lbl)
             if node_attr and hasattr(nm, node_attr):
                 try:
                     val = getattr(nm, node_attr).value
@@ -308,9 +622,8 @@ def _build_setting_items(bp: BeamProfiler) -> list[dbc.AccordionItem]:
                     pass
         if val:
             info_rows.append(
-                html.Tr([html.Td(label, className="pe-3 text-muted"), html.Td(str(val))])
+                html.Tr([html.Td(lbl, className="pe-3 text-muted"), html.Td(str(val))])
             )
-
     sensor_w = getattr(cam, "width_pixels", None) or getattr(cam, "width", None)
     sensor_h = getattr(cam, "height_pixels", None) or getattr(cam, "height", None)
     if sensor_w and sensor_h:
@@ -327,7 +640,6 @@ def _build_setting_items(bp: BeamProfiler) -> list[dbc.AccordionItem]:
         info_rows.append(
             html.Tr([html.Td("Pixel size", className="pe-3 text-muted"), html.Td(f"{ps} μm")])
         )
-
     items.append(
         dbc.AccordionItem(
             html.Table(html.Tbody(info_rows), className="table table-sm table-borderless mb-0"),
@@ -335,151 +647,50 @@ def _build_setting_items(bp: BeamProfiler) -> list[dbc.AccordionItem]:
         )
     )
 
-    # ── Exposure & Gain ─────────────────────────────────────────
-    exp_min, exp_max = 0.001, 1.0
-    er = getattr(cam, "exposure_range", None)
-    if er is not None:
+    # ── Discover features ─────────────────────────────────────────
+    discovered: dict[str, list[str]] = {}
+    if hasattr(cam, "_discover_features"):
         try:
-            exp_min, exp_max = er
+            discovered = cam._discover_features()
         except Exception:
-            pass
-    gain_min, gain_max = 0.0, 24.0
-    gr = getattr(cam, "gain_range", None)
-    if gr is not None:
-        try:
-            gain_min, gain_max = gr
-        except Exception:
-            pass
-
-    exp_ms = (cam.exposure_time or 0.01) * 1000
-
-    items.append(
-        dbc.AccordionItem(
-            [
-                dbc.Label("Exposure (ms)", className="small mb-1"),
-                dcc.Slider(
-                    id="slider-exposure",
-                    min=round(exp_min * 1000, 3),
-                    max=round(exp_max * 1000, 3),
-                    value=round(exp_ms, 3),
-                    step=0.001,
-                    tooltip={"placement": "bottom", "always_visible": True},
-                    marks=None,
-                ),
-                html.Div(className="mb-3"),
-                dbc.Label("Gain", className="small mb-1"),
-                dcc.Slider(
-                    id="slider-gain",
-                    min=gain_min,
-                    max=gain_max,
-                    value=cam.gain or 0.0,
-                    step=0.1,
-                    tooltip={"placement": "bottom", "always_visible": True},
-                    marks=None,
-                ),
-            ],
-            title="Exposure & Gain",
-        )
+            logger.warning("Feature discovery failed", exc_info=True)
+    logger.debug(
+        "Setting panel: discovered %d features in %d categories: %s",
+        sum(len(v) for v in discovered.values()),
+        len(discovered),
+        list(discovered.keys()),
     )
 
-    # ── ROI ─────────────────────────────────────────────────────
-    roi: dict[str, int] | None = None
-    if hasattr(cam, "roi_info") and hasattr(cam, "set_roi"):
-        try:
-            roi = getattr(cam, "roi_info")
-        except Exception:
-            pass
-        if roi is not None:
-            items.append(
-                dbc.AccordionItem(
-                    [
-                        dbc.Row(
-                            [
-                                dbc.Col(
-                                    [
-                                        dbc.Label("Offset X", className="small"),
-                                        dbc.Input(
-                                            id="input-roi-ox",
-                                            type="number",
-                                            value=roi.get("offset_x", 0),
-                                            size="sm",
-                                        ),
-                                    ],
-                                    width=6,
-                                ),
-                                dbc.Col(
-                                    [
-                                        dbc.Label("Offset Y", className="small"),
-                                        dbc.Input(
-                                            id="input-roi-oy",
-                                            type="number",
-                                            value=roi.get("offset_y", 0),
-                                            size="sm",
-                                        ),
-                                    ],
-                                    width=6,
-                                ),
-                            ],
-                            className="mb-2",
-                        ),
-                        dbc.Row(
-                            [
-                                dbc.Col(
-                                    [
-                                        dbc.Label("Width", className="small"),
-                                        dbc.Input(
-                                            id="input-roi-w",
-                                            type="number",
-                                            value=roi.get("width", 1024),
-                                            size="sm",
-                                        ),
-                                    ],
-                                    width=6,
-                                ),
-                                dbc.Col(
-                                    [
-                                        dbc.Label("Height", className="small"),
-                                        dbc.Input(
-                                            id="input-roi-h",
-                                            type="number",
-                                            value=roi.get("height", 1024),
-                                            size="sm",
-                                        ),
-                                    ],
-                                    width=6,
-                                ),
-                            ],
-                            className="mb-2",
-                        ),
-                        dbc.Row(
-                            [
-                                dbc.Col(
-                                    dbc.Button(
-                                        "Apply ROI",
-                                        id="btn-roi-apply",
-                                        color="primary",
-                                        size="sm",
-                                        className="w-100",
-                                    ),
-                                    width=6,
-                                ),
-                                dbc.Col(
-                                    dbc.Button(
-                                        "Full Sensor",
-                                        id="btn-roi-reset",
-                                        color="outline-secondary",
-                                        size="sm",
-                                        className="w-100",
-                                    ),
-                                    width=6,
-                                ),
-                            ],
-                        ),
-                        html.Div(id="div-roi-status", className="small text-muted mt-2"),
-                    ],
-                    title="Region of Interest",
-                )
-            )
+    # Build ordered category list: pinned first, then the rest alphabetically
+    category_order: list[str] = list(_PINNED_CATEGORIES)
+    for cat in sorted(discovered):
+        if cat not in category_order:
+            category_order.append(cat)
+
+    # ── Build one accordion item per category ─────────────────────
+    for cat in category_order:
+        children: list[Any] = []
+
+        # Inject dedicated controls into the appropriate category
+        if cat == "Acquisition Control":
+            children.extend(_exposure_controls(cam))
+        elif cat == "Analog Control":
+            children.extend(_gain_controls(cam))
+
+        # Auto-discovered features for this category
+        for fname in discovered.get(cat, []):
+            ctrl = _build_genicam_control(cam, fname)
+            if ctrl is not None:
+                children.append(ctrl)
+
+        # ROI panel at the bottom of Image Format Control
+        if cat == "Image Format Control":
+            roi = _roi_controls(cam)
+            if roi is not None:
+                children.extend(roi)
+
+        if children:
+            items.append(dbc.AccordionItem(children, title=cat))
 
     return items
 
@@ -495,7 +706,10 @@ def _setting_tab(bp: BeamProfiler) -> dbc.Tab:
     return dbc.Tab(
         label="Setting",
         tab_id="tab-setting",
-        children=dbc.Card(dbc.CardBody(body), className="border-0"),
+        children=dbc.Card(
+            dbc.CardBody(html.Div(body, id="settings-container")),
+            className="border-0",
+        ),
     )
 
 
@@ -515,7 +729,7 @@ def _normalize_profile(
 
 def build_figure(
     bp: BeamProfiler,
-    image: np.ndarray,
+    image: np.ndarray | None,
     popt_x: np.ndarray | list[Any] | None,
     popt_y: np.ndarray | list[Any] | None,
     *,
@@ -527,12 +741,25 @@ def build_figure(
     """Build a single-plot figure with profiles overlaid on the heatmap.
 
     The X projection is drawn along the bottom edge and the Y projection
-    along the left edge, similar to LaseView.
+    along the left edge, similar to LaseView.  Returns an empty figure
+    when *image* is ``None``.
+
+    Args:
+        bp: BeamProfiler instance (used for pixel size and cached projections).
+        image: 2-D intensity array, or ``None`` for an empty figure.
+        popt_x: X-projection Gaussian fit parameters, or ``None``.
+        popt_y: Y-projection Gaussian fit parameters, or ``None``.
+        colorscale: Plotly colorscale name.
+        zmin: Fixed minimum for the color range (``None`` for auto).
+        zmax: Fixed maximum for the color range (``None`` for auto).
+        dark_theme: Use dark background when ``True``.
+
+    Returns:
+        Plotly ``Figure`` with heatmap, profile overlays, and optional
+        fit curves / beam ellipse.
     """
     if image is None:
         return go.Figure()
-
-    from scipy.ndimage import zoom as _ndimage_zoom
 
     h, w = image.shape
     if max(h, w) > MAX_DISPLAY_DIM:
@@ -623,7 +850,8 @@ def build_figure(
 
     # ── X profile (bottom edge) ─────────────────────────────────
     x_ax = np.arange(w)
-    proj_x = np.sum(image, axis=0).astype(float)
+    cached_proj_x = getattr(bp, "_last_proj_x", None)
+    proj_x = (cached_proj_x if cached_proj_x is not None else np.sum(image, axis=0)).astype(float)
     norm_x = _normalize_profile(proj_x, y_max)
 
     fig.add_trace(
@@ -639,9 +867,7 @@ def build_figure(
         )
     )
     if popt_x is not None:
-        from .beamprofiler import BeamProfiler as _BP
-
-        fit_x = _BP.gaussian(x_ax, *popt_x).astype(float)
+        fit_x = bp.gaussian(x_ax, *popt_x).astype(float)
         norm_fit_x = _normalize_profile(fit_x, y_max)
         fig.add_trace(
             go.Scatter(
@@ -655,8 +881,9 @@ def build_figure(
         )
 
     # ── Y profile (left edge) ──────────────────────────────────
-    proj_y = np.sum(image, axis=1).astype(float)
     y_ax = np.arange(h)
+    cached_proj_y = getattr(bp, "_last_proj_y", None)
+    proj_y = (cached_proj_y if cached_proj_y is not None else np.sum(image, axis=1)).astype(float)
     norm_y = _normalize_profile(proj_y, x_max)
 
     fig.add_trace(
@@ -672,9 +899,7 @@ def build_figure(
         )
     )
     if popt_y is not None:
-        from .beamprofiler import BeamProfiler as _BP
-
-        fit_y = _BP.gaussian(y_ax, *popt_y).astype(float)
+        fit_y = bp.gaussian(y_ax, *popt_y).astype(float)
         norm_fit_y = _normalize_profile(fit_y, x_max)
         fig.add_trace(
             go.Scatter(
@@ -813,9 +1038,15 @@ window.addEventListener('load', function() {
     if bp._mode == "camera" and bp.camera is not None and not bp.camera.is_acquiring:
         bp.camera.start_acquisition()
 
-    initial_img = (
-        bp.camera.get_image() if bp._mode == "camera" and bp.camera is not None else bp.last_img
-    )
+    initial_img = None
+    if bp._mode == "camera" and bp.camera is not None:
+        try:
+            initial_img = bp.camera.get_image()
+        except (TimeoutError, Exception) as e:
+            logger.warning("Could not grab initial frame: %s", e)
+    else:
+        initial_img = bp.last_img
+
     if initial_img is not None:
         popt_x, popt_y = bp.analyze(initial_img)
         initial_fig = build_figure(bp, initial_img, popt_x, popt_y)
@@ -884,29 +1115,51 @@ window.addEventListener('load', function() {
 # ---------------------------------------------------------------------------
 
 _callback_lock = threading.Lock()
+_server_paused = False
 
 
 def _register_callbacks(app: dash.Dash, bp: BeamProfiler) -> None:
     """Wire up all Dash callbacks."""
+    global _server_paused  # noqa: PLW0603
+    _server_paused = False
 
     # -- Play / Pause toggle --------------------------------------------------
     @app.callback(
         Output("store-paused", "data"),
         Output("btn-play-pause", "children"),
         Output("btn-play-pause", "color"),
+        Output("settings-container", "children"),
         Input("btn-play-pause", "n_clicks"),
         State("store-paused", "data"),
         prevent_initial_call=True,
     )
-    def toggle_pause(n: int, paused: bool) -> tuple[bool, list[Any], str]:
+    def toggle_pause(n: int, paused: bool) -> tuple[bool, list[Any], str, Any]:
+        global _server_paused  # noqa: PLW0603
         new_paused = not paused
+
+        with _callback_lock:
+            _server_paused = new_paused
+            if bp._mode == "camera" and bp.camera is not None:
+                if new_paused:
+                    bp.camera.stop_acquisition()
+                else:
+                    bp.camera.start_acquisition()
+
+            items = _build_setting_items(bp)
+
         if new_paused:
             label = [html.I(className="bi bi-play-fill me-1"), "Play"]
             color = "success"
         else:
             label = [html.I(className="bi bi-pause-fill me-1"), "Pause"]
             color = "primary"
-        return new_paused, label, color
+
+        if items:
+            settings_body = dbc.Accordion(items, start_collapsed=False, always_open=True)
+        else:
+            settings_body = html.P("No camera connected.", className="text-muted p-3")
+
+        return new_paused, label, color, settings_body
 
     # -- Save current frame ---------------------------------------------------
     @app.callback(
@@ -979,13 +1232,14 @@ def _register_callbacks(app: dash.Dash, bp: BeamProfiler) -> None:
     )
     def set_exposure(val: float) -> float:
         if bp.camera is not None:
-            try:
-                was_acquiring = bp.camera.is_acquiring
-                bp.camera.set_exposure(val / 1000.0)
-                if was_acquiring and not bp.camera.is_acquiring:
-                    bp.camera.start_acquisition()
-            except Exception as e:
-                logger.warning(f"Failed to set exposure: {e}")
+            with _callback_lock:
+                try:
+                    was_acquiring = bp.camera.is_acquiring
+                    bp.camera.set_exposure(val / 1000.0)
+                    if was_acquiring and not bp.camera.is_acquiring:
+                        bp.camera.start_acquisition()
+                except Exception as e:
+                    logger.warning(f"Failed to set exposure: {e}")
         return val
 
     # -- Gain slider ----------------------------------------------------------
@@ -996,13 +1250,14 @@ def _register_callbacks(app: dash.Dash, bp: BeamProfiler) -> None:
     )
     def set_gain(val: float) -> float:
         if bp.camera is not None:
-            try:
-                was_acquiring = bp.camera.is_acquiring
-                bp.camera.set_gain(val)
-                if was_acquiring and not bp.camera.is_acquiring:
-                    bp.camera.start_acquisition()
-            except Exception as e:
-                logger.warning(f"Failed to set gain: {e}")
+            with _callback_lock:
+                try:
+                    was_acquiring = bp.camera.is_acquiring
+                    bp.camera.set_gain(val)
+                    if was_acquiring and not bp.camera.is_acquiring:
+                        bp.camera.start_acquisition()
+                except Exception as e:
+                    logger.warning(f"Failed to set gain: {e}")
         return val
 
     # -- ROI apply (conditional) ----------------------------------------------
@@ -1021,22 +1276,21 @@ def _register_callbacks(app: dash.Dash, bp: BeamProfiler) -> None:
         def apply_roi(_n: int, ox: int, oy: int, w: int, h: int) -> str:
             if bp.camera is None:
                 return "No camera"
-            try:
-                was_acquiring = bp.camera.is_acquiring
-                if was_acquiring:
-                    bp.camera.stop_acquisition()
-                getattr(bp.camera, "set_roi")(
-                    offset_x=int(ox), offset_y=int(oy), width=int(w), height=int(h)
-                )
-                if was_acquiring:
-                    bp.camera.start_acquisition()
-                roi = getattr(bp.camera, "roi_info")
-                return (
-                    f"ROI: {roi['width']}×{roi['height']} at ({roi['offset_x']},{roi['offset_y']})"
-                )
-            except Exception as e:
-                logger.warning(f"Failed to set ROI: {e}")
-                return f"Error: {e}"
+            with _callback_lock:
+                try:
+                    was_acquiring = bp.camera.is_acquiring
+                    if was_acquiring:
+                        bp.camera.stop_acquisition()
+                    getattr(bp.camera, "set_roi")(
+                        offset_x=int(ox), offset_y=int(oy), width=int(w), height=int(h)
+                    )
+                    if was_acquiring:
+                        bp.camera.start_acquisition()
+                    roi = getattr(bp.camera, "roi_info")
+                    return f"ROI: {roi['width']}×{roi['height']} at ({roi['offset_x']},{roi['offset_y']})"
+                except Exception as e:
+                    logger.warning(f"Failed to set ROI: {e}")
+                    return f"Error: {e}"
 
         @app.callback(
             Output("input-roi-ox", "value"),
@@ -1050,18 +1304,96 @@ def _register_callbacks(app: dash.Dash, bp: BeamProfiler) -> None:
         def reset_roi(_n: int) -> tuple[int, int, int, int, str]:
             if bp.camera is None:
                 return 0, 0, 0, 0, "No camera"
-            try:
-                was_acquiring = bp.camera.is_acquiring
-                if was_acquiring:
-                    bp.camera.stop_acquisition()
-                getattr(bp.camera, "set_roi")(offset_x=0, offset_y=0, width=None, height=None)
-                if was_acquiring:
-                    bp.camera.start_acquisition()
-                roi = getattr(bp.camera, "roi_info")
-                return 0, 0, roi["max_width"], roi["max_height"], "Reset to full sensor"
-            except Exception as e:
-                logger.warning(f"Failed to reset ROI: {e}")
-                return 0, 0, 0, 0, f"Error: {e}"
+            with _callback_lock:
+                try:
+                    was_acquiring = bp.camera.is_acquiring
+                    if was_acquiring:
+                        bp.camera.stop_acquisition()
+                    getattr(bp.camera, "set_roi")(offset_x=0, offset_y=0, width=None, height=None)
+                    if was_acquiring:
+                        bp.camera.start_acquisition()
+                    roi = getattr(bp.camera, "roi_info")
+                    return 0, 0, roi["max_width"], roi["max_height"], "Reset to full sensor"
+                except Exception as e:
+                    logger.warning(f"Failed to reset ROI: {e}")
+                    return 0, 0, 0, 0, f"Error: {e}"
+
+    # -- GenICam feature callbacks (pattern-matching) -------------------------
+    has_genicam = (
+        bp.camera is not None
+        and hasattr(bp.camera, "_discover_features")
+        and bp.camera._discover_features()
+    )
+    if has_genicam:
+
+        @app.callback(
+            Output({"type": "genicam-num", "feature": MATCH}, "value"),
+            Input({"type": "genicam-num", "feature": MATCH}, "value"),
+            prevent_initial_call=True,
+        )
+        def set_genicam_numeric(value: float | None) -> Any:
+            if value is None or bp.camera is None:
+                return dash.no_update
+            feature = ctx.triggered_id["feature"]
+            with _callback_lock:
+                nm = getattr(bp.camera, "node_map", None)
+                if nm is not None:
+                    node = getattr(nm, feature, None)
+                    if node is not None:
+                        try:
+                            was_acquiring = bp.camera.is_acquiring
+                            node.value = value
+                            if was_acquiring and not bp.camera.is_acquiring and not _server_paused:
+                                bp.camera.start_acquisition()
+                        except Exception as e:
+                            logger.debug("Failed to set %s: %s", feature, e)
+            return value
+
+        @app.callback(
+            Output({"type": "genicam-sel", "feature": MATCH}, "value"),
+            Input({"type": "genicam-sel", "feature": MATCH}, "value"),
+            prevent_initial_call=True,
+        )
+        def set_genicam_select(value: str | None) -> Any:
+            if value is None or bp.camera is None:
+                return dash.no_update
+            feature = ctx.triggered_id["feature"]
+            with _callback_lock:
+                nm = getattr(bp.camera, "node_map", None)
+                if nm is not None:
+                    node = getattr(nm, feature, None)
+                    if node is not None:
+                        try:
+                            was_acquiring = bp.camera.is_acquiring
+                            node.value = value
+                            if was_acquiring and not bp.camera.is_acquiring and not _server_paused:
+                                bp.camera.start_acquisition()
+                        except Exception as e:
+                            logger.debug("Failed to set %s: %s", feature, e)
+            return value
+
+        @app.callback(
+            Output({"type": "genicam-sw", "feature": MATCH}, "value"),
+            Input({"type": "genicam-sw", "feature": MATCH}, "value"),
+            prevent_initial_call=True,
+        )
+        def set_genicam_switch(value: bool) -> Any:
+            if bp.camera is None:
+                return dash.no_update
+            feature = ctx.triggered_id["feature"]
+            with _callback_lock:
+                nm = getattr(bp.camera, "node_map", None)
+                if nm is not None:
+                    node = getattr(nm, feature, None)
+                    if node is not None:
+                        try:
+                            was_acquiring = bp.camera.is_acquiring
+                            node.value = value
+                            if was_acquiring and not bp.camera.is_acquiring and not _server_paused:
+                                bp.camera.start_acquisition()
+                        except Exception as e:
+                            logger.debug("Failed to set %s: %s", feature, e)
+            return value
 
     # -- Main update loop -----------------------------------------------------
     @app.callback(
@@ -1094,7 +1426,7 @@ def _register_callbacks(app: dash.Dash, bp: BeamProfiler) -> None:
         definition: str,
         dark_theme: bool,
     ) -> tuple[Any, ...]:
-        if paused:
+        if paused or _server_paused:
             return (dash.no_update,) * 4
 
         if not _callback_lock.acquire(blocking=False):

@@ -978,3 +978,97 @@ class TestCLI:
             assert bp.camera is not None
             assert bp.definition == defn
             bp.camera.close()
+
+
+# ─── _camera_info_html ─────────────────────────────────────────────────────
+
+
+class TestCameraInfoHtml:
+    """Tests for BeamProfiler._camera_info_html."""
+
+    def test_simulated_camera_info(self):
+        bp = BeamProfiler(camera="simulated")
+        assert bp.camera is not None
+        html = bp._camera_info_html()
+        assert "Simulated" in html
+        assert "1024×1024" in html
+
+    def test_no_camera_returns_empty(self):
+        bp = BeamProfiler(camera="simulated")
+        bp.camera = None
+        assert bp._camera_info_html() == ""
+
+    def test_with_exposure_and_gain(self):
+        bp = BeamProfiler(camera="simulated")
+        assert bp.camera is not None
+        bp.camera.set_exposure(0.05)
+        bp.camera.set_gain(5.0)
+        html = bp._camera_info_html()
+        assert "Exp:" in html
+        assert "Gain:" in html
+
+    def test_with_vendor_and_model(self):
+        bp = BeamProfiler(camera="simulated")
+        assert bp.camera is not None
+        bp.camera.device_vendor = "TestVendor"  # ty: ignore[unresolved-attribute]
+        bp.camera.device_model = "TestModel"  # ty: ignore[unresolved-attribute]
+        html = bp._camera_info_html()
+        assert "TestVendor TestModel" in html
+
+
+# ─── 2D fit warm start ────────────────────────────────────────────────────
+
+
+class TestFit2DWarmStart:
+    """Test 2D Gaussian fitting with warm-start (cached parameters)."""
+
+    def test_warm_start_reuses_previous(self):
+        bp = BeamProfiler(camera="simulated")
+        assert bp.camera is not None
+        bp.fit_method = "2d"
+        img = bp.camera.get_image()
+        bp.analyze(img)
+        assert bp._last_popt_2d is not None
+        assert len(list(bp._last_popt_2d)) == 7
+
+        img2 = bp.camera.get_image()
+        bp.analyze(img2)
+        assert bp._last_popt_2d is not None
+        assert len(bp._last_popt_2d) == 7
+
+    def test_warm_start_with_large_image(self):
+        bp = BeamProfiler(camera="simulated")
+        assert bp.camera is not None
+        bp.fit_method = "2d"
+        img = bp.camera.get_image()
+        assert max(img.shape) > bp._MAX_FIT_2D_DIM
+        bp.analyze(img)
+        assert bp._last_popt_2d is not None
+
+        bp.analyze(img)
+        assert bp._last_popt_2d is not None
+        second = list(bp._last_popt_2d)
+        assert len(second) == 7
+
+
+# ─── __getattr__ delegation ───────────────────────────────────────────────
+
+
+class TestGetAttrDelegation:
+    """Test BeamProfiler.__getattr__ camera delegation."""
+
+    def test_delegates_to_camera(self):
+        bp = BeamProfiler(camera="simulated")
+        assert bp.camera is not None
+        assert bp.exposure_time == bp.camera.exposure_time
+
+    def test_missing_attr_raises(self):
+        bp = BeamProfiler(camera="simulated")
+        with pytest.raises(AttributeError):
+            _ = bp.nonexistent_attribute_xyz
+
+    def test_no_camera_raises(self):
+        bp = BeamProfiler(camera="simulated")
+        bp.camera = None
+        with pytest.raises(AttributeError):
+            _ = bp.exposure_time

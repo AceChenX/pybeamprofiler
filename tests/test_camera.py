@@ -7,6 +7,8 @@ import numpy as np
 import pytest
 
 from pybeamprofiler import BeamProfiler, SimulatedCamera
+from pybeamprofiler.camera import _categorize_feature
+from pybeamprofiler.simulated import _SimulatedNode
 
 
 class TestSimulatedCamera:
@@ -60,7 +62,7 @@ class TestSimulatedCamera:
         """Test that None exposure defaults to 0.01s."""
         cam = SimulatedCamera()
         cam.open()
-        cam.set_exposure(None)  # ty: ignore[invalid-argument-type]
+        cam.set_exposure(None)
         assert cam.exposure_time == 0.01
         cam.close()
 
@@ -1198,12 +1200,8 @@ class TestCameraSettingMethod:
         cam.close()
 
     def test_create_genicam_controls_with_features(self):
-        """Test _create_genicam_controls with mock features."""
+        """Test _create_genicam_controls discovers features from node_map."""
         cam = self._make_cam_with_mocks()
-        cam.node_map = MagicMock()
-        cam.node_map.Gamma.value = 1.0
-        cam.node_map.Gamma.min = 0.0
-        cam.node_map.Gamma.max = 4.0
         result = cam._create_genicam_controls({"description_width": "initial"})
         assert len(result) > 0
         cam.close()
@@ -1310,14 +1308,11 @@ class TestCameraSettingMethod:
         assert len(controls) == 3
         cam.close()
 
-    def test_create_advanced_controls_with_node_map(self):
-        """Test _create_advanced_controls with available features."""
+    def test_create_advanced_controls_returns_empty(self):
+        """Test _create_advanced_controls returns empty (features are now auto-discovered)."""
         cam = self._make_cam_with_mocks()
-        cam.node_map = MagicMock()
-        cam.node_map.TriggerMode.value = "Off"
-        cam.node_map.TriggerMode.symbolics = ["Off", "On"]
         result = cam._create_advanced_controls({"description_width": "initial"})
-        assert len(result) > 0
+        assert result == []
         cam.close()
 
 
@@ -1844,4 +1839,187 @@ class TestSettingCallbacks:
             ["NonexistentFeature"], {"description_width": "initial"}
         )
         assert result == []
+        cam.close()
+
+
+class TestCategorizeFeature:
+    """Tests for the _categorize_feature module-level function."""
+
+    def test_known_prefixes(self):
+        assert _categorize_feature("TriggerMode") == "Acquisition Control"
+        assert _categorize_feature("TriggerSource") == "Acquisition Control"
+        assert _categorize_feature("AcquisitionFrameRate") == "Acquisition Control"
+        assert _categorize_feature("DeviceTemperature") == "Device Control"
+        assert _categorize_feature("Gamma") == "Analog Control"
+        assert _categorize_feature("GammaEnable") == "Analog Control"
+        assert _categorize_feature("BlackLevel") == "Analog Control"
+        assert _categorize_feature("PixelFormat") == "Image Format Control"
+        assert _categorize_feature("ReverseX") == "Image Format Control"
+        assert _categorize_feature("BinningHorizontal") == "Image Format Control"
+        assert _categorize_feature("LUTEnable") == "LUT Control"
+        assert _categorize_feature("DefectivePixelCorrection") == "Image Quality Control"
+        assert _categorize_feature("TestPattern") == "Test Control"
+        assert _categorize_feature("SensorShutterMode") == "Image Format Control"
+        assert _categorize_feature("LineSelector") == "Digital I/O Control"
+        assert _categorize_feature("CounterEventSource") == "Counter & Timer Control"
+        assert _categorize_feature("ExposureMode") == "Acquisition Control"
+        assert _categorize_feature("ExposureAuto") == "Acquisition Control"
+        assert _categorize_feature("ChunkEnable") == "Chunk Data Control"
+        assert _categorize_feature("EventNotification") == "Event Control"
+
+    def test_longest_prefix_wins(self):
+        assert _categorize_feature("BlackLevelAuto") == "Analog Control"
+        assert _categorize_feature("WhiteBalanceAuto") == "Analog Control"
+
+    def test_unknown_uses_first_camelcase_word(self):
+        assert _categorize_feature("FooBarBaz") == "Foo"
+        assert _categorize_feature("CustomSetting") == "Custom"
+
+    def test_completely_unknown(self):
+        assert _categorize_feature("lowercase") == "Other"
+        assert _categorize_feature("") == "Other"
+
+
+class TestDiscoverFeatures:
+    """Tests for Camera._discover_features."""
+
+    def test_no_node_map(self):
+        cam = SimulatedCamera()
+        assert cam._discover_features() == {}
+
+    def test_with_simulated_camera(self):
+        cam = SimulatedCamera()
+        cam.open()
+        discovered = cam._discover_features()
+        assert isinstance(discovered, dict)
+        assert len(discovered) > 0
+
+        all_features = [f for features in discovered.values() for f in features]
+        assert "Gamma" in all_features
+        assert "GammaEnable" in all_features
+        assert "BlackLevel" in all_features
+        assert "AcquisitionFrameRate" in all_features
+        assert "PixelFormat" in all_features
+        assert "TriggerMode" in all_features
+        assert "TriggerSource" in all_features
+        assert "ReverseX" in all_features
+        assert "ReverseY" in all_features
+        assert "DeviceTemperature" in all_features
+        cam.close()
+
+    def test_skips_handled_features(self):
+        cam = SimulatedCamera()
+        cam.open()
+        discovered = cam._discover_features()
+        all_features = [f for features in discovered.values() for f in features]
+        for skip in ("ExposureTime", "Gain", "Width", "Height", "OffsetX", "OffsetY"):
+            assert skip not in all_features
+        cam.close()
+
+    def test_skips_private_attributes(self):
+        cam = SimulatedCamera()
+        cam.open()
+        discovered = cam._discover_features()
+        all_features = [f for features in discovered.values() for f in features]
+        for f in all_features:
+            assert not f.startswith("_")
+        cam.close()
+
+    def test_features_grouped_by_category(self):
+        cam = SimulatedCamera()
+        cam.open()
+        discovered = cam._discover_features()
+        assert "Analog Control" in discovered
+        assert "Gamma" in discovered["Analog Control"]
+        assert "GammaEnable" in discovered["Analog Control"]
+        assert "Acquisition Control" in discovered
+        assert "TriggerMode" in discovered["Acquisition Control"]
+        cam.close()
+
+    def test_with_custom_node_map(self):
+        """Test discovery with a manually constructed node map."""
+        cam = SimulatedCamera()
+
+        class CustomNodeMap:
+            CustomFloat = _SimulatedNode(5.0, min_val=0.0, max_val=10.0)
+            CustomEnum = _SimulatedNode("A", symbolics=["A", "B", "C"])
+            CustomBool = _SimulatedNode(True)
+
+        cam.node_map = CustomNodeMap()  # ty: ignore[invalid-assignment]
+        discovered = cam._discover_features()
+        all_features = [f for features in discovered.values() for f in features]
+        assert "CustomFloat" in all_features
+        assert "CustomEnum" in all_features
+        assert "CustomBool" in all_features
+
+    def test_node_map_none(self):
+        cam = SimulatedCamera()
+        cam.node_map = None
+        assert cam._discover_features() == {}
+
+    def test_skips_callable_attributes(self):
+        """Callable attributes (methods) should be skipped."""
+        cam = SimulatedCamera()
+
+        class NodeMapWithMethod:
+            Gamma = _SimulatedNode(1.0, min_val=0.0, max_val=4.0)
+
+            def some_method(self):
+                pass
+
+        cam.node_map = NodeMapWithMethod()  # ty: ignore[invalid-assignment]
+        discovered = cam._discover_features()
+        all_features = [f for features in discovered.values() for f in features]
+        assert "Gamma" in all_features
+        assert "some_method" not in all_features
+
+    def test_getattr_exception_handled(self):
+        """Features that raise on getattr should be skipped."""
+        cam = SimulatedCamera()
+
+        class FailingNodeMap:
+            Gamma = _SimulatedNode(1.0, min_val=0.0, max_val=4.0)
+
+            @property
+            def BadNode(self):
+                raise RuntimeError("broken")
+
+        cam.node_map = FailingNodeMap()  # ty: ignore[invalid-assignment]
+        discovered = cam._discover_features()
+        all_features = [f for features in discovered.values() for f in features]
+        assert "Gamma" in all_features
+        assert "BadNode" not in all_features
+
+
+class TestDiscoverFeaturesIntegration:
+    """Integration tests: _discover_features feeds into _create_genicam_controls."""
+
+    def test_genicam_controls_from_discovery(self):
+        """_create_genicam_controls produces accordions from discovered features."""
+        cam = SimulatedCamera()
+        cam.open()
+        controls = cam._create_genicam_controls({"description_width": "initial"})
+        assert len(controls) > 0
+
+        import ipywidgets as widgets
+
+        for ctrl in controls:
+            assert isinstance(ctrl, widgets.Accordion)
+        cam.close()
+
+    def test_setting_shows_discovered_features(self):
+        """setting() should show discovered features without error."""
+        cam = SimulatedCamera()
+        cam.open()
+        with patch("IPython.display.display"):
+            cam.setting()
+        cam.close()
+
+    def test_setting_kwargs_and_discovery(self):
+        """setting() applies kwargs then shows discovered controls."""
+        cam = SimulatedCamera()
+        cam.open()
+        with patch("IPython.display.display"):
+            cam.setting(exposure_time=0.05)
+        assert cam.exposure_time == 0.05
         cam.close()

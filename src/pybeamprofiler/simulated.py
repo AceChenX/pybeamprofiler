@@ -99,9 +99,17 @@ class _SimulatedNodeMap:
         self.SensorPixelHeight = _SimulatedNode(cam.pixel_size, readonly=True)
 
         self.GammaEnable = _SimulatedNode(False)
+        self.Gamma = _SimulatedNode(1.0, min_val=0.25, max_val=4.0)
+        self.BlackLevel = _SimulatedNode(0, min_val=0, max_val=255)
         self.ExposureAuto = _SimulatedNode("Off", symbolics=["Off", "Once", "Continuous"])
         self.GainAuto = _SimulatedNode("Off", symbolics=["Off", "Once", "Continuous"])
         self.AcquisitionFrameRate = _SimulatedNode(30.0, min_val=1.0, max_val=120.0)
+        self.PixelFormat = _SimulatedNode("Mono8", symbolics=["Mono8", "Mono12", "Mono16"])
+        self.TriggerMode = _SimulatedNode("Off", symbolics=["Off", "On"])
+        self.TriggerSource = _SimulatedNode("Software", symbolics=["Software", "Line0", "Line1"])
+        self.ReverseX = _SimulatedNode(False)
+        self.ReverseY = _SimulatedNode(False)
+        self.DeviceTemperature = _SimulatedNode(42.5, min_val=0.0, max_val=100.0, readonly=True)
 
 
 class SimulatedCamera(Camera):
@@ -157,13 +165,16 @@ class SimulatedCamera(Camera):
         logger.info("Simulated camera opened.")
 
     def close(self) -> None:
+        """Release simulated camera resources (no-op)."""
         logger.info("Simulated camera closed.")
 
     def start_acquisition(self) -> None:
+        """Begin simulated image acquisition."""
         self.is_acquiring = True
         logger.info("Simulated acquisition started.")
 
     def stop_acquisition(self) -> None:
+        """Stop simulated image acquisition."""
         self.is_acquiring = False
         logger.info("Simulated acquisition stopped.")
 
@@ -200,11 +211,11 @@ class SimulatedCamera(Camera):
         self.image_buffer = image
         return image
 
-    def set_exposure(self, exposure_time: float) -> None:  # type: ignore[override]
+    def set_exposure(self, exposure_time: float | None) -> None:  # type: ignore[override]
         """Set exposure time and adjust simulated signal amplitude.
 
-        Accepts ``None`` for convenience (resets to the default), though the
-        base-class signature specifies ``float``.
+        Args:
+            exposure_time: Exposure in seconds, or ``None`` to reset to the default.
         """
         if exposure_time is None:
             exposure_time = DEFAULT_EXPOSURE_TIME
