@@ -32,8 +32,6 @@ from .constants import (
 from .flir import FlirCamera
 from .simulated import SimulatedCamera
 
-warnings.filterwarnings("ignore", category=OptimizeWarning)
-
 logger = logging.getLogger(__name__)
 
 
