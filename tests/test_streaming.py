@@ -55,8 +55,13 @@ def test_plot_stream_jupyter_task():
             # Should return a task
             assert isinstance(task, asyncio.Task)
 
-            # Let it render the first frame
-            await asyncio.sleep(0.01)
+            # Wait for the loop to render at least one frame.  A fixed sleep
+            # is flaky on slow CI because the loop offloads camera/fit/figure
+            # calls to threads via ``asyncio.to_thread``.
+            for _ in range(200):  # up to ~2 s
+                if display_mock.call_count > 0 and clear_output_mock.call_count > 0:
+                    break
+                await asyncio.sleep(0.01)
 
             # Cancel the task since it now continues on dropped frames
             task.cancel()
@@ -101,8 +106,13 @@ def test_plot_stream_jupyter_cancellation():
             task = bp.plot(heatmap_only=True)
             assert isinstance(task, asyncio.Task)
 
-            # Give it a tiny bit of time to start and loop once
-            await asyncio.sleep(0.01)
+            # Wait until the loop has actually rendered at least one frame.
+            # The loop offloads camera/fit/figure calls to threads via
+            # ``asyncio.to_thread``, so a fixed sleep is flaky on slow CI.
+            for _ in range(200):  # up to ~2 s
+                if display_mock.call_count > 0:
+                    break
+                await asyncio.sleep(0.01)
 
             # Cancel the task
             task.cancel()
