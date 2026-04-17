@@ -6,6 +6,7 @@ import argparse
 import asyncio
 import logging
 import os
+import signal
 import threading
 import time
 import webbrowser
@@ -1434,8 +1435,6 @@ class BeamProfiler:
                     webbrowser.open(f"http://127.0.0.1:{DEFAULT_DASH_PORT}")
 
                 threading.Thread(target=open_browser, daemon=True).start()
-
-            import signal
 
             def _sigint_handler(signum: int, frame: Any) -> None:
                 if self._mode == "camera" and self.camera is not None:

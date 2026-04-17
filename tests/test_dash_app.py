@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from typing import Any
+from unittest.mock import patch
 
 import dash
 import dash_bootstrap_components as dbc
@@ -1019,6 +1020,15 @@ class TestBuildGenicamControlEdgeCases:
 # ─── Dash callback helpers ─────────────────────────────────────────────────
 
 
+def _fire_slider(fn: Any, slider_id: str, val: float) -> Any:
+    """Invoke the slider+input paired callback as if the user dragged the
+    slider (trigger = slider id, input value = None). Handles both the
+    new tuple return shape and legacy scalar returns."""
+    with patch("pybeamprofiler.dash_app.ctx") as mock_ctx:
+        mock_ctx.triggered_id = slider_id
+        return fn(val, None)
+
+
 def _extract_callback(bp: BeamProfiler, output_id: str) -> Any:
     """Register callbacks on a throwaway Dash app and find one by output id."""
     from pybeamprofiler.dash_app import _register_callbacks
@@ -1147,7 +1157,7 @@ class TestAveragedImage:
     def test_n_one_passes_through(self):
         from pybeamprofiler import dash_app as da
 
-        da._avg_buffer.clear()
+        da._reset_avg_state()
         img = np.full((4, 4), 10, dtype=np.uint8)
         out = da._averaged_image(img, 1)
         assert np.array_equal(out, img)
@@ -1156,7 +1166,7 @@ class TestAveragedImage:
     def test_running_mean(self):
         from pybeamprofiler import dash_app as da
 
-        da._avg_buffer.clear()
+        da._reset_avg_state()
         a = np.full((4, 4), 0, dtype=np.uint8)
         b = np.full((4, 4), 100, dtype=np.uint8)
         da._averaged_image(a, 2)
@@ -1166,7 +1176,7 @@ class TestAveragedImage:
     def test_buffer_resets_on_shape_change(self):
         from pybeamprofiler import dash_app as da
 
-        da._avg_buffer.clear()
+        da._reset_avg_state()
         da._averaged_image(np.zeros((4, 4), dtype=np.uint8), 4)
         da._averaged_image(np.zeros((8, 8), dtype=np.uint8), 4)
         assert len(da._avg_buffer) == 1
@@ -1176,14 +1186,14 @@ class TestAveragedImage:
         from pybeamprofiler import dash_app as da
         from pybeamprofiler.dash_app import _MAX_AVG_FRAMES
 
-        da._avg_buffer.clear()
+        da._reset_avg_state()
         da._averaged_image(np.zeros((4, 4), dtype=np.uint8), _MAX_AVG_FRAMES + 100)
         assert da._avg_buffer.maxlen == _MAX_AVG_FRAMES
 
     def test_n_zero_or_negative_treated_as_one(self):
         from pybeamprofiler import dash_app as da
 
-        da._avg_buffer.clear()
+        da._reset_avg_state()
         img = np.full((4, 4), 7, dtype=np.uint8)
         out = da._averaged_image(img, 0)
         assert np.array_equal(out, img)
@@ -1194,12 +1204,38 @@ class TestAveragedImage:
         """Averaged frame must keep the source dtype so saturation math stays sane."""
         from pybeamprofiler import dash_app as da
 
-        da._avg_buffer.clear()
+        da._reset_avg_state()
         a = np.full((4, 4), 100, dtype=np.uint16)
         b = np.full((4, 4), 200, dtype=np.uint16)
         da._averaged_image(a, 2)
         out = da._averaged_image(b, 2)
         assert out.dtype == np.uint16
+
+    def test_running_mean_evicts_oldest_when_full(self):
+        """Verify the incremental sum stays in sync after the deque fills up.
+
+        A naive implementation that forgets to subtract the evicted frame
+        would drift; this check would catch that regression.
+        """
+        from pybeamprofiler import dash_app as da
+
+        da._reset_avg_state()
+        shape = (4, 4)
+        da._averaged_image(np.full(shape, 10, dtype=np.uint8), 3)
+        da._averaged_image(np.full(shape, 20, dtype=np.uint8), 3)
+        da._averaged_image(np.full(shape, 30, dtype=np.uint8), 3)
+        out = da._averaged_image(np.full(shape, 40, dtype=np.uint8), 3)
+        assert np.array_equal(out, np.full(shape, 30, dtype=np.uint8))
+
+    def test_reset_avg_state_clears_running_sum(self):
+        from pybeamprofiler import dash_app as da
+
+        da._reset_avg_state()
+        da._averaged_image(np.full((4, 4), 10, dtype=np.uint8), 3)
+        assert da._avg_running_sum is not None
+        da._reset_avg_state()
+        assert da._avg_running_sum is None
+        assert len(da._avg_buffer) == 0
 
 
 # ─── _measured_fps and _build_status helpers ──────────────────────────────
@@ -1398,7 +1434,7 @@ class TestPauseClearsAvgBuffer:
         assert len(da._avg_buffer) == 1
         fn = _extract_callback(bp, "slider-exposure")
         assert fn is not None
-        fn(50.0)
+        _fire_slider(fn, "slider-exposure", 50.0)
         assert len(da._avg_buffer) == 0
 
 
@@ -1500,7 +1536,7 @@ class TestSliderRestartBranches:
         )
         fn = _extract_callback(bp, "slider-exposure")
         assert fn is not None
-        fn(50.0)
+        _fire_slider(fn, "slider-exposure", 50.0)
         assert cam.is_acquiring
 
     def test_set_gain_restarts_when_stopped(self):
@@ -1522,7 +1558,7 @@ class TestSliderRestartBranches:
         )
         fn = _extract_callback(bp, "slider-gain")
         assert fn is not None
-        fn(3.0)
+        _fire_slider(fn, "slider-gain", 3.0)
         assert cam.is_acquiring
 
 
@@ -1672,7 +1708,9 @@ class TestGenicamCallbackBranches:
             patch.object(type(node), "value", property(lambda s: 0.0, boom)),
         ):
             mock_ctx.triggered_id = {"type": "genicam-num", "feature": "ExposureTime"}
-            assert fn(1.0) == 1.0  # value passes through, exception logged
+            # Slider-triggered → callback mirrors value onto the companion input.
+            result = fn(1.0, None)
+            assert result[1] == 1.0
 
     def test_select_set_exception_swallowed(self):
         from unittest.mock import patch
@@ -1718,7 +1756,7 @@ class TestGenicamCallbackBranches:
             patch.object(type(node), "value", property(lambda s: s._value, stop_then_set)),
         ):
             mock_ctx.triggered_id = {"type": "genicam-num", "feature": "ExposureTime"}
-            fn(123.0)
+            fn(123.0, None)
         assert bp.camera.is_acquiring  # restarted
 
     def test_select_setter_restarts_when_stopped(self):
@@ -1913,10 +1951,24 @@ class TestExposureCallback:
         bp = BeamProfiler(camera="simulated")
         fn = _extract_callback(bp, "slider-exposure")
         assert fn is not None
-        result = fn(50.0)
-        assert result == 50.0
+        result = _fire_slider(fn, "slider-exposure", 50.0)
+        # Slider-triggered → input mirrors the new value, slider gets no_update.
+        assert result[1] == 50.0
         assert bp.camera is not None
         assert abs(bp.camera.exposure_time - 0.05) < 1e-6
+
+    def test_set_exposure_via_input_box(self):
+        """Typing a precise value into the companion number input applies
+        it to the camera and mirrors back to the slider."""
+        bp = BeamProfiler(camera="simulated")
+        fn = _extract_callback(bp, "input-exposure")
+        assert fn is not None
+        with patch("pybeamprofiler.dash_app.ctx") as mock_ctx:
+            mock_ctx.triggered_id = "input-exposure"
+            result = fn(None, 123.456)
+        assert result[0] == 123.456  # slider is synced
+        assert bp.camera is not None
+        assert abs(bp.camera.exposure_time - 0.123456) < 1e-6
 
 
 # ─── set_gain callback ───────────────────────────────────────────────────
@@ -1927,10 +1979,21 @@ class TestGainCallback:
         bp = BeamProfiler(camera="simulated")
         fn = _extract_callback(bp, "slider-gain")
         assert fn is not None
-        result = fn(5.0)
-        assert result == 5.0
+        result = _fire_slider(fn, "slider-gain", 5.0)
+        assert result[1] == 5.0
         assert bp.camera is not None
         assert bp.camera.gain == 5.0
+
+    def test_set_gain_via_input_box(self):
+        bp = BeamProfiler(camera="simulated")
+        fn = _extract_callback(bp, "input-gain")
+        assert fn is not None
+        with patch("pybeamprofiler.dash_app.ctx") as mock_ctx:
+            mock_ctx.triggered_id = "input-gain"
+            result = fn(None, 7.25)
+        assert result[0] == 7.25
+        assert bp.camera is not None
+        assert bp.camera.gain == 7.25
 
 
 # ─── ROI callbacks ────────────────────────────────────────────────────────
@@ -2015,8 +2078,25 @@ class TestGenicamSetCallbacks:
         assert set_fn is not None
         with patch("pybeamprofiler.dash_app.ctx") as mock_ctx:
             mock_ctx.triggered_id = {"type": "genicam-num", "feature": "ExposureTime"}
-            result = set_fn(50000.0)
-            assert result == 50000.0
+            result = set_fn(50000.0, None)
+            # Slider-triggered → input mirrors, slider returns no_update.
+            assert result[1] == 50000.0
+
+    def test_numeric_callback_via_input_box(self):
+        """Typing into the companion number input commits to the camera
+        and mirrors back to the slider."""
+        bp = BeamProfiler(camera="simulated")
+        captured = self._extract_genicam_callbacks(bp)
+        set_fn = None
+        for key, func in captured.items():
+            if "genicam-num" in key:
+                set_fn = func
+                break
+        assert set_fn is not None
+        with patch("pybeamprofiler.dash_app.ctx") as mock_ctx:
+            mock_ctx.triggered_id = {"type": "genicam-num-input", "feature": "ExposureTime"}
+            result = set_fn(None, 12345.0)
+            assert result[0] == 12345.0
 
     def test_select_callback_sets_value(self):
         from unittest.mock import patch
@@ -2059,8 +2139,12 @@ class TestGenicamSetCallbacks:
                 set_fn = func
                 break
         assert set_fn is not None
-        result = set_fn(None)
-        assert isinstance(result, dash._no_update.NoUpdate)
+        with patch("pybeamprofiler.dash_app.ctx") as mock_ctx:
+            mock_ctx.triggered_id = {"type": "genicam-num", "feature": "ExposureTime"}
+            result = set_fn(None, None)
+        # Both outputs should be no_update when nothing to commit.
+        assert isinstance(result[0], dash._no_update.NoUpdate)
+        assert isinstance(result[1], dash._no_update.NoUpdate)
 
 
 # ─── update_live callback ────────────────────────────────────────────────
@@ -2130,7 +2214,7 @@ class TestUpdateLiveCallback:
         bp.camera.start_acquisition()
         fn = self._get_update_fn(bp)
         assert fn is not None
-        da._avg_buffer.clear()
+        da._reset_avg_state()
         for _ in range(3):
             fn(1, False, True, "Hot", True, None, None, 0, "1d", "gaussian", True, 4)
         assert len(da._avg_buffer) == 3
@@ -2165,8 +2249,9 @@ class TestCallbackErrorBranches:
         )
         fn = _extract_callback(bp, "slider-exposure")
         assert fn is not None
-        result = fn(50.0)
-        assert result == 50.0
+        result = _fire_slider(fn, "slider-exposure", 50.0)
+        # Exception is swallowed; the other control still gets mirrored.
+        assert result[1] == 50.0
 
     def test_gain_exception_handled(self):
         from unittest.mock import MagicMock
@@ -2178,8 +2263,8 @@ class TestCallbackErrorBranches:
         )
         fn = _extract_callback(bp, "slider-gain")
         assert fn is not None
-        result = fn(5.0)
-        assert result == 5.0
+        result = _fire_slider(fn, "slider-gain", 5.0)
+        assert result[1] == 5.0
 
     def test_roi_apply_no_camera(self):
         bp = BeamProfiler(camera="simulated")
@@ -2230,3 +2315,178 @@ class TestCallbackErrorBranches:
             result = fn(1, False)
             settings_body = result[3]
             assert "No camera" in str(settings_body) or isinstance(settings_body, dbc.Accordion)
+
+
+# ─── Small branch coverage for helpers and callbacks ────────────────────────
+
+
+class TestIsReadonlyEAccessMode:
+    """``_is_readonly`` branches that depend on GenICam's ``EAccessMode``
+    enum — exercised only when a node exposes ``get_access_mode`` AND
+    ``genicam.genapi`` is importable (it is, in our dev env)."""
+
+    @pytest.mark.parametrize("mode_name", ["RO", "NA", "NI"])
+    def test_access_mode_readonly_states(self, mode_name: str):
+        # Import the real enum so the ``mode in (...)`` comparison hits
+        # the true branch inside the helper.
+        from genicam.genapi import EAccessMode  # ty: ignore[unresolved-import]
+
+        from pybeamprofiler.dash_app import _is_readonly
+
+        mode = getattr(EAccessMode, mode_name)
+
+        class Node:
+            def __init__(self, m):
+                self._m = m
+
+            def get_access_mode(self):
+                return self._m
+
+        assert _is_readonly(Node(mode)) is True
+
+    def test_access_mode_writable(self):
+        from genicam.genapi import EAccessMode  # ty: ignore[unresolved-import]
+
+        from pybeamprofiler.dash_app import _is_readonly
+
+        class Node:
+            def get_access_mode(self):
+                return EAccessMode.RW
+
+        assert _is_readonly(Node()) is False
+
+    def test_no_genicam_installed_returns_false(self):
+        """When ``genicam.genapi`` isn't importable the helper short-
+        circuits to ``False`` — we can't know whether the node is RO."""
+        from pybeamprofiler.dash_app import _is_readonly
+
+        class Node:
+            def get_access_mode(self):
+                return 3  # would match RO if the enum were loaded
+
+        with patch("pybeamprofiler.dash_app._EAccessMode", None):
+            assert _is_readonly(Node()) is False
+
+
+class TestBuildGenicamControlNumericCoercion:
+    """The numeric branch in ``_build_genicam_control`` is wrapped in a
+    ``try/except (TypeError, ValueError)`` so malformed min/max still
+    produce *something* instead of crashing the whole accordion."""
+
+    def test_non_numeric_min_falls_through(self):
+        """Min that can't be coerced to float must hit the
+        ``except (TypeError, ValueError): pass`` path (lines 557-558)."""
+        from pybeamprofiler.dash_app import _build_genicam_control
+
+        class WeirdNode:
+            value = "nope"
+            min = "nope"
+            max = "still nope"
+
+        class MockCam:
+            class node_map:
+                WeirdThing = WeirdNode()
+
+        # Should not raise; falls through to string/unknown fallback and
+        # ultimately returns *some* component (or None).  The important
+        # bit is that the except clause ran without propagating.
+        _build_genicam_control(MockCam(), "WeirdThing")
+
+
+class TestRoiControlsBranch:
+    """``_roi_controls`` swallows exceptions from ``cam.roi_info`` so a
+    flaky camera doesn't blow up the panel (lines 644-645)."""
+
+    def test_roi_info_raises_returns_none(self):
+        from pybeamprofiler.dash_app import _roi_controls
+
+        # Using ``__getattr__`` lets ``hasattr`` succeed on the first probe
+        # (returns a stub dict) but the subsequent ``getattr`` in the
+        # ``try/except`` block raises — simulating a camera whose state
+        # flipped between the two calls.
+        class FlakyCam:
+            def __init__(self) -> None:
+                self._n = 0
+
+            def set_roi(self, **_: Any) -> None:
+                pass
+
+            def __getattr__(self, name: str) -> Any:
+                if name == "roi_info":
+                    self._n += 1
+                    if self._n == 1:
+                        return {}
+                    raise RuntimeError("cable disconnected")
+                raise AttributeError(name)
+
+        assert _roi_controls(FlakyCam()) is None
+
+
+class TestBuildSettingItemsInfoNodeFailure:
+    """When a GenICam info node raises on ``.value`` access (e.g. a
+    disconnected device), ``_build_setting_items`` must keep going and
+    still render the rest of the accordion (lines 780-781)."""
+
+    def test_info_node_value_exception_is_swallowed(self):
+        bp = BeamProfiler(camera="simulated")
+        assert bp.camera is not None
+
+        class Boom:
+            @property
+            def value(self):
+                raise RuntimeError("no response")
+
+        # Wipe the eager device_* attrs so the code falls through into
+        # the node_map lookup branch we want to exercise. ``setattr`` is
+        # used here so ``ty`` doesn't trip over the narrower ``Camera``
+        # base type (the real attributes live on the subclasses).
+        cam: Any = bp.camera
+        setattr(cam, "device_model", None)
+        setattr(cam, "device_vendor", None)
+        setattr(cam, "serial_number", None)
+        nm: Any = getattr(cam, "node_map")
+        nm.DeviceModelName = Boom()
+        nm.DeviceVendorName = Boom()
+        nm.DeviceSerialNumber = Boom()
+
+        items = _build_setting_items(bp)
+        # We still get the accordion items — the info node failure was
+        # caught and the rest of rendering proceeded.
+        assert len(items) > 0
+
+
+class TestExposureGainNoneValue:
+    """If both slider and input fire with ``None`` (e.g. during initial
+    clearing), the paired callbacks must short-circuit to two
+    ``dash.no_update`` sentinels (lines 1680, 1711)."""
+
+    def test_set_exposure_both_none(self):
+        bp = BeamProfiler(camera="simulated")
+        fn = _extract_callback(bp, "slider-exposure")
+        assert fn is not None
+        with patch("pybeamprofiler.dash_app.ctx") as mock_ctx:
+            mock_ctx.triggered_id = "slider-exposure"
+            result = fn(None, None)
+        assert result == (dash.no_update, dash.no_update)
+
+    def test_set_gain_both_none(self):
+        bp = BeamProfiler(camera="simulated")
+        fn = _extract_callback(bp, "slider-gain")
+        assert fn is not None
+        with patch("pybeamprofiler.dash_app.ctx") as mock_ctx:
+            mock_ctx.triggered_id = "slider-gain"
+            result = fn(None, None)
+        assert result == (dash.no_update, dash.no_update)
+
+
+class TestApplyRoiMissingFields:
+    """``apply_roi`` returns a friendly message when any of the four
+    input boxes is empty (line 1744) — the Apply button on an
+    uninitialised form should not crash."""
+
+    def test_apply_roi_none_field(self):
+        bp = BeamProfiler(camera="simulated")
+        fn = _extract_callback(bp, "div-roi-status")
+        assert fn is not None
+        result = fn(1, None, 0, 512, 512)
+        assert "Please enter" in result

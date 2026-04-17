@@ -335,13 +335,11 @@ class TestHarvesterCameraGetImage:
 
     def test_get_image_wraps_timeout_exception(self):
         """get_image raises TimeoutError when no frame arrives within timeout."""
+        from harvesters.core import TimeoutException
+
         cam = self._make_camera()
         cam.is_acquiring = True
-
-        class TimeoutException(Exception):
-            pass
-
-        cam.ia.fetch.side_effect = TimeoutException("timed out")
+        cam.ia.fetch.side_effect = TimeoutException
 
         try:
             with pytest.raises(TimeoutError, match="did not deliver a frame"):

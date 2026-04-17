@@ -28,6 +28,13 @@ from .constants import (
     MAX_DISPLAY_DIM,
 )
 
+# Optional: only present when a real GenTL backend is installed. Used by
+# ``_is_readonly`` to map GenICam access modes to our read-only flag.
+try:
+    from genicam.genapi import EAccessMode as _EAccessMode  # ty: ignore[unresolved-import]
+except ImportError:  # pragma: no cover - exercised only on non-GenICam envs
+    _EAccessMode = None  # ty: ignore[invalid-assignment]
+
 if TYPE_CHECKING:
     from .beamprofiler import BeamProfiler
 
@@ -386,13 +393,13 @@ def _is_readonly(node: Any) -> bool:
     """Return ``True`` if the GenICam node is read-only."""
     if getattr(node, "_readonly", False):
         return True
+    if _EAccessMode is None:
+        return False
     try:
         access = getattr(node, "get_access_mode", None)
         if access is not None:
-            from genicam.genapi import EAccessMode  # ty: ignore[unresolved-import]
-
             mode = access()
-            if mode in (EAccessMode.RO, EAccessMode.NA, EAccessMode.NI):
+            if mode in (_EAccessMode.RO, _EAccessMode.NA, _EAccessMode.NI):
                 return True
     except Exception:
         pass
@@ -402,6 +409,59 @@ def _is_readonly(node: Any) -> bool:
 def _humanize(name: str) -> str:
     """``"AcquisitionFrameRate"`` → ``"Acquisition Frame Rate"``."""
     return re.sub(r"(?<=[a-z])(?=[A-Z])", " ", name)
+
+
+def _slider_with_input(
+    *,
+    slider_id: Any,
+    input_id: Any,
+    min_val: float,
+    max_val: float,
+    value: float,
+    step: float,
+    input_width: str = "110px",
+) -> html.Div:
+    """Render a slider paired with a narrow numeric input box.
+
+    The slider is for quick drag-to-set, the input on the right lets the
+    user type a precise value (debounced — only fires on Enter / blur).
+    Both are kept in sync by a matching callback elsewhere; this helper
+    just lays them out consistently.
+    """
+    return html.Div(
+        dbc.Row(
+            [
+                dbc.Col(
+                    dcc.Slider(
+                        id=slider_id,
+                        min=min_val,
+                        max=max_val,
+                        value=value,
+                        step=step,
+                        tooltip={"placement": "bottom", "always_visible": False},
+                        marks=None,
+                    ),
+                    className="pe-2",
+                ),
+                dbc.Col(
+                    dbc.Input(
+                        id=input_id,
+                        type="number",
+                        value=value,
+                        min=min_val,
+                        max=max_val,
+                        step=step,
+                        size="sm",
+                        debounce=True,
+                    ),
+                    width="auto",
+                    style={"width": input_width},
+                ),
+            ],
+            className="g-0 align-items-center",
+        ),
+        className="mb-2",
+    )
 
 
 def _build_genicam_control(cam: Any, feature_name: str) -> html.Div | None:
@@ -490,20 +550,16 @@ def _build_genicam_control(cam: Any, feature_name: str) -> html.Div | None:
             return html.Div(
                 [
                     label,
-                    dcc.Slider(
-                        id={"type": "genicam-num", "feature": feature_name},
-                        min=fmin,
-                        max=fmax,
+                    _slider_with_input(
+                        slider_id={"type": "genicam-num", "feature": feature_name},
+                        input_id={"type": "genicam-num-input", "feature": feature_name},
+                        min_val=fmin,
+                        max_val=fmax,
                         value=fval,
                         step=step,
-                        tooltip={"placement": "bottom", "always_visible": True},
-                        marks=None,
                     ),
                 ],
-                # Extra bottom margin leaves room for the always-visible
-                # value tooltip beneath the slider thumb so it doesn't
-                # overlap the next control's label.
-                style={"marginBottom": "1.75rem"},
+                className="mb-2",
             )
         except (TypeError, ValueError):
             pass
@@ -542,7 +598,7 @@ def _build_genicam_control(cam: Any, feature_name: str) -> html.Div | None:
 
 
 def _exposure_controls(cam: Any) -> list[Any]:
-    """Build the Exposure (ms) slider — always present."""
+    """Build the Exposure (ms) slider + numeric input — always present."""
     exp_min, exp_max = 0.001, 1.0
     er = getattr(cam, "exposure_range", None)
     if er is not None:
@@ -553,22 +609,19 @@ def _exposure_controls(cam: Any) -> list[Any]:
     exp_ms = (cam.exposure_time or 0.01) * 1000
     return [
         dbc.Label("Exposure (ms)", className="small mb-1"),
-        dcc.Slider(
-            id="slider-exposure",
-            min=round(exp_min * 1000, 3),
-            max=round(exp_max * 1000, 3),
+        _slider_with_input(
+            slider_id="slider-exposure",
+            input_id="input-exposure",
+            min_val=round(exp_min * 1000, 3),
+            max_val=round(exp_max * 1000, 3),
             value=round(exp_ms, 3),
             step=0.001,
-            tooltip={"placement": "bottom", "always_visible": True},
-            marks=None,
         ),
-        # Spacer for the always-visible tooltip beneath the slider thumb.
-        html.Div(style={"height": "1.75rem"}),
     ]
 
 
 def _gain_controls(cam: Any) -> list[Any]:
-    """Build the Gain slider — always present."""
+    """Build the Gain slider + numeric input — always present."""
     gain_min, gain_max = 0.0, 24.0
     gr = getattr(cam, "gain_range", None)
     if gr is not None:
@@ -578,17 +631,14 @@ def _gain_controls(cam: Any) -> list[Any]:
             pass
     return [
         dbc.Label("Gain", className="small mb-1"),
-        dcc.Slider(
-            id="slider-gain",
-            min=gain_min,
-            max=gain_max,
+        _slider_with_input(
+            slider_id="slider-gain",
+            input_id="input-gain",
+            min_val=gain_min,
+            max_val=gain_max,
             value=cam.gain or 0.0,
             step=0.1,
-            tooltip={"placement": "bottom", "always_visible": True},
-            marks=None,
         ),
-        # Spacer for the always-visible tooltip beneath the slider thumb.
-        html.Div(style={"height": "1.75rem"}),
     ]
 
 
@@ -1261,8 +1311,12 @@ _server_paused = False
 _recent_frame_times: collections.deque[float] = collections.deque(maxlen=20)
 
 # Rolling buffer for N-frame averaging. Recreated when N or shape changes.
+# Only the frames are retained here so we can subtract the frame that
+# falls out of the window; the mean is kept incrementally in
+# ``_avg_running_sum`` so each tick is O(H·W) rather than O(N·H·W).
 _avg_buffer: collections.deque[np.ndarray] = collections.deque(maxlen=1)
 _avg_buffer_shape: tuple[int, ...] | None = None
+_avg_running_sum: np.ndarray | None = None
 
 
 def _measured_fps() -> float:
@@ -1318,14 +1372,29 @@ def _build_status(bp: BeamProfiler, img: np.ndarray, frame_count: int) -> Any:
     return children
 
 
+def _reset_avg_state() -> None:
+    """Drop any cached averaging state (used on pause/resume, exposure
+    changes, ROI changes, etc. where frame contents change shape or
+    semantics)."""
+    global _avg_running_sum  # noqa: PLW0603
+    _avg_buffer.clear()
+    _avg_running_sum = None
+
+
 def _averaged_image(image: np.ndarray, n: int) -> np.ndarray:
     """Return a running mean of the last *n* frames including *image*.
+
+    Uses an incremental sum (one add per new frame, one subtract per
+    evicted frame) so the cost stays O(H·W) per call regardless of *n*
+    — critical for large sensors where stacking N frames into one array
+    would allocate hundreds of megabytes per tick and block the Dash
+    callback lock long enough for the camera's buffer ring to overflow.
 
     Resets the internal buffer when *n* or the frame shape changes, so
     callers don't have to worry about ROI changes mid-stream. Returns
     *image* unchanged when ``n == 1``.
     """
-    global _avg_buffer, _avg_buffer_shape  # noqa: PLW0603
+    global _avg_buffer, _avg_buffer_shape, _avg_running_sum  # noqa: PLW0603
 
     n = max(1, min(int(n), _MAX_AVG_FRAMES))
     if n == 1:
@@ -1333,19 +1402,26 @@ def _averaged_image(image: np.ndarray, n: int) -> np.ndarray:
             _avg_buffer = collections.deque(maxlen=1)
         _avg_buffer_shape = image.shape
         _avg_buffer.clear()
+        _avg_running_sum = None
         return image
 
-    if _avg_buffer.maxlen != n or _avg_buffer_shape != image.shape:
+    if _avg_buffer.maxlen != n or _avg_buffer_shape != image.shape or _avg_running_sum is None:
         _avg_buffer = collections.deque(maxlen=n)
         _avg_buffer_shape = image.shape
+        # Use float32 — enough precision for N ≤ 32 frames of uint8/uint16
+        # pixel values, half the memory of float64.
+        _avg_running_sum = np.zeros(image.shape, dtype=np.float32)
+
+    # Evict the frame that the deque will drop before appending, so the
+    # running sum stays in sync with the buffer contents.
+    if len(_avg_buffer) == n:
+        _avg_running_sum -= _avg_buffer[0]
 
     _avg_buffer.append(image)
-    if len(_avg_buffer) == 1:
-        return image
-    # Sum in float32 to avoid overflow then cast back to the source dtype
-    # so downstream code (saturation check, peak value) keeps its meaning.
-    stacked = np.stack(list(_avg_buffer)).astype(np.float32, copy=False)
-    return stacked.mean(axis=0).astype(image.dtype)
+    _avg_running_sum += image
+
+    mean = _avg_running_sum / len(_avg_buffer)
+    return mean.astype(image.dtype)
 
 
 def _register_callbacks(app: dash.Dash, bp: BeamProfiler) -> None:
@@ -1375,7 +1451,7 @@ def _register_callbacks(app: dash.Dash, bp: BeamProfiler) -> None:
                 else:
                     bp.camera.start_acquisition()
             _recent_frame_times.clear()
-            _avg_buffer.clear()
+            _reset_avg_state()
 
             items = _build_setting_items(bp)
 
@@ -1592,13 +1668,19 @@ def _register_callbacks(app: dash.Dash, bp: BeamProfiler) -> None:
             bp.pixel_size = val
         return round(bp.pixel_size, 4)
 
-    # -- Exposure slider ------------------------------------------------------
+    # -- Exposure slider + input (kept in sync) -------------------------------
     @app.callback(
         Output("slider-exposure", "value"),
+        Output("input-exposure", "value"),
         Input("slider-exposure", "value"),
+        Input("input-exposure", "value"),
         prevent_initial_call=True,
     )
-    def set_exposure(val: float) -> float:
+    def set_exposure(slider_val: float | None, input_val: float | None) -> tuple[Any, Any]:
+        trigger = ctx.triggered_id
+        val = slider_val if trigger == "slider-exposure" else input_val
+        if val is None:
+            return dash.no_update, dash.no_update
         if bp.camera is not None:
             with _callback_lock:
                 try:
@@ -1607,18 +1689,29 @@ def _register_callbacks(app: dash.Dash, bp: BeamProfiler) -> None:
                     if was_acquiring and not bp.camera.is_acquiring:
                         bp.camera.start_acquisition()
                     _recent_frame_times.clear()
-                    _avg_buffer.clear()
+                    _reset_avg_state()
                 except Exception as e:
                     logger.warning(f"Failed to set exposure: {e}")
-        return val
+        # Mirror the committed value to the *other* control only — echoing
+        # the triggering control would cause a pointless second callback
+        # round-trip and can jitter the slider thumb while the user drags.
+        if trigger == "slider-exposure":
+            return dash.no_update, val
+        return val, dash.no_update
 
-    # -- Gain slider ----------------------------------------------------------
+    # -- Gain slider + input (kept in sync) -----------------------------------
     @app.callback(
         Output("slider-gain", "value"),
+        Output("input-gain", "value"),
         Input("slider-gain", "value"),
+        Input("input-gain", "value"),
         prevent_initial_call=True,
     )
-    def set_gain(val: float) -> float:
+    def set_gain(slider_val: float | None, input_val: float | None) -> tuple[Any, Any]:
+        trigger = ctx.triggered_id
+        val = slider_val if trigger == "slider-gain" else input_val
+        if val is None:
+            return dash.no_update, dash.no_update
         if bp.camera is not None:
             with _callback_lock:
                 try:
@@ -1627,10 +1720,12 @@ def _register_callbacks(app: dash.Dash, bp: BeamProfiler) -> None:
                     if was_acquiring and not bp.camera.is_acquiring:
                         bp.camera.start_acquisition()
                     _recent_frame_times.clear()
-                    _avg_buffer.clear()
+                    _reset_avg_state()
                 except Exception as e:
                     logger.warning(f"Failed to set gain: {e}")
-        return val
+        if trigger == "slider-gain":
+            return dash.no_update, val
+        return val, dash.no_update
 
     # -- ROI apply (conditional) ----------------------------------------------
     has_roi = bp.camera is not None and hasattr(bp.camera, "set_roi")
@@ -1706,13 +1801,20 @@ def _register_callbacks(app: dash.Dash, bp: BeamProfiler) -> None:
 
         @app.callback(
             Output({"type": "genicam-num", "feature": MATCH}, "value"),
+            Output({"type": "genicam-num-input", "feature": MATCH}, "value"),
             Input({"type": "genicam-num", "feature": MATCH}, "value"),
+            Input({"type": "genicam-num-input", "feature": MATCH}, "value"),
             prevent_initial_call=True,
         )
-        def set_genicam_numeric(value: float | None) -> Any:
+        def set_genicam_numeric(
+            slider_val: float | None, input_val: float | None
+        ) -> tuple[Any, Any]:
+            trigger = ctx.triggered_id or {}
+            source = trigger.get("type") if isinstance(trigger, dict) else None
+            value = slider_val if source == "genicam-num" else input_val
             if value is None or bp.camera is None:
-                return dash.no_update
-            feature = ctx.triggered_id["feature"]
+                return dash.no_update, dash.no_update
+            feature = trigger["feature"]
             with _callback_lock:
                 nm = getattr(bp.camera, "node_map", None)
                 if nm is not None:
@@ -1725,7 +1827,10 @@ def _register_callbacks(app: dash.Dash, bp: BeamProfiler) -> None:
                                 bp.camera.start_acquisition()
                         except Exception as e:
                             logger.debug("Failed to set %s: %s", feature, e)
-            return value
+            # Mirror to the other control only (see set_exposure for rationale).
+            if source == "genicam-num":
+                return dash.no_update, value
+            return value, dash.no_update
 
         @app.callback(
             Output({"type": "genicam-sel", "feature": MATCH}, "value"),

@@ -10,6 +10,20 @@ from typing import Any, cast
 
 import numpy as np
 
+# Optional GenICam enums — only present when a real GenTL backend is
+# installed. We tolerate the import failure so the package still works
+# with the simulated camera on machines without the SDK.
+try:
+    from genicam.genapi import (  # ty: ignore[unresolved-import]
+        EInterfaceType as _EInterfaceType,
+    )
+    from genicam.genapi import (
+        EVisibility as _EVisibility,
+    )
+except ImportError:  # pragma: no cover - exercised only on non-GenICam envs
+    _EInterfaceType = None  # ty: ignore[invalid-assignment]
+    _EVisibility = None  # ty: ignore[invalid-assignment]
+
 logger = logging.getLogger(__name__)
 
 # Features handled by dedicated exposure / gain / ROI controls.
@@ -402,27 +416,23 @@ class Camera(ABC):
         if not hasattr(self, "node_map") or not self.node_map:
             return {}
 
-        # ── Import GenICam helpers ────────────────────────────────────
+        # ── GenICam helpers ───────────────────────────────────────────
         # Allowlist: only these interface types represent user-settable
-        # value nodes that can be rendered as UI controls.
+        # value nodes that can be rendered as UI controls. ``None`` means
+        # the optional ``genicam.genapi`` dep isn't installed — we then
+        # skip the interface/visibility filtering and rely on the
+        # ``.value`` probe alone to reject non-value nodes.
         allow_iface: set[int] = set()
         invisible_threshold: int | None = None
-        try:
-            from genicam.genapi import (  # ty: ignore[unresolved-import]
-                EInterfaceType,
-                EVisibility,
-            )
-
+        if _EInterfaceType is not None and _EVisibility is not None:
             allow_iface = {
-                int(EInterfaceType.intfIFloat),
-                int(EInterfaceType.intfIInteger),
-                int(EInterfaceType.intfIBoolean),
-                int(EInterfaceType.intfIEnumeration),
-                int(EInterfaceType.intfIString),
+                int(_EInterfaceType.intfIFloat),
+                int(_EInterfaceType.intfIInteger),
+                int(_EInterfaceType.intfIBoolean),
+                int(_EInterfaceType.intfIEnumeration),
+                int(_EInterfaceType.intfIString),
             }
-            invisible_threshold = int(EVisibility.Invisible)
-        except ImportError:
-            pass
+            invisible_threshold = int(_EVisibility.Invisible)
 
         # ── Enumerate candidate node names ────────────────────────────
         # Prefer node_map.nodes (reliable for real GenICam cameras)

@@ -5,14 +5,17 @@ from __future__ import annotations
 import logging
 import os
 import platform
+import time
 from typing import Any
 
 import numpy as np
 
 try:
     from harvesters.core import Harvester
+    from harvesters.core import TimeoutException as _HarvestersTimeout
 except ImportError:
     Harvester = None  # ty:ignore[invalid-assignment]
+    _HarvestersTimeout = None  # ty:ignore[invalid-assignment]
 
 from .camera import Camera
 
@@ -120,6 +123,12 @@ class HarvesterCamera(Camera):
         self._roi_offset_y: int = 0
         self.width: int = 0
         self.height: int = 0
+        # Time of the most recent successful frame. Used to detect when the
+        # producer has silently stalled (a known issue on some GenTL stacks
+        # after long-running acquisition) so ``get_image`` can attempt a
+        # stop/start recovery instead of timing out forever.
+        self._last_successful_fetch: float = 0.0
+        self._stall_recovery_attempted: bool = False
 
     @staticmethod
     def _parse_gentl_path(gentl_path: str) -> str | list[str] | None:
@@ -445,6 +454,8 @@ class HarvesterCamera(Camera):
         if not self.is_acquiring:
             self.ia.start()
             self.is_acquiring = True
+            self._last_successful_fetch = 0.0
+            self._stall_recovery_attempted = False
 
     def stop_acquisition(self) -> None:
         """Stop image acquisition on the GenTL producer."""
@@ -482,17 +493,48 @@ class HarvesterCamera(Camera):
         if timeout is None:
             timeout = max(2.0, (self.exposure_time or 0) + 2.0)
 
+        # One-shot stop/start recovery: if the producer has been silent for
+        # roughly ``max(5 s, 3× exposure)`` we assume the acquirer has
+        # stalled (a known issue on some GenTL stacks after long runs).
+        now = time.monotonic()
+        if self._last_successful_fetch and not self._stall_recovery_attempted:
+            stall_window = max(5.0, 3.0 * (self.exposure_time or 0.0))
+            if now - self._last_successful_fetch > stall_window:
+                logger.warning(
+                    "Acquisition appears stalled (no frame for %.1f s); "
+                    "attempting to recover by restarting acquisition.",
+                    now - self._last_successful_fetch,
+                )
+                self._stall_recovery_attempted = True
+                try:
+                    self.stop_acquisition()
+                    self.start_acquisition()
+                except Exception:
+                    logger.debug("Stall recovery failed", exc_info=True)
+
         try:
             with self.ia.fetch(timeout=timeout) as buffer:
                 component = buffer.payload.components[0]
                 self.width_pixels = component.width
                 self.height_pixels = component.height
-                return component.data.reshape(component.height, component.width).copy()
+                img = component.data.reshape(component.height, component.width).copy()
+            self._last_successful_fetch = time.monotonic()
+            self._stall_recovery_attempted = False
+            return img
         except Exception as exc:
-            # Harvesters raises various producer-specific exceptions on timeout;
-            # normalise them so callers only need to catch TimeoutError.
-            msg = str(exc).lower()
-            if isinstance(exc, TimeoutError) or "timeout" in msg or "timed out" in msg:
+            # Harvesters re-exports ``_gentl.TimeoutException`` which isn't a
+            # subclass of Python's built-in ``TimeoutError`` (they merely share
+            # a name), so we catch it explicitly and re-raise as ``TimeoutError``
+            # so callers can use a single, standard-library-only except clause.
+            is_timeout = isinstance(exc, TimeoutError) or (
+                _HarvestersTimeout is not None and isinstance(exc, _HarvestersTimeout)
+            )
+            if is_timeout:
+                # Seed the stall timer on the very first call so we don't
+                # falsely trigger recovery for a camera that simply hasn't
+                # warmed up yet.
+                if not self._last_successful_fetch:
+                    self._last_successful_fetch = now
                 raise TimeoutError(
                     f"Camera did not deliver a frame within {timeout:.1f} s. "
                     "Check that the camera is connected, powered, and not in "

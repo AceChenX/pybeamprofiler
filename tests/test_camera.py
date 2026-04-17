@@ -1,6 +1,8 @@
 """Tests for camera interfaces and control."""
 
 import os
+import time
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import numpy as np
@@ -577,6 +579,123 @@ class TestGenCameraSensorLookup:
         assert result is None
 
 
+class TestGenCameraGetImage:
+    """Test HarvesterCamera.get_image timeout normalisation and stall recovery."""
+
+    def _make_mock_camera(self):
+        from pybeamprofiler.gen_camera import HarvesterCamera
+
+        mock_harvester = MagicMock()
+        with patch("pybeamprofiler.gen_camera.Harvester", mock_harvester):
+            cam = HarvesterCamera()
+        cam.ia = MagicMock()
+        cam.is_acquiring = True
+        cam.exposure_time = 0.01
+        return cam
+
+    def test_harvesters_timeout_normalised(self):
+        """The real ``harvesters.core.TimeoutException`` maps to ``TimeoutError``."""
+        from harvesters.core import TimeoutException
+
+        cam = self._make_mock_camera()
+        cam.ia.fetch.side_effect = TimeoutException
+        with pytest.raises(TimeoutError, match="did not deliver a frame"):
+            cam.get_image(timeout=0.1)
+
+    def test_builtin_timeout_error_normalised(self):
+        """Python's built-in ``TimeoutError`` is also normalised (re-wrapped)."""
+        cam = self._make_mock_camera()
+        cam.ia.fetch.side_effect = TimeoutError("slow")
+        with pytest.raises(TimeoutError, match="did not deliver a frame"):
+            cam.get_image(timeout=0.1)
+
+    def test_non_timeout_exception_propagates(self):
+        """Non-timeout errors bubble up unchanged."""
+        cam = self._make_mock_camera()
+        cam.ia.fetch.side_effect = RuntimeError("bad buffer")
+        with pytest.raises(RuntimeError, match="bad buffer"):
+            cam.get_image(timeout=0.1)
+
+    def test_successful_fetch_resets_stall_state(self):
+        """A successful fetch clears the stall-recovery flags."""
+        cam = self._make_mock_camera()
+        cam._stall_recovery_attempted = True
+        cam._last_successful_fetch = 0.0
+
+        buf = MagicMock()
+        comp = MagicMock()
+        comp.width, comp.height = 4, 4
+        comp.data = np.zeros(16, dtype=np.uint8)
+        buf.__enter__.return_value.payload.components = [comp]
+        cam.ia.fetch.return_value = buf
+
+        img = cam.get_image(timeout=0.1)
+        assert img.shape == (4, 4)
+        assert cam._stall_recovery_attempted is False
+        assert cam._last_successful_fetch > 0.0
+
+    def test_stall_recovery_restarts_acquisition(self):
+        """Consecutive timeouts beyond the stall window trigger stop/start."""
+        from harvesters.core import TimeoutException
+
+        cam = self._make_mock_camera()
+        cam.ia.fetch.side_effect = TimeoutException
+        # Simulate a successful fetch 10s ago — beyond the 5s stall window
+        # at a 10 ms exposure.
+        cam._last_successful_fetch = time.monotonic() - 10.0
+
+        with pytest.raises(TimeoutError):
+            cam.get_image(timeout=0.1)
+
+        cam.ia.stop.assert_called()
+        cam.ia.start.assert_called()
+
+    def test_stall_recovery_is_one_shot(self):
+        """A second timeout within the same stall window doesn't re-trigger recovery."""
+        from harvesters.core import TimeoutException
+
+        cam = self._make_mock_camera()
+        cam.ia.fetch.side_effect = TimeoutException
+        cam._last_successful_fetch = time.monotonic() - 10.0
+
+        with pytest.raises(TimeoutError):
+            cam.get_image(timeout=0.1)
+        stop_calls = cam.ia.stop.call_count
+        start_calls = cam.ia.start.call_count
+
+        with pytest.raises(TimeoutError):
+            cam.get_image(timeout=0.1)
+
+        assert cam.ia.stop.call_count == stop_calls
+        assert cam.ia.start.call_count == start_calls
+
+    def test_first_timeout_seeds_stall_timer(self):
+        """The very first fetch timing out should NOT trigger recovery."""
+        from harvesters.core import TimeoutException
+
+        cam = self._make_mock_camera()
+        cam.ia.fetch.side_effect = TimeoutException
+        assert cam._last_successful_fetch == 0.0
+
+        with pytest.raises(TimeoutError):
+            cam.get_image(timeout=0.1)
+
+        cam.ia.stop.assert_not_called()
+        assert cam._last_successful_fetch > 0.0
+
+    def test_start_acquisition_resets_stall_state(self):
+        """`start_acquisition` clears stall tracking so pause/resume is safe."""
+        cam = self._make_mock_camera()
+        cam.is_acquiring = False
+        cam._last_successful_fetch = 123.0
+        cam._stall_recovery_attempted = True
+
+        cam.start_acquisition()
+
+        assert cam._last_successful_fetch == 0.0
+        assert cam._stall_recovery_attempted is False
+
+
 class TestBaslerCameraInit:
     """Test BaslerCamera initialization and CTI discovery."""
 
@@ -787,6 +906,35 @@ class TestFlirCameraInit:
         mock_harvester = MagicMock()
         with patch("pybeamprofiler.gen_camera.Harvester", mock_harvester):
             BaslerCamera()
+
+    @patch("pybeamprofiler.basler.os.environ", {})
+    @patch("pybeamprofiler.basler.BaslerCamera._find_basler_cti")
+    def test_basler_init_scalar_cti_string(self, mock_find):
+        """Defensive branch: if ``_find_basler_cti`` ever returns a scalar
+        string (instead of a list), ``BaslerCamera.__init__`` must still
+        handle it and log the singular-form message."""
+        from pybeamprofiler.basler import BaslerCamera
+
+        mock_find.return_value = "/some/single.cti"
+        mock_harvester = MagicMock()
+        with patch("pybeamprofiler.gen_camera.Harvester", mock_harvester):
+            BaslerCamera()
+        mock_find.assert_called_once()
+
+    @patch("pybeamprofiler.flir.platform.system")
+    @patch("pybeamprofiler.flir.os.path.isdir")
+    @patch("pybeamprofiler.flir.os.listdir")
+    def test_find_flir_cti_linux_listdir_oserror(self, mock_listdir, mock_isdir, mock_system):
+        """Per-directory ``os.listdir`` failure on Linux must be swallowed
+        and allow the search to continue (line 88-89)."""
+        from pybeamprofiler.flir import FlirCamera
+
+        mock_system.return_value = "Linux"
+        mock_isdir.return_value = True  # claims dir exists
+        mock_listdir.side_effect = OSError("EACCES")
+
+        # No exception propagates, we just get None back.
+        assert FlirCamera._find_flir_cti() is None
 
 
 class TestGenCameraDetection:
@@ -1995,6 +2143,164 @@ class TestDiscoverFeatures:
         all_features = [f for features in discovered.values() for f in features]
         assert "Gamma" in all_features
         assert "BadNode" not in all_features
+
+    def test_nodes_api_with_interface_type_and_visibility(self):
+        """Simulate a real GenICam ``node_map`` that exposes a ``.nodes``
+        iterable where each entry has ``principal_interface_type`` /
+        ``visibility`` / ``name``. This drives the SWIG-shaped branch
+        (lines 438-458) that ``dir()``-based discovery bypasses."""
+        from genicam.genapi import (  # ty: ignore[unresolved-import]
+            EInterfaceType,
+            EVisibility,
+        )
+
+        cam = SimulatedCamera()
+
+        ok_node = _SimulatedNode(1.0, min_val=0.0, max_val=4.0)
+        hidden_node = _SimulatedNode(0, min_val=0, max_val=100)
+        wrong_type_node = _SimulatedNode(0)
+        boom_node = _SimulatedNode(0)
+
+        class _NodeDescriptor:
+            def __init__(self, name: str, iface: int, vis: int) -> None:
+                self.name = name
+                self.principal_interface_type = iface
+                self.visibility = vis
+
+        class _BadDescriptor:
+            """A node that raises on every attribute access — the per-node
+            ``except`` in the loop must swallow it and continue."""
+
+            def __getattr__(self, _name: str) -> Any:
+                raise RuntimeError("swig binding crashed")
+
+        visible_float = _NodeDescriptor(
+            "CustomGamma",
+            int(EInterfaceType.intfIFloat),
+            int(EVisibility.Beginner),
+        )
+        # intfIValue(0) nodes go through the allowlist bypass at line 448.
+        generic_node = _NodeDescriptor("ValueNode", 0, int(EVisibility.Beginner))
+        # Expert visibility is below "Invisible" so it stays visible.
+        guru_node = _NodeDescriptor(
+            "GuruFeature",
+            int(EInterfaceType.intfIInteger),
+            int(EVisibility.Guru),
+        )
+        # Non-allowlisted interface type → continue.
+        wrong_iface = _NodeDescriptor(
+            "NotAValue", int(EInterfaceType.intfICategory), int(EVisibility.Beginner)
+        )
+        # Invisible → continue.
+        invisible = _NodeDescriptor(
+            "Secret",
+            int(EInterfaceType.intfIFloat),
+            int(EVisibility.Invisible),
+        )
+
+        class NodeMapWithNodesApi:
+            CustomGamma = ok_node
+            ValueNode = _SimulatedNode(42.0, min_val=0.0, max_val=100.0)
+            GuruFeature = hidden_node
+            NotAValue = wrong_type_node
+            Secret = boom_node
+            # Note: intentionally no ``Broken`` attribute — we want to
+            # prove the per-node except block runs cleanly.
+            nodes = [
+                visible_float,
+                generic_node,
+                guru_node,
+                wrong_iface,
+                invisible,
+                _BadDescriptor(),
+            ]
+
+        cam.node_map = NodeMapWithNodesApi()  # ty: ignore[invalid-assignment]
+        discovered = cam._discover_features()
+        flat = [f for features in discovered.values() for f in features]
+
+        assert "CustomGamma" in flat
+        assert "ValueNode" in flat  # intfIValue(0) bypass path
+        assert "GuruFeature" in flat  # Guru < Invisible threshold
+        assert "NotAValue" not in flat
+        assert "Secret" not in flat
+
+    def test_nodes_api_without_genicam_enum(self):
+        """If ``genicam.genapi`` isn't importable at all, the allowlist /
+        visibility filters are disabled and every named node is kept.
+        We simulate "not installed" by nulling out the module-level
+        handles the helper consults."""
+        cam = SimulatedCamera()
+
+        class Desc:
+            def __init__(self, name: str) -> None:
+                self.name = name
+
+        class NodeMap:
+            Foo = _SimulatedNode(1.0, min_val=0.0, max_val=10.0)
+            Bar = _SimulatedNode(2.0, min_val=0.0, max_val=10.0)
+            nodes = [Desc("Foo"), Desc("Bar")]
+
+        cam.node_map = NodeMap()  # ty: ignore[invalid-assignment]
+
+        with (
+            patch("pybeamprofiler.camera._EInterfaceType", None),
+            patch("pybeamprofiler.camera._EVisibility", None),
+        ):
+            discovered = cam._discover_features()
+
+        flat = [f for features in discovered.values() for f in features]
+        assert "Foo" in flat
+        assert "Bar" in flat
+
+    def test_nodes_api_raises_falls_back_to_dir(self):
+        """If iterating ``node_map.nodes`` itself blows up, the helper
+        must log and fall back to ``dir()``-based discovery (line 461).
+        Using a ``@property`` that raises is the simplest model."""
+        cam = SimulatedCamera()
+
+        class NodeMap:
+            Gamma = _SimulatedNode(1.0, min_val=0.0, max_val=4.0)
+
+            @property
+            def nodes(self) -> list[Any]:
+                raise RuntimeError("SWIG dead")
+
+        cam.node_map = NodeMap()  # ty: ignore[invalid-assignment]
+        discovered = cam._discover_features()
+        flat = [f for features in discovered.values() for f in features]
+        assert "Gamma" in flat  # dir() fallback still picked it up
+
+    def test_scalar_attribute_is_skipped(self):
+        """Attributes whose value is already a plain scalar (str/int/etc)
+        are rejected before the ``.value`` probe (line 493)."""
+        cam = SimulatedCamera()
+
+        class NodeMap:
+            Gamma = _SimulatedNode(1.0, min_val=0.0, max_val=4.0)
+            NotANode = "raw string"  # bare str → skipped
+            AlsoNot = 42  # bare int → skipped
+
+        cam.node_map = NodeMap()  # ty: ignore[invalid-assignment]
+        discovered = cam._discover_features()
+        flat = [f for features in discovered.values() for f in features]
+        assert "Gamma" in flat
+        assert "NotANode" not in flat
+        assert "AlsoNot" not in flat
+
+    def test_none_attribute_is_skipped(self):
+        """An attribute whose value is ``None`` must be skipped (line 490)."""
+        cam = SimulatedCamera()
+
+        class NodeMap:
+            Gamma = _SimulatedNode(1.0, min_val=0.0, max_val=4.0)
+            NoneAttr = None
+
+        cam.node_map = NodeMap()  # ty: ignore[invalid-assignment]
+        discovered = cam._discover_features()
+        flat = [f for features in discovered.values() for f in features]
+        assert "Gamma" in flat
+        assert "NoneAttr" not in flat
 
 
 class TestDiscoverFeaturesIntegration:

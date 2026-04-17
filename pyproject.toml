@@ -103,3 +103,10 @@ indent-style = "space"
 
 [tool.ty.environment]
 python-version = "3.10"
+
+[tool.ty.rules]
+# ``# ty: ignore[unresolved-import]`` directives in the source are needed on
+# CI runners where optional camera SDKs (genicam, harvesters) aren't
+# installed. With them installed locally, ty would otherwise complain about
+# the directive being unused.
+unused-ignore-comment = "ignore"
