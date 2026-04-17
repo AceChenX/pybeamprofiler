@@ -9,8 +9,8 @@ DEFAULT_PIXEL_SIZE = 1.0  # micrometers
 SIMULATED_WIDTH = 1024  # pixels
 SIMULATED_HEIGHT = 1024  # pixels
 SIMULATED_PIXEL_SIZE = 5.0  # micrometers
-SIMULATED_SIGMA_X = 150  # pixels, typical beam width
-SIMULATED_SIGMA_Y = 140  # pixels, slightly elliptical
+SIMULATED_SIGMA_X = 50  # pixels, ~1 mm 1/e² width at 5 µm/px (typical lab laser)
+SIMULATED_SIGMA_Y = 45  # pixels, slightly elliptical (~0.9 mm)
 SIMULATED_AMPLITUDE = 200  # intensity units (below 255 to avoid saturation)
 SIMULATED_BACKGROUND = 10  # baseline intensity
 

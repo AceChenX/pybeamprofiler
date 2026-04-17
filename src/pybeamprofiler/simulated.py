@@ -140,8 +140,8 @@ class SimulatedCamera(Camera):
         self._amplitude = SIMULATED_AMPLITUDE
         self._background = SIMULATED_BACKGROUND
 
-        self._noise_center = 50.0
-        self._noise_sigma = 20.0
+        self._noise_center = 17.0
+        self._noise_sigma = 7.0
         self._noise_amp = 25.0
         self._noise_bg = 10.0
         self._noise_image = 10.0
