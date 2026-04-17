@@ -388,7 +388,7 @@ def _is_readonly(node: Any) -> bool:
     try:
         access = getattr(node, "get_access_mode", None)
         if access is not None:
-            from genicam.genapi import EAccessMode
+            from genicam.genapi import EAccessMode  # ty: ignore[unresolved-import]
 
             mode = access()
             if mode in (EAccessMode.RO, EAccessMode.NA, EAccessMode.NI):

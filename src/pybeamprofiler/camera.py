@@ -408,7 +408,10 @@ class Camera(ABC):
         allow_iface: set[int] = set()
         invisible_threshold: int | None = None
         try:
-            from genicam.genapi import EInterfaceType, EVisibility
+            from genicam.genapi import (  # ty: ignore[unresolved-import]
+                EInterfaceType,
+                EVisibility,
+            )
 
             allow_iface = {
                 int(EInterfaceType.intfIFloat),
