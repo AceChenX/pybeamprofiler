@@ -63,12 +63,12 @@ test = [
 ]
 dev = [
     "pybeamprofiler[test]",
-    "ruff>=0.15.0",
-    "ty>=0.0.25",
-    "pre-commit>=4.5.0",
+    "ruff>=0.15",
+    "ty>=0.0.30",
+    "pre-commit>=4.5",
 ]
 matplotlib = [
-    "matplotlib>=3.0",  # Optional fallback for command-line streaming
+    "matplotlib>=3.10",  # Optional fallback for command-line streaming
 ]
 
 [tool.pytest.ini_options]

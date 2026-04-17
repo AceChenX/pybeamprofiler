@@ -427,6 +427,22 @@ def _build_genicam_control(cam: Any, feature_name: str) -> html.Div | None:
     readonly = _is_readonly(node)
     label = dbc.Label(_humanize(feature_name), className="small mb-1")
 
+    def _readonly_row(value_text: str) -> html.Div:
+        """Render a label/value pair as a flex row so the value is
+        right-aligned with a clear gap from the label (avoids text
+        running together when both fit on one line)."""
+        return html.Div(
+            [
+                dbc.Label(_humanize(feature_name), className="small text-muted mb-0 me-2"),
+                html.Span(
+                    value_text,
+                    className="small text-end",
+                    style={"wordBreak": "break-word"},
+                ),
+            ],
+            className="mb-2 d-flex justify-content-between align-items-baseline",
+        )
+
     # ── Boolean ───────────────────────────────────────────────────
     if isinstance(current_val, bool):
         return html.Div(
@@ -467,10 +483,7 @@ def _build_genicam_control(cam: Any, feature_name: str) -> html.Div | None:
         try:
             fmin, fmax, fval = float(node_min), float(node_max), float(current_val)
             if readonly:
-                return html.Div(
-                    [label, html.Span(f"{fval:g}", className="small text-muted")],
-                    className="mb-2",
-                )
+                return _readonly_row(f"{fval:g}")
             is_int = isinstance(current_val, int) and isinstance(node_min, int)
             step = 1 if is_int else round((fmax - fmin) / 1000, 6) or 0.001
             return html.Div(
@@ -486,17 +499,17 @@ def _build_genicam_control(cam: Any, feature_name: str) -> html.Div | None:
                         marks=None,
                     ),
                 ],
-                className="mb-3",
+                # Extra bottom margin leaves room for the always-visible
+                # value tooltip beneath the slider thumb so it doesn't
+                # overlap the next control's label.
+                style={"marginBottom": "1.75rem"},
             )
         except (TypeError, ValueError):
             pass
 
     # ── Read-only / unknown string → text display ─────────────────
     if readonly or (isinstance(current_val, str) and not current_val):
-        return html.Div(
-            [label, html.Span(str(current_val), className="small text-muted")],
-            className="mb-2",
-        )
+        return _readonly_row(str(current_val))
 
     # ── String fallback (Enable / Auto without symbolics) ─────────
     if isinstance(current_val, str):
@@ -511,7 +524,7 @@ def _build_genicam_control(cam: Any, feature_name: str) -> html.Div | None:
                 label,
                 dbc.Select(
                     id={"type": "genicam-sel", "feature": feature_name},
-                    options=opts,
+                    options=opts,  # ty: ignore[invalid-argument-type]
                     value=current_val,
                     size="sm",
                 ),
@@ -548,7 +561,8 @@ def _exposure_controls(cam: Any) -> list[Any]:
             tooltip={"placement": "bottom", "always_visible": True},
             marks=None,
         ),
-        html.Div(className="mb-3"),
+        # Spacer for the always-visible tooltip beneath the slider thumb.
+        html.Div(style={"height": "1.75rem"}),
     ]
 
 
@@ -572,7 +586,8 @@ def _gain_controls(cam: Any) -> list[Any]:
             tooltip={"placement": "bottom", "always_visible": True},
             marks=None,
         ),
-        html.Div(className="mb-3"),
+        # Spacer for the always-visible tooltip beneath the slider thumb.
+        html.Div(style={"height": "1.75rem"}),
     ]
 
 

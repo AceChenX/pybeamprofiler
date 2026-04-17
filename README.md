@@ -91,20 +91,6 @@ See [the API docs](https://github.com/acechenx/pybeamprofiler) for fitting metho
 - **Jupyter camera stuck** — restart the kernel to release the hardware lock.
 - **Basler USB3** — pass the USB3 CTI explicitly: `BaslerCamera(cti_file="/path/to/ProducerU3V.cti")`.
 
-## License
-
-MIT — see [LICENSE](LICENSE).
-
-## Author
-
-C.-A. Chen (acechen@cirx.org)
-
-## Acknowledgments
-
-- Built on [Harvesters](https://github.com/genicam/harvesters), [Plotly/Dash](https://plotly.com/dash/)
-- Inspired by LaseView (old freeware), [ptomato/Beams](https://github.com/ptomato/Beams), [jordens/bullseye](https://github.com/jordens/bullseye)
-- FLIR and Basler cameras loaned from [Atom Computing](https://atom-computing.com/) for testing
-
 ---
 
 ## For Developers
@@ -163,3 +149,19 @@ Current suite: **474 tests, 93% coverage**.
 ### Supported sensors
 
 Auto-detected pixel sizes (40+ models) — Sony IMX174, IMX183, IMX226, IMX249, IMX250, IMX252, IMX253, IMX255, IMX264, IMX265, IMX273, IMX287, IMX290, IMX291, IMX304, IMX392, IMX412, IMX477, IMX485, IMX530, IMX531, IMX540, IMX541, IMX542, IMX547, and direct Basler model lookups (acA4024-8gm, acA4024-29um, acA1920-155um, acA2440-75um, acA3800-14um).
+
+---
+
+## License
+
+MIT — see [LICENSE](LICENSE).
+
+## Author
+
+C.-A. Chen (acechen@cirx.org)
+
+## Acknowledgments
+
+- Built on [Harvesters](https://github.com/genicam/harvesters), [Plotly/Dash](https://plotly.com/dash/)
+- Inspired by LaseView (old freeware), [ptomato/Beams](https://github.com/ptomato/Beams), [jordens/bullseye](https://github.com/jordens/bullseye)
+- FLIR and Basler cameras loaned from [Atom Computing](https://atom-computing.com/) for testing

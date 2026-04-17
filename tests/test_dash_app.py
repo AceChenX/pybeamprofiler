@@ -1180,6 +1180,693 @@ class TestAveragedImage:
         da._averaged_image(np.zeros((4, 4), dtype=np.uint8), _MAX_AVG_FRAMES + 100)
         assert da._avg_buffer.maxlen == _MAX_AVG_FRAMES
 
+    def test_n_zero_or_negative_treated_as_one(self):
+        from pybeamprofiler import dash_app as da
+
+        da._avg_buffer.clear()
+        img = np.full((4, 4), 7, dtype=np.uint8)
+        out = da._averaged_image(img, 0)
+        assert np.array_equal(out, img)
+        out = da._averaged_image(img, -3)
+        assert np.array_equal(out, img)
+
+    def test_uses_source_dtype_after_averaging(self):
+        """Averaged frame must keep the source dtype so saturation math stays sane."""
+        from pybeamprofiler import dash_app as da
+
+        da._avg_buffer.clear()
+        a = np.full((4, 4), 100, dtype=np.uint16)
+        b = np.full((4, 4), 200, dtype=np.uint16)
+        da._averaged_image(a, 2)
+        out = da._averaged_image(b, 2)
+        assert out.dtype == np.uint16
+
+
+# ─── _measured_fps and _build_status helpers ──────────────────────────────
+
+
+class TestMeasuredFps:
+    def test_empty_returns_zero(self):
+        from pybeamprofiler import dash_app as da
+
+        da._recent_frame_times.clear()
+        assert da._measured_fps() == 0.0
+
+    def test_single_sample_returns_zero(self):
+        from pybeamprofiler import dash_app as da
+
+        da._recent_frame_times.clear()
+        da._recent_frame_times.append(1.0)
+        assert da._measured_fps() == 0.0
+
+    def test_zero_span_returns_zero(self):
+        from pybeamprofiler import dash_app as da
+
+        da._recent_frame_times.clear()
+        da._recent_frame_times.append(5.0)
+        da._recent_frame_times.append(5.0)
+        assert da._measured_fps() == 0.0
+
+    def test_positive_span_returns_rate(self):
+        from pybeamprofiler import dash_app as da
+
+        da._recent_frame_times.clear()
+        for t in (0.0, 0.1, 0.2, 0.3):
+            da._recent_frame_times.append(t)
+        assert da._measured_fps() == pytest.approx(10.0)
+
+
+class TestBuildStatus:
+    def test_no_camera_only_frame(self):
+        from pybeamprofiler import dash_app as da
+
+        da._recent_frame_times.clear()
+        bp = BeamProfiler(camera="simulated")
+        bp.camera = None
+        children = da._build_status(bp, np.zeros((4, 4), dtype=np.uint8), 7)
+        text = str(children)
+        assert "Frame #7" in text
+        assert "Exp" not in text and "Gain" not in text
+
+    def test_with_camera_includes_exposure_and_gain(self):
+        from pybeamprofiler import dash_app as da
+
+        da._recent_frame_times.clear()
+        bp = BeamProfiler(camera="simulated")
+        children = da._build_status(bp, np.zeros((4, 4), dtype=np.uint8), 1)
+        text = str(children)
+        assert "Exp" in text
+        assert "Gain" in text
+
+    def test_long_exposure_renders_seconds(self):
+        from pybeamprofiler import dash_app as da
+
+        bp = BeamProfiler(camera="simulated")
+        assert bp.camera is not None
+        bp.camera.set_exposure(2.5)
+        children = da._build_status(bp, np.zeros((4, 4), dtype=np.uint8), 1)
+        text = str(children)
+        assert "2.50 s" in text
+
+    def test_saturation_warning_appears(self):
+        from pybeamprofiler import dash_app as da
+
+        bp = BeamProfiler(camera="simulated")
+        bp.camera = None
+        img = np.zeros((100, 100), dtype=np.uint8)
+        img[:5, :] = 255  # 5% saturated, well above the 0.1% threshold
+        children = da._build_status(bp, img, 1)
+        text = str(children)
+        assert "saturated" in text
+        assert "5.0%" in text
+
+    def test_no_saturation_warning_below_threshold(self):
+        from pybeamprofiler import dash_app as da
+
+        bp = BeamProfiler(camera="simulated")
+        bp.camera = None
+        img = np.zeros((100, 100), dtype=np.uint8)
+        img[0, 0] = 255  # 0.01%, below the 0.1% threshold
+        children = da._build_status(bp, img, 1)
+        assert "saturated" not in str(children)
+
+
+# ─── update_live extra branches ───────────────────────────────────────────
+
+
+class TestUpdateLiveExtraBranches:
+    """Cover the timeout, lock-contention and definition-change branches."""
+
+    @staticmethod
+    def _get_update_fn(bp: BeamProfiler):
+        return _extract_callback(bp, "live-graph")
+
+    def test_timeout_returns_no_update(self):
+        from unittest.mock import MagicMock
+
+        bp = BeamProfiler(camera="simulated")
+        assert bp.camera is not None
+        bp.camera.start_acquisition()
+        bp.camera.get_image = MagicMock(  # ty: ignore[invalid-assignment]
+            side_effect=TimeoutError("no frame")
+        )
+        fn = self._get_update_fn(bp)
+        assert fn is not None
+        result = fn(1, False, True, "Hot", True, None, None, 0, "1d", "gaussian", True, 1)
+        assert all(isinstance(r, dash._no_update.NoUpdate) for r in result)
+
+    def test_lock_contention_returns_no_update(self):
+        from pybeamprofiler import dash_app as da
+
+        bp = BeamProfiler(camera="simulated")
+        assert bp.camera is not None
+        bp.camera.start_acquisition()
+        fn = self._get_update_fn(bp)
+        assert fn is not None
+        # Hold the lock from another "thread" (simulated via direct acquire).
+        assert da._callback_lock.acquire(blocking=False)
+        try:
+            result = fn(1, False, True, "Hot", True, None, None, 0, "1d", "gaussian", True, 1)
+            assert all(isinstance(r, dash._no_update.NoUpdate) for r in result)
+        finally:
+            da._callback_lock.release()
+
+    def test_definition_change_propagates(self):
+        bp = BeamProfiler(camera="simulated")
+        assert bp.camera is not None
+        bp.camera.start_acquisition()
+        bp.definition = "gaussian"
+        fn = self._get_update_fn(bp)
+        assert fn is not None
+        fn(1, False, True, "Hot", True, None, None, 0, "1d", "fwhm", True, 1)
+        assert bp.definition == "fwhm"
+
+    def test_manual_zmax_uses_user_value(self):
+        """When auto-range is off and zmax is provided, it should be honoured."""
+        from unittest.mock import patch
+
+        bp = BeamProfiler(camera="simulated")
+        assert bp.camera is not None
+        bp.camera.start_acquisition()
+        fn = self._get_update_fn(bp)
+        assert fn is not None
+        with patch("pybeamprofiler.dash_app.build_figure") as mock_bf:
+            mock_bf.return_value = "FIG"
+            fn(1, False, True, "Hot", False, 10.0, 200.0, 0, "1d", "gaussian", True, 1)
+            kwargs = mock_bf.call_args.kwargs
+            assert kwargs["zmin"] == 10.0
+            assert kwargs["zmax"] == 200.0
+
+    def test_manual_zmax_falls_back_to_dtype_max(self):
+        """When auto-range is off and zmax is None, the dtype max is used."""
+        from unittest.mock import patch
+
+        bp = BeamProfiler(camera="simulated")
+        assert bp.camera is not None
+        bp.camera.start_acquisition()
+        fn = self._get_update_fn(bp)
+        assert fn is not None
+        with patch("pybeamprofiler.dash_app.build_figure") as mock_bf:
+            mock_bf.return_value = "FIG"
+            fn(1, False, True, "Hot", False, None, None, 0, "1d", "gaussian", True, 1)
+            assert mock_bf.call_args.kwargs["zmax"] == 255.0
+
+
+# ─── side-effect callbacks (pause / exposure) clear avg buffer ────────────
+
+
+class TestPauseClearsAvgBuffer:
+    def test_pause_clears_buffer(self):
+        from pybeamprofiler import dash_app as da
+
+        bp = BeamProfiler(camera="simulated")
+        assert bp.camera is not None
+        # Prime the buffer with one frame.
+        da._averaged_image(np.zeros((4, 4), dtype=np.uint8), 4)
+        assert len(da._avg_buffer) == 1
+        fn = _extract_callback(bp, "store-paused")
+        assert fn is not None
+        fn(1, False)
+        assert len(da._avg_buffer) == 0
+
+    def test_exposure_change_clears_buffer(self):
+        from pybeamprofiler import dash_app as da
+
+        bp = BeamProfiler(camera="simulated")
+        assert bp.camera is not None
+        da._averaged_image(np.zeros((4, 4), dtype=np.uint8), 4)
+        assert len(da._avg_buffer) == 1
+        fn = _extract_callback(bp, "slider-exposure")
+        assert fn is not None
+        fn(50.0)
+        assert len(da._avg_buffer) == 0
+
+
+# ─── create_app handles initial-frame failure gracefully ──────────────────
+
+
+class TestCreateAppInitialFrame:
+    def test_initial_frame_exception_logged(self, caplog):
+        """If the first ``get_image`` call raises, ``create_app`` should log
+        a warning and still return a working app with an empty figure."""
+        import logging
+        from unittest.mock import MagicMock
+
+        bp = BeamProfiler(camera="simulated")
+        assert bp.camera is not None
+        bp.camera.get_image = MagicMock(  # ty: ignore[invalid-assignment]
+            side_effect=RuntimeError("boom")
+        )
+        with caplog.at_level(logging.WARNING):
+            app = create_app(bp)
+        assert app is not None
+        assert any("Could not grab initial frame" in r.message for r in caplog.records)
+
+
+# ─── update_live: img-is-None and outer exception branches ────────────────
+
+
+class TestUpdateLiveImgPaths:
+    @staticmethod
+    def _get_update_fn(bp: BeamProfiler):
+        return _extract_callback(bp, "live-graph")
+
+    def test_no_image_returns_no_update(self):
+        from unittest.mock import MagicMock
+
+        bp = BeamProfiler(camera="simulated")
+        assert bp.camera is not None
+        bp.camera.start_acquisition()
+        bp.camera.get_image = MagicMock(  # ty: ignore[invalid-assignment]
+            return_value=None
+        )
+        fn = self._get_update_fn(bp)
+        assert fn is not None
+        result = fn(1, False, True, "Hot", True, None, None, 0, "1d", "gaussian", True, 1)
+        assert all(isinstance(r, dash._no_update.NoUpdate) for r in result)
+
+    def test_static_mode_uses_last_img(self):
+        """Non-camera mode should source img from ``bp.last_img``."""
+        bp = BeamProfiler(camera="simulated")
+        assert bp.camera is not None
+        bp.last_img = bp.camera.get_image()
+        bp._mode = "file"
+        bp.camera = None
+        fn = self._get_update_fn(bp)
+        assert fn is not None
+        result = fn(1, False, True, "Hot", True, None, None, 0, "1d", "gaussian", True, 1)
+        assert hasattr(result[0], "data")
+        assert result[3] == 1
+
+    def test_outer_exception_returns_no_update(self):
+        """Any exception during analyze should be caught and logged."""
+        from unittest.mock import MagicMock
+
+        bp = BeamProfiler(camera="simulated")
+        assert bp.camera is not None
+        bp.camera.start_acquisition()
+        bp.analyze = MagicMock(  # ty: ignore[invalid-assignment]
+            side_effect=RuntimeError("explode")
+        )
+        fn = self._get_update_fn(bp)
+        assert fn is not None
+        result = fn(1, False, True, "Hot", True, None, None, 0, "1d", "gaussian", True, 1)
+        assert all(isinstance(r, dash._no_update.NoUpdate) for r in result)
+
+
+# ─── slider restart-on-stopped branches ───────────────────────────────────
+
+
+class TestSliderRestartBranches:
+    """When a setter call stops the camera, the slider callback restarts it."""
+
+    def test_set_exposure_restarts_when_stopped(self):
+        from unittest.mock import MagicMock
+
+        bp = BeamProfiler(camera="simulated")
+        assert bp.camera is not None
+        cam = bp.camera
+        cam.start_acquisition()
+        assert cam.is_acquiring
+
+        original_set = cam.set_exposure
+
+        def stop_then_set(v):
+            cam.stop_acquisition()
+            original_set(v)
+
+        cam.set_exposure = MagicMock(  # ty: ignore[invalid-assignment]
+            side_effect=stop_then_set
+        )
+        fn = _extract_callback(bp, "slider-exposure")
+        assert fn is not None
+        fn(50.0)
+        assert cam.is_acquiring
+
+    def test_set_gain_restarts_when_stopped(self):
+        from unittest.mock import MagicMock
+
+        bp = BeamProfiler(camera="simulated")
+        assert bp.camera is not None
+        cam = bp.camera
+        cam.start_acquisition()
+
+        original_set = cam.set_gain
+
+        def stop_then_set(v):
+            cam.stop_acquisition()
+            original_set(v)
+
+        cam.set_gain = MagicMock(  # ty: ignore[invalid-assignment]
+            side_effect=stop_then_set
+        )
+        fn = _extract_callback(bp, "slider-gain")
+        assert fn is not None
+        fn(3.0)
+        assert cam.is_acquiring
+
+
+# ─── ROI extra branches ───────────────────────────────────────────────────
+
+
+class TestROIExtraBranches:
+    @staticmethod
+    def _find(bp: BeamProfiler, key: str):
+        from pybeamprofiler.dash_app import _register_callbacks
+
+        app = dash.Dash(__name__)
+        app.layout = html.Div()
+        captured: dict[str, Any] = {}
+        original = app.callback
+
+        def tracking(*args, **kwargs):
+            def deco(f):
+                captured[str(args)] = f
+                return original(*args, **kwargs)(f)
+
+            return deco
+
+        app.callback = tracking  # ty: ignore[invalid-assignment]
+        _register_callbacks(app, bp)
+        for k, fn in captured.items():
+            if key in k:
+                return fn
+        return None
+
+    def test_apply_roi_exception_returns_error_string(self):
+        from unittest.mock import MagicMock
+
+        bp = BeamProfiler(camera="simulated")
+        assert bp.camera is not None
+        bp.camera.start_acquisition()
+        bp.camera.set_roi = MagicMock(  # ty: ignore[unresolved-attribute]
+            side_effect=RuntimeError("bad roi")
+        )
+        fn = self._find(bp, "div-roi-status")
+        assert fn is not None
+        result = fn(1, 0, 0, 100, 100)
+        assert "Error" in result and "bad roi" in result
+
+    def test_reset_roi_no_camera_returns_no_camera(self):
+        bp = BeamProfiler(camera="simulated")
+        bp.camera = None
+        fn = self._find(bp, "btn-roi-reset")
+        # When the camera is missing, the ROI callback isn't even registered
+        # (``has_roi`` is False), so we re-register with a real camera then
+        # null it before calling.  This exercises the in-callback guard.
+        bp.camera = BeamProfiler(camera="simulated").camera
+        fn = self._find(bp, "btn-roi-reset")
+        assert fn is not None
+        bp.camera = None
+        assert fn(1) == (0, 0, 0, 0, "No camera")
+
+    def test_reset_roi_restarts_when_was_acquiring(self):
+        bp = BeamProfiler(camera="simulated")
+        assert bp.camera is not None
+        bp.camera.start_acquisition()
+        assert bp.camera.is_acquiring
+        fn = self._find(bp, "btn-roi-reset")
+        assert fn is not None
+        result = fn(1)
+        assert result[4] == "Reset to full sensor"
+        assert bp.camera.is_acquiring  # restarted
+
+    def test_reset_roi_exception_returns_error_tuple(self):
+        from unittest.mock import MagicMock
+
+        bp = BeamProfiler(camera="simulated")
+        assert bp.camera is not None
+        bp.camera.set_roi = MagicMock(  # ty: ignore[unresolved-attribute]
+            side_effect=RuntimeError("bad reset")
+        )
+        fn = self._find(bp, "btn-roi-reset")
+        assert fn is not None
+        result = fn(1)
+        assert result[:4] == (0, 0, 0, 0)
+        assert "Error" in result[4]
+
+
+# ─── GenICam pattern-matching extra branches ──────────────────────────────
+
+
+class TestGenicamCallbackBranches:
+    @staticmethod
+    def _capture(bp: BeamProfiler) -> dict[str, Any]:
+        from pybeamprofiler.dash_app import _register_callbacks
+
+        app = dash.Dash(__name__)
+        app.layout = html.Div()
+        captured: dict[str, Any] = {}
+        original = app.callback
+
+        def tracking(*args, **kwargs):
+            def deco(f):
+                captured[str(args)] = f
+                return original(*args, **kwargs)(f)
+
+            return deco
+
+        app.callback = tracking  # ty: ignore[invalid-assignment]
+        _register_callbacks(app, bp)
+        return captured
+
+    def _find(self, captured: dict[str, Any], key: str):
+        for k, fn in captured.items():
+            if key in k:
+                return fn
+        return None
+
+    def test_select_none_value_returns_no_update(self):
+        bp = BeamProfiler(camera="simulated")
+        captured = self._capture(bp)
+        fn = self._find(captured, "genicam-sel")
+        assert fn is not None
+        assert isinstance(fn(None), dash._no_update.NoUpdate)
+
+    def test_switch_no_camera_returns_no_update(self):
+        bp = BeamProfiler(camera="simulated")
+        captured = self._capture(bp)
+        fn = self._find(captured, "genicam-sw")
+        assert fn is not None
+        bp.camera = None
+        assert isinstance(fn(True), dash._no_update.NoUpdate)
+
+    def test_numeric_set_exception_swallowed(self):
+        from unittest.mock import patch
+
+        bp = BeamProfiler(camera="simulated")
+        captured = self._capture(bp)
+        fn = self._find(captured, "genicam-num")
+        assert fn is not None
+        # The simulated node accepts any numeric write, so monkey-patch the
+        # node's __setattr__ to raise.
+        assert bp.camera is not None
+        nm = bp.camera.node_map  # ty: ignore[unresolved-attribute]
+        node = getattr(nm, "ExposureTime")
+
+        def boom(_self, _v):
+            raise RuntimeError("nope")
+
+        with (
+            patch("pybeamprofiler.dash_app.ctx") as mock_ctx,
+            patch.object(type(node), "value", property(lambda s: 0.0, boom)),
+        ):
+            mock_ctx.triggered_id = {"type": "genicam-num", "feature": "ExposureTime"}
+            assert fn(1.0) == 1.0  # value passes through, exception logged
+
+    def test_select_set_exception_swallowed(self):
+        from unittest.mock import patch
+
+        bp = BeamProfiler(camera="simulated")
+        captured = self._capture(bp)
+        fn = self._find(captured, "genicam-sel")
+        assert fn is not None
+        assert bp.camera is not None
+        nm = bp.camera.node_map  # ty: ignore[unresolved-attribute]
+        node = getattr(nm, "ExposureAuto")
+
+        def boom(_self, _v):
+            raise RuntimeError("nope")
+
+        with (
+            patch("pybeamprofiler.dash_app.ctx") as mock_ctx,
+            patch.object(type(node), "value", property(lambda s: "Off", boom)),
+        ):
+            mock_ctx.triggered_id = {"type": "genicam-sel", "feature": "ExposureAuto"}
+            assert fn("Off") == "Off"
+
+    def test_numeric_setter_restarts_when_stopped(self):
+        from unittest.mock import patch
+
+        bp = BeamProfiler(camera="simulated")
+        assert bp.camera is not None
+        cam = bp.camera
+        cam.start_acquisition()
+        captured = self._capture(bp)
+        fn = self._find(captured, "genicam-num")
+        assert fn is not None
+
+        nm = cam.node_map  # ty: ignore[unresolved-attribute]
+        node = getattr(nm, "ExposureTime")
+
+        def stop_then_set(self, v):
+            cam.stop_acquisition()
+            self._value = v
+
+        with (
+            patch("pybeamprofiler.dash_app.ctx") as mock_ctx,
+            patch.object(type(node), "value", property(lambda s: s._value, stop_then_set)),
+        ):
+            mock_ctx.triggered_id = {"type": "genicam-num", "feature": "ExposureTime"}
+            fn(123.0)
+        assert bp.camera.is_acquiring  # restarted
+
+    def test_select_setter_restarts_when_stopped(self):
+        from unittest.mock import patch
+
+        bp = BeamProfiler(camera="simulated")
+        assert bp.camera is not None
+        cam = bp.camera
+        cam.start_acquisition()
+        captured = self._capture(bp)
+        fn = self._find(captured, "genicam-sel")
+        assert fn is not None
+
+        nm = cam.node_map  # ty: ignore[unresolved-attribute]
+        node = getattr(nm, "ExposureAuto")
+
+        def stop_then_set(self, v):
+            cam.stop_acquisition()
+            self._value = v
+
+        with (
+            patch("pybeamprofiler.dash_app.ctx") as mock_ctx,
+            patch.object(type(node), "value", property(lambda s: s._value, stop_then_set)),
+        ):
+            mock_ctx.triggered_id = {"type": "genicam-sel", "feature": "ExposureAuto"}
+            fn("Off")
+        assert bp.camera.is_acquiring
+
+    def test_switch_setter_restarts_when_stopped(self):
+        from unittest.mock import patch
+
+        bp = BeamProfiler(camera="simulated")
+        assert bp.camera is not None
+        cam = bp.camera
+        cam.start_acquisition()
+        captured = self._capture(bp)
+        fn = self._find(captured, "genicam-sw")
+        assert fn is not None
+
+        nm = cam.node_map  # ty: ignore[unresolved-attribute]
+        node = getattr(nm, "ReverseX", None)
+        if node is None:
+            pytest.skip("No boolean node available")
+
+        def stop_then_set(self, v):
+            cam.stop_acquisition()
+            self._value = v
+
+        with (
+            patch("pybeamprofiler.dash_app.ctx") as mock_ctx,
+            patch.object(type(node), "value", property(lambda s: s._value, stop_then_set)),
+        ):
+            mock_ctx.triggered_id = {"type": "genicam-sw", "feature": "ReverseX"}
+            fn(True)
+        assert bp.camera.is_acquiring
+
+    def test_switch_set_exception_swallowed(self):
+        from unittest.mock import patch
+
+        bp = BeamProfiler(camera="simulated")
+        captured = self._capture(bp)
+        fn = self._find(captured, "genicam-sw")
+        assert fn is not None
+        assert bp.camera is not None
+        # Pick any boolean-valued node from the simulated map.
+        nm = bp.camera.node_map  # ty: ignore[unresolved-attribute]
+        node = getattr(nm, "ReverseX", None)
+        if node is None:
+            pytest.skip("No boolean node available")
+
+        def boom(_self, _v):
+            raise RuntimeError("nope")
+
+        with (
+            patch("pybeamprofiler.dash_app.ctx") as mock_ctx,
+            patch.object(type(node), "value", property(lambda s: False, boom)),
+        ):
+            mock_ctx.triggered_id = {"type": "genicam-sw", "feature": "ReverseX"}
+            assert fn(True) is True
+
+
+# ─── Pre-existing edge cases (cheap one-liners) ───────────────────────────
+
+
+class TestPreexistingEdgeCases:
+    """Cover marginal `except: pass` defensive paths."""
+
+    def test_saturation_fraction_float_dtype_with_max(self):
+        from pybeamprofiler.dash_app import _saturation_fraction
+
+        img = np.array([[0.0, 1.0, 1.0], [0.5, 0.5, 0.5]], dtype=np.float32)
+        # Two of six pixels at the (observed) max of 1.0 → 1/3.
+        assert _saturation_fraction(img) == pytest.approx(2 / 6)
+
+    def test_exposure_controls_handles_bad_range(self):
+        """``exposure_range`` returning a non-iterable shouldn't crash."""
+        from pybeamprofiler.dash_app import _exposure_controls
+
+        class FakeCam:
+            exposure_range = 5  # not unpackable
+            exposure_time = 0.01
+
+        ctrls = _exposure_controls(FakeCam())
+        assert ctrls  # didn't crash, fell back to defaults
+
+    def test_gain_controls_handles_bad_range(self):
+        from pybeamprofiler.dash_app import _gain_controls
+
+        class FakeCam:
+            gain_range = "oops"  # not unpackable to two floats
+            gain = 0.0
+
+        ctrls = _gain_controls(FakeCam())
+        assert ctrls
+
+    def test_roi_controls_no_roi_info_returns_none(self):
+        from pybeamprofiler.dash_app import _roi_controls
+
+        class FakeCam:
+            pass
+
+        assert _roi_controls(FakeCam()) is None
+
+    def test_build_genicam_control_unsupported_value_returns_none(self):
+        """A node whose value is an exotic type (e.g. tuple) yields no control."""
+        from pybeamprofiler.dash_app import _build_genicam_control
+
+        class FakeNode:
+            value = (1, 2, 3)  # not bool, str, int, float
+
+        cam = type("C", (), {"node_map": type("N", (), {"Weird": FakeNode()})()})()
+        assert _build_genicam_control(cam, "Weird") is None
+
+    def test_build_setting_items_discover_failure_logged(self, caplog):
+        """When ``_discover_features`` raises, the panel still builds."""
+        import logging
+        from unittest.mock import MagicMock
+
+        bp = BeamProfiler(camera="simulated")
+        assert bp.camera is not None
+        bp.camera._discover_features = MagicMock(  # ty: ignore[invalid-assignment]
+            side_effect=RuntimeError("discovery boom")
+        )
+        with caplog.at_level(logging.WARNING):
+            items = _build_setting_items(bp)
+        assert items  # camera info accordion still present
+        assert any("Feature discovery failed" in r.message for r in caplog.records)
+
 
 # ─── toggle_colorscale callback ───────────────────────────────────────────
 
