@@ -8,7 +8,6 @@ import logging
 import os
 import threading
 import time
-import warnings
 import webbrowser
 from types import TracebackType
 from typing import Any
@@ -18,7 +17,7 @@ import plotly.graph_objs as go
 from PIL import Image
 from plotly.subplots import make_subplots
 from scipy.ndimage import zoom as _ndimage_zoom
-from scipy.optimize import OptimizeWarning, curve_fit
+from scipy.optimize import curve_fit
 
 from .basler import BaslerCamera
 from .camera import Camera
