@@ -1645,13 +1645,19 @@ def _register_callbacks(app: dash.Dash, bp: BeamProfiler) -> None:
         def apply_roi(_n: int, ox: int, oy: int, w: int, h: int) -> str:
             if bp.camera is None:
                 return "No camera"
+            if ox is None or oy is None or w is None or h is None:
+                return "Please enter offset/width/height"
             with _callback_lock:
                 try:
+                    offset_x = int(ox)
+                    offset_y = int(oy)
+                    width = int(w)
+                    height = int(h)
                     was_acquiring = bp.camera.is_acquiring
                     if was_acquiring:
                         bp.camera.stop_acquisition()
                     getattr(bp.camera, "set_roi")(
-                        offset_x=int(ox), offset_y=int(oy), width=int(w), height=int(h)
+                        offset_x=offset_x, offset_y=offset_y, width=width, height=height
                     )
                     if was_acquiring:
                         bp.camera.start_acquisition()
