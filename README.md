@@ -144,7 +144,7 @@ Current suite: **474 tests, 93% coverage**.
 
 - 2D fits use adaptive downsampling + Levenberg-Marquardt warm starts
 - Projection profiles are cached between `analyze()` and figure rendering
-- `update_live` and camera I/O are offloaded with `asyncio.to_thread` and guarded by a `threading.Lock` to avoid segfaults in the Harvesters C library
+- In the current Dash implementation, live updates perform `bp.camera.get_image(timeout=0.1)` and `bp.analyze(img)` synchronously while holding a `threading.Lock` to reduce segfault risk in the Harvesters C library
 
 ### Supported sensors
 
