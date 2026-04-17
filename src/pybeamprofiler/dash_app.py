@@ -1625,6 +1625,8 @@ def _register_callbacks(app: dash.Dash, bp: BeamProfiler) -> None:
                     bp.camera.set_gain(val)
                     if was_acquiring and not bp.camera.is_acquiring:
                         bp.camera.start_acquisition()
+                    _recent_frame_times.clear()
+                    _avg_buffer.clear()
                 except Exception as e:
                     logger.warning(f"Failed to set gain: {e}")
         return val
