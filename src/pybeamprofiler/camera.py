@@ -126,8 +126,14 @@ class Camera(ABC):
         ...
 
     @abstractmethod
-    def get_image(self) -> np.ndarray:
-        """Get a single image from the camera."""
+    def get_image(self, timeout: float | None = None) -> np.ndarray:
+        """Return the most recent frame from the camera.
+
+        Args:
+            timeout: Optional maximum seconds to wait for the first frame
+                during cold start. Implementations that always have a frame
+                available (e.g. simulated cameras) may ignore this argument.
+        """
         ...
 
     @abstractmethod

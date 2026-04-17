@@ -420,30 +420,32 @@ class BeamProfiler:
             last_popt: Previous fit parameters for initial guess
 
         Returns:
-            Fit parameters ``[amplitude, center, sigma, offset]``
+            Fit parameters ``[amplitude, center, sigma, offset]``.
         """
         n = len(profile)
         if n == 0:
             return [0, 0, 1, 0]
 
         if last_popt is not None:
-            p0 = last_popt
+            p0 = list(last_popt)
         else:
             pmax, pmin = np.max(profile), np.min(profile)
-            p0 = [pmax - pmin, np.argmax(profile), n / 10.0, pmin]
+            p0 = [pmax - pmin, float(np.argmax(profile)), n / 10.0, pmin]
 
         try:
             x = np.arange(n)
-            # Bounds constrain parameters for faster convergence:
-            # amplitude > 0, center in [0, n], sigma in [0.1, n], offset unbounded
-            bounds = ([0, 0, 0.1, -np.inf], [np.inf, n, n, np.inf])
             popt, _ = curve_fit(
-                BeamProfiler.gaussian, x, profile, p0=p0, bounds=bounds, maxfev=MAX_FIT_ITERATIONS
+                BeamProfiler.gaussian,
+                x,
+                profile,
+                p0=p0,
+                maxfev=MAX_FIT_ITERATIONS,
             )
-            return popt
         except (RuntimeError, ValueError) as e:
             logger.debug("1D fit failed: %s, using initial guess", e)
-            return p0
+            popt = np.array(p0)
+
+        return popt
 
     _MAX_FIT_2D_DIM = 256
 

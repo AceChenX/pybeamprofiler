@@ -8,7 +8,6 @@ import dash
 import numpy as np
 
 from pybeamprofiler.beamprofiler import BeamProfiler
-from pybeamprofiler.dash_app import build_figure
 
 
 def test_plot_single():
@@ -197,7 +196,6 @@ def test_plot_stream_dash_robustness():
         patch("dash.Dash") as MockDash,
         patch.dict("sys.modules", {"IPython": mock_ipython}),
         patch("threading.Thread"),
-        patch("asyncio.to_thread") as mock_to_thread,
     ):
         mock_app = MagicMock()
         MockDash.return_value = mock_app
@@ -223,48 +221,25 @@ def test_plot_stream_dash_robustness():
 
         bp.camera.is_acquiring = True
 
-        async def run_callback_error():
-            def side_effect(*args, **kwargs):
-                if args[0] == bp.camera.get_image:
-                    raise RuntimeError("Camera dead")
-                return None
+        bp.camera.get_image = MagicMock(side_effect=RuntimeError("Camera dead"))
+        result = callback_func(
+            0, False, True, "Hot", True, None, None, 0, "1d", "gaussian", True, 1
+        )
+        assert result[0] is dash.no_update
 
-            mock_to_thread.side_effect = side_effect
-            return await callback_func(
-                0, False, True, "Hot", True, None, None, 0, "1d", "gaussian", True
-            )  # type: ignore
+        bp.camera.get_image = MagicMock(return_value=None)
+        result = callback_func(
+            0, False, True, "Hot", True, None, None, 0, "1d", "gaussian", True, 1
+        )
+        assert result[0] is dash.no_update
 
-        assert asyncio.run(run_callback_error())[0] is dash.no_update
-
-        async def run_callback_none():
-            def side_effect(*args, **kwargs):
-                if args[0] == bp.camera.get_image:
-                    return None
-                return None
-
-            mock_to_thread.side_effect = side_effect
-            return await callback_func(
-                0, False, True, "Hot", True, None, None, 0, "1d", "gaussian", True
-            )  # type: ignore
-
-        assert asyncio.run(run_callback_none())[0] is dash.no_update
-
-        async def run_callback_success():
-            def side_effect(*args, **kwargs):
-                if args[0] == bp.camera.get_image:
-                    return mock_img
-                if args[0] == bp.analyze:
-                    return ([0, 0, 1, 0], [0, 0, 1, 0])
-                if args[0] == build_figure:
-                    return mock_fig
-                return None
-
-            mock_to_thread.side_effect = side_effect
-            return await callback_func(
-                0, False, True, "Hot", True, None, None, 0, "1d", "gaussian", True
-            )  # type: ignore
-
-        assert asyncio.run(run_callback_success())[0] is mock_fig
+        bp.camera.get_image = MagicMock(return_value=mock_img)
+        bp.analyze = MagicMock(return_value=([0, 0, 1, 0], [0, 0, 1, 0]))
+        with patch("pybeamprofiler.dash_app.build_figure", return_value=mock_fig):
+            result = callback_func(
+                0, False, True, "Hot", True, None, None, 0, "1d", "gaussian", True, 1
+            )
+        assert result[0] is mock_fig
 
 
 def test_plot_stream_matplotlib_fallback():
@@ -350,7 +325,6 @@ def test_plot_stream_dash_non_heatmap():
         patch("dash.Dash") as MockDash,
         patch.dict("sys.modules", {"IPython": mock_ipython}),
         patch("threading.Thread"),
-        patch("asyncio.to_thread") as mock_to_thread,
     ):
         mock_app = MagicMock()
         MockDash.return_value = mock_app
@@ -375,23 +349,13 @@ def test_plot_stream_dash_non_heatmap():
         assert callback_func is not None
 
         bp.camera.is_acquiring = True
-
-        async def run_callback_success():
-            def side_effect(*args, **kwargs):
-                if args[0] == bp.camera.get_image:
-                    return mock_img
-                if args[0] == bp.analyze:
-                    return ([0, 0, 1, 0], [0, 0, 1, 0])
-                if args[0] == build_figure:
-                    return mock_fig
-                return None
-
-            mock_to_thread.side_effect = side_effect
-            return await callback_func(
-                0, False, True, "Hot", True, None, None, 0, "1d", "gaussian", True
-            )  # type: ignore
-
-        assert asyncio.run(run_callback_success())[0] is mock_fig
+        bp.camera.get_image = MagicMock(return_value=mock_img)
+        bp.analyze = MagicMock(return_value=([0, 0, 1, 0], [0, 0, 1, 0]))
+        with patch("pybeamprofiler.dash_app.build_figure", return_value=mock_fig):
+            result = callback_func(
+                0, False, True, "Hot", True, None, None, 0, "1d", "gaussian", True, 1
+            )
+        assert result[0] is mock_fig
 
     bp.camera.close()
 
@@ -409,7 +373,6 @@ def test_plot_stream_camera_not_acquiring_restart():
         patch("dash.Dash") as MockDash,
         patch.dict("sys.modules", {"IPython": mock_ipython}),
         patch("threading.Thread"),
-        patch("asyncio.to_thread") as mock_to_thread,
     ):
         mock_app = MagicMock()
         MockDash.return_value = mock_app
@@ -433,25 +396,13 @@ def test_plot_stream_camera_not_acquiring_restart():
         bp.plot(heatmap_only=True)
         assert callback_func is not None
 
-        # Camera stops acquiring mid-stream
         bp.camera.is_acquiring = False
-
-        async def run_callback():
-            def side_effect(*args, **kwargs):
-                if args[0] == bp.camera.get_image:
-                    return mock_img
-                if args[0] == bp.analyze:
-                    return ([0, 0, 1, 0], [0, 0, 1, 0])
-                if args[0] == build_figure:
-                    return mock_fig
-                return None
-
-            mock_to_thread.side_effect = side_effect
-            return await callback_func(
-                0, False, True, "Hot", True, None, None, 0, "1d", "gaussian", True
-            )  # type: ignore
-
-        result = asyncio.run(run_callback())
+        bp.camera.get_image = MagicMock(return_value=mock_img)
+        bp.analyze = MagicMock(return_value=([0, 0, 1, 0], [0, 0, 1, 0]))
+        with patch("pybeamprofiler.dash_app.build_figure", return_value=mock_fig):
+            result = callback_func(
+                0, False, True, "Hot", True, None, None, 0, "1d", "gaussian", True, 1
+            )
         assert result[0] is mock_fig
 
     bp.camera.close()
@@ -478,7 +429,6 @@ def test_plot_stream_static_mode():
             patch("dash.Dash") as MockDash,
             patch.dict("sys.modules", {"IPython": mock_ipython}),
             patch("threading.Thread"),
-            patch("asyncio.to_thread") as mock_to_thread,
         ):
             mock_app = MagicMock()
             MockDash.return_value = mock_app
@@ -502,20 +452,11 @@ def test_plot_stream_static_mode():
             bp._plot_stream()
             assert callback_func is not None
 
-            async def run_callback():
-                def side_effect(*args, **kwargs):
-                    if args[0] == bp.analyze:
-                        return ([0, 0, 1, 0], [0, 0, 1, 0])
-                    if args[0] == build_figure:
-                        return mock_fig
-                    return None
-
-                mock_to_thread.side_effect = side_effect
-                return await callback_func(
-                    0, False, True, "Hot", True, None, None, 0, "1d", "gaussian", True
-                )  # type: ignore
-
-            result = asyncio.run(run_callback())
+            bp.analyze = MagicMock(return_value=([0, 0, 1, 0], [0, 0, 1, 0]))
+            with patch("pybeamprofiler.dash_app.build_figure", return_value=mock_fig):
+                result = callback_func(
+                    0, False, True, "Hot", True, None, None, 0, "1d", "gaussian", True, 1
+                )
             assert result[0] is mock_fig
 
 
@@ -629,7 +570,7 @@ def test_plot_stream_jupyter_non_heatmap():
 
 
 def test_dash_callback_lock_prevents_reentrance():
-    """Test that the Dash callback returns no_update when the lock is held."""
+    """Test that the Dash callback returns valid figures across consecutive calls."""
     bp = BeamProfiler(camera="simulated")
     assert bp.camera is not None
     mock_img = np.ones((10, 10))
@@ -641,7 +582,6 @@ def test_dash_callback_lock_prevents_reentrance():
         patch("dash.Dash") as MockDash,
         patch.dict("sys.modules", {"IPython": mock_ipython}),
         patch("threading.Thread"),
-        patch("asyncio.to_thread") as mock_to_thread,
     ):
         mock_app = MagicMock()
         MockDash.return_value = mock_app
@@ -666,30 +606,19 @@ def test_dash_callback_lock_prevents_reentrance():
         assert callback_func is not None
 
         bp.camera.is_acquiring = True
+        bp.camera.get_image = MagicMock(return_value=mock_img)
+        bp.analyze = MagicMock(return_value=([0, 0, 1, 0], [0, 0, 1, 0]))
 
-        def side_effect(*args, **kwargs):
-            if args[0] == bp.camera.get_image:
-                return mock_img
-            if args[0] == bp.analyze:
-                return ([0, 0, 1, 0], [0, 0, 1, 0])
-            if args[0] == build_figure:
-                return mock_fig
-            return None
-
-        mock_to_thread.side_effect = side_effect
-
-        async def run_lock_test():
-            result1 = await callback_func(
-                0, False, True, "Hot", True, None, None, 0, "1d", "gaussian", True
-            )  # ty: ignore[call-non-callable]
+        with patch("pybeamprofiler.dash_app.build_figure", return_value=mock_fig):
+            result1 = callback_func(
+                0, False, True, "Hot", True, None, None, 0, "1d", "gaussian", True, 1
+            )
             assert result1[0] is mock_fig
 
-            result2 = await callback_func(
-                1, False, True, "Hot", True, None, None, 0, "1d", "gaussian", True
+            result2 = callback_func(
+                1, False, True, "Hot", True, None, None, 0, "1d", "gaussian", True, 1
             )
             assert result2[0] is mock_fig
-
-        asyncio.run(run_lock_test())
 
     bp.camera.close()
 
@@ -739,7 +668,6 @@ def test_dash_shutdown_flag_stops_callback():
         patch("dash.Dash") as MockDash,
         patch.dict("sys.modules", {"IPython": mock_ipython}),
         patch("threading.Thread"),
-        patch("asyncio.to_thread") as mock_to_thread,
     ):
         mock_app = MagicMock()
         MockDash.return_value = mock_app
@@ -764,24 +692,13 @@ def test_dash_shutdown_flag_stops_callback():
         assert callback_func is not None
 
         bp.camera.is_acquiring = True
+        bp.camera.get_image = MagicMock(return_value=mock_img)
+        bp.analyze = MagicMock(return_value=([0, 0, 1, 0], [0, 0, 1, 0]))
 
-        def side_effect(*args, **kwargs):
-            if args[0] == bp.camera.get_image:
-                return mock_img
-            if args[0] == bp.analyze:
-                return ([0, 0, 1, 0], [0, 0, 1, 0])
-            if args[0] == build_figure:
-                return mock_fig
-            return None
-
-        mock_to_thread.side_effect = side_effect
-
-        async def run_test():
-            return await callback_func(
-                0, False, True, "Hot", True, None, None, 0, "1d", "gaussian", True
-            )  # ty: ignore[call-non-callable]
-
-        result = asyncio.run(run_test())
+        with patch("pybeamprofiler.dash_app.build_figure", return_value=mock_fig):
+            result = callback_func(
+                0, False, True, "Hot", True, None, None, 0, "1d", "gaussian", True, 1
+            )
         assert result[0] is mock_fig
 
     bp.camera.close()

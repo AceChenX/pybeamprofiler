@@ -486,8 +486,11 @@ class TestGenCameraExposureGain:
         mock_ia = MagicMock()
         cam.ia = mock_ia
         cam.start_acquisition()
-        mock_ia.start.assert_called_once()
-        assert cam.is_acquiring is True
+        try:
+            mock_ia.start.assert_called_once()
+            assert cam.is_acquiring is True
+        finally:
+            cam.stop_acquisition()
 
     def test_stop_acquisition(self):
         """Test stop_acquisition calls ia.stop."""
@@ -1130,8 +1133,11 @@ class TestGenCameraDetection:
         mock_ia.fetch.return_value.__enter__ = MagicMock(return_value=mock_buffer)
         mock_ia.fetch.return_value.__exit__ = MagicMock(return_value=False)
 
-        img = cam.get_image()
-        assert img.shape == (480, 640)
+        try:
+            img = cam.get_image(timeout=1.0)
+            assert img.shape == (480, 640)
+        finally:
+            cam.stop_acquisition()
 
 
 class TestCameraSettingMethod:

@@ -425,6 +425,10 @@ class HarvesterCamera(Camera):
     def close(self) -> None:
         """Close camera connection and release hardware."""
         try:
+            self.stop_acquisition()
+        except Exception:
+            logger.debug("Error stopping acquisition during close", exc_info=True)
+        try:
             if self.ia:
                 self.ia.destroy()
         except Exception:
@@ -435,50 +439,64 @@ class HarvesterCamera(Camera):
             logger.debug("Error resetting Harvester", exc_info=True)
 
     def start_acquisition(self) -> None:
-        """Start image acquisition."""
-        if self.ia:
+        """Start image acquisition on the GenTL producer."""
+        if not self.ia:
+            return
+        if not self.is_acquiring:
             self.ia.start()
             self.is_acquiring = True
 
     def stop_acquisition(self) -> None:
-        """Stop image acquisition."""
-        if self.ia:
+        """Stop image acquisition on the GenTL producer."""
+        if self.ia and self.is_acquiring:
             try:
                 self.ia.stop()
             except Exception:
                 logger.debug("Error stopping acquisition", exc_info=True)
             self.is_acquiring = False
 
-    def get_image(self) -> np.ndarray:
-        """Retrieve image from camera.
+    def get_image(self, timeout: float | None = None) -> np.ndarray:
+        """Fetch the next frame from the GenTL producer.
 
-        Automatically starts acquisition if not already running.
-        The fetch timeout adapts to the current exposure time so that
-        long-exposure frames don't cause spurious ``TimeoutError``.
+        For default short exposures this returns within a few ms. For long
+        exposures the caller should pass a small ``timeout`` (e.g. ``0.2``)
+        and treat :class:`TimeoutError` as "no new frame yet, try again
+        next tick" so the UI stays responsive.
+
+        Args:
+            timeout: Maximum seconds to wait for a frame.
+                Defaults to ``max(2.0, exposure_time + 2.0)``.
 
         Returns:
-            2D numpy array of image data
+            2D numpy array containing the frame data.
+
+        Raises:
+            RuntimeError: If the camera has not been opened.
+            TimeoutError: If no frame arrives within ``timeout``.
         """
         if not self.ia:
             raise RuntimeError("Camera not opened.")
-
         if not self.is_acquiring:
             self.start_acquisition()
 
-        timeout = max(2.0, (self.exposure_time or 0) + 2.0)
+        if timeout is None:
+            timeout = max(2.0, (self.exposure_time or 0) + 2.0)
+
         try:
             with self.ia.fetch(timeout=timeout) as buffer:
                 component = buffer.payload.components[0]
-                image = component.data.reshape(component.height, component.width).copy()
                 self.width_pixels = component.width
                 self.height_pixels = component.height
-                return image
+                return component.data.reshape(component.height, component.width).copy()
         except Exception as exc:
-            if type(exc).__name__ == "TimeoutException":
+            # Harvesters raises various producer-specific exceptions on timeout;
+            # normalise them so callers only need to catch TimeoutError.
+            msg = str(exc).lower()
+            if isinstance(exc, TimeoutError) or "timeout" in msg or "timed out" in msg:
                 raise TimeoutError(
                     f"Camera did not deliver a frame within {timeout:.1f} s. "
-                    "Check that the camera is connected, powered, and not in use "
-                    "by another application."
+                    "Check that the camera is connected, powered, and not in "
+                    "use by another application."
                 ) from exc
             raise
 

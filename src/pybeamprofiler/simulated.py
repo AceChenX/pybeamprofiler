@@ -178,14 +178,19 @@ class SimulatedCamera(Camera):
         self.is_acquiring = False
         logger.info("Simulated acquisition stopped.")
 
-    def get_image(self) -> np.ndarray:
+    def get_image(self, timeout: float | None = None) -> np.ndarray:
         """Generate simulated beam image with random fluctuations.
 
         If an ROI has been set, returns only the cropped region.
 
+        Args:
+            timeout: Unused; kept for :class:`~pybeamprofiler.camera.Camera`
+                interface compatibility.
+
         Returns:
             2D numpy array of uint8 intensity values.
         """
+        del timeout
         cx = self._center_x + np.random.normal(0, self._noise_center)
         cy = self._center_y + np.random.normal(0, self._noise_center)
         sx = self._sigma_x + np.random.normal(0, self._noise_sigma)

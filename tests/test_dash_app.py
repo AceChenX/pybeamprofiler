@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 from typing import Any
 
 import dash
@@ -1070,6 +1069,117 @@ class TestSaveFrameCallback:
         assert fn is not None
         assert fn(1) is None
 
+    def test_save_npy_returns_data(self):
+        import base64
+        import io
+
+        bp = BeamProfiler(camera="simulated")
+        assert bp.camera is not None
+        bp.last_img = bp.camera.get_image()
+        fn = _extract_callback(bp, "download-npy")
+        assert fn is not None
+        result = fn(1)
+        assert result is not None
+        assert result["filename"].endswith(".npy")
+        assert result["base64"] is True
+        # Round-trip verifies the bytes are a valid NumPy file.
+        loaded = np.load(io.BytesIO(base64.b64decode(result["content"])))
+        assert loaded.shape == bp.last_img.shape
+
+    def test_save_npy_no_image(self):
+        bp = BeamProfiler(camera="simulated")
+        bp.last_img = None
+        fn = _extract_callback(bp, "download-npy")
+        assert fn is not None
+        assert fn(1) is None
+
+
+# ─── helper functions ─────────────────────────────────────────────────────
+
+
+class TestSaturationHelpers:
+    """Tests for `_saturation_max` and `_saturation_fraction`."""
+
+    def test_uint8_max(self):
+        from pybeamprofiler.dash_app import _saturation_max
+
+        assert _saturation_max(np.zeros((4, 4), dtype=np.uint8)) == 255.0
+
+    def test_uint16_max(self):
+        from pybeamprofiler.dash_app import _saturation_max
+
+        assert _saturation_max(np.zeros((4, 4), dtype=np.uint16)) == 65535.0
+
+    def test_float_normalised(self):
+        from pybeamprofiler.dash_app import _saturation_max
+
+        img = np.array([[0.0, 0.5], [0.9, 1.0]], dtype=np.float32)
+        assert _saturation_max(img) == 1.0
+
+    def test_float_unnormalised(self):
+        from pybeamprofiler.dash_app import _saturation_max
+
+        img = np.array([[0.0, 100.0], [50.0, 200.0]], dtype=np.float32)
+        assert _saturation_max(img) == 200.0
+
+    def test_fraction_no_saturated_pixels(self):
+        from pybeamprofiler.dash_app import _saturation_fraction
+
+        img = np.full((10, 10), 100, dtype=np.uint8)
+        assert _saturation_fraction(img) == 0.0
+
+    def test_fraction_some_saturated_pixels(self):
+        from pybeamprofiler.dash_app import _saturation_fraction
+
+        img = np.full((10, 10), 100, dtype=np.uint8)
+        img[0, :5] = 255
+        assert _saturation_fraction(img) == pytest.approx(0.05)
+
+    def test_fraction_empty(self):
+        from pybeamprofiler.dash_app import _saturation_fraction
+
+        assert _saturation_fraction(np.array([], dtype=np.uint8)) == 0.0
+
+
+class TestAveragedImage:
+    """Tests for the rolling N-frame averaging buffer."""
+
+    def test_n_one_passes_through(self):
+        from pybeamprofiler import dash_app as da
+
+        da._avg_buffer.clear()
+        img = np.full((4, 4), 10, dtype=np.uint8)
+        out = da._averaged_image(img, 1)
+        assert np.array_equal(out, img)
+        assert len(da._avg_buffer) == 0
+
+    def test_running_mean(self):
+        from pybeamprofiler import dash_app as da
+
+        da._avg_buffer.clear()
+        a = np.full((4, 4), 0, dtype=np.uint8)
+        b = np.full((4, 4), 100, dtype=np.uint8)
+        da._averaged_image(a, 2)
+        out = da._averaged_image(b, 2)
+        assert np.array_equal(out, np.full((4, 4), 50, dtype=np.uint8))
+
+    def test_buffer_resets_on_shape_change(self):
+        from pybeamprofiler import dash_app as da
+
+        da._avg_buffer.clear()
+        da._averaged_image(np.zeros((4, 4), dtype=np.uint8), 4)
+        da._averaged_image(np.zeros((8, 8), dtype=np.uint8), 4)
+        assert len(da._avg_buffer) == 1
+        assert da._avg_buffer_shape == (8, 8)
+
+    def test_n_clamped_to_max(self):
+        from pybeamprofiler import dash_app as da
+        from pybeamprofiler.dash_app import _MAX_AVG_FRAMES
+
+        da._avg_buffer.clear()
+        da._averaged_image(np.zeros((4, 4), dtype=np.uint8), _MAX_AVG_FRAMES + 100)
+        assert da._avg_buffer.maxlen == _MAX_AVG_FRAMES
+
 
 # ─── toggle_colorscale callback ───────────────────────────────────────────
 
@@ -1270,28 +1380,18 @@ class TestGenicamSetCallbacks:
 
 
 class TestUpdateLiveCallback:
-    """Test the async update_live callback."""
+    """Test the synchronous update_live callback."""
 
     @staticmethod
     def _get_update_fn(bp: BeamProfiler):
         fn = _extract_callback(bp, "live-graph")
         return fn
 
-    @staticmethod
-    def _run_async(coro):
-        loop = asyncio.new_event_loop()
-        try:
-            return loop.run_until_complete(coro)
-        finally:
-            loop.close()
-
     def test_paused_returns_no_update(self):
         bp = BeamProfiler(camera="simulated")
         fn = self._get_update_fn(bp)
         assert fn is not None
-        result = self._run_async(
-            fn(1, True, True, "Hot", True, None, None, 0, "1d", "gaussian", True)
-        )
+        result = fn(1, True, True, "Hot", True, None, None, 0, "1d", "gaussian", True, 1)
         assert all(isinstance(r, dash._no_update.NoUpdate) for r in result)
 
     def test_live_update_returns_figure(self):
@@ -1300,9 +1400,7 @@ class TestUpdateLiveCallback:
         bp.camera.start_acquisition()
         fn = self._get_update_fn(bp)
         assert fn is not None
-        result = self._run_async(
-            fn(1, False, True, "Hot", True, None, None, 0, "1d", "gaussian", True)
-        )
+        result = fn(1, False, True, "Hot", True, None, None, 0, "1d", "gaussian", True, 1)
         assert len(result) == 4
         fig = result[0]
         assert hasattr(fig, "data")
@@ -1315,7 +1413,7 @@ class TestUpdateLiveCallback:
         bp.fit_method = "1d"
         fn = self._get_update_fn(bp)
         assert fn is not None
-        self._run_async(fn(1, False, True, "Hot", True, None, None, 0, "2d", "gaussian", True))
+        fn(1, False, True, "Hot", True, None, None, 0, "2d", "gaussian", True, 1)
         assert bp.fit_method == "2d"
 
     def test_live_update_manual_range(self):
@@ -1324,9 +1422,7 @@ class TestUpdateLiveCallback:
         bp.camera.start_acquisition()
         fn = self._get_update_fn(bp)
         assert fn is not None
-        result = self._run_async(
-            fn(1, False, True, "Hot", False, 10.0, 200.0, 0, "1d", "gaussian", True)
-        )
+        result = fn(1, False, True, "Hot", False, 10.0, 200.0, 0, "1d", "gaussian", True, 1)
         assert len(result) == 4
 
     def test_live_update_greyscale(self):
@@ -1335,10 +1431,35 @@ class TestUpdateLiveCallback:
         bp.camera.start_acquisition()
         fn = self._get_update_fn(bp)
         assert fn is not None
-        result = self._run_async(
-            fn(1, False, False, "Hot", True, None, None, 0, "1d", "gaussian", True)
-        )
+        result = fn(1, False, False, "Hot", True, None, None, 0, "1d", "gaussian", True, 1)
         assert len(result) == 4
+
+    def test_live_update_averages_frames(self):
+        """N>1 averaging returns valid figure and populates the buffer."""
+        from pybeamprofiler import dash_app as da
+
+        bp = BeamProfiler(camera="simulated")
+        assert bp.camera is not None
+        bp.camera.start_acquisition()
+        fn = self._get_update_fn(bp)
+        assert fn is not None
+        da._avg_buffer.clear()
+        for _ in range(3):
+            fn(1, False, True, "Hot", True, None, None, 0, "1d", "gaussian", True, 4)
+        assert len(da._avg_buffer) == 3
+        assert da._avg_buffer.maxlen == 4
+
+    def test_live_update_status_includes_exposure_and_gain(self):
+        bp = BeamProfiler(camera="simulated")
+        assert bp.camera is not None
+        bp.camera.start_acquisition()
+        fn = self._get_update_fn(bp)
+        assert fn is not None
+        result = fn(1, False, True, "Hot", True, None, None, 0, "1d", "gaussian", True, 1)
+        status_text = str(result[2])
+        assert "Frame #" in status_text
+        assert "Exp" in status_text
+        assert "Gain" in status_text
 
 
 # ─── Exposure/Gain error branches ────────────────────────────────────────

@@ -6,8 +6,8 @@ interactive fitting controls, and camera settings management.
 
 from __future__ import annotations
 
-import asyncio
 import base64
+import collections
 import io
 import logging
 import re
@@ -77,6 +77,39 @@ GRAY_COLORSCALE = "gray"
 
 _PROFILE_FRACTION = 0.15
 
+# Saturation warning thresholds.
+_SATURATION_PIXEL_FRACTION = 0.001  # 0.1% of pixels at the dtype max ⇒ warn.
+
+# Maximum frames in the rolling-average buffer (memory cap: N×frame size).
+_MAX_AVG_FRAMES = 32
+
+
+def _saturation_max(image: np.ndarray) -> float:
+    """Return the saturation level for *image* given its dtype.
+
+    For integer images this is the dtype's largest representable value
+    (e.g. 255 for ``uint8``, 65535 for ``uint16``, 4095 for a 12-bit
+    sensor packed in ``uint16`` is reported as 65535 — we cannot tell
+    "real" bit depth from the dtype alone, so the warning is conservative).
+    For floating-point images we assume normalised ``[0, 1]`` data when the
+    observed max is ≤ 1, otherwise use the observed max as a heuristic.
+    """
+    if np.issubdtype(image.dtype, np.integer):
+        return float(np.iinfo(image.dtype).max)
+    obs_max = float(image.max()) if image.size else 1.0
+    return 1.0 if obs_max <= 1.0 else obs_max
+
+
+def _saturation_fraction(image: np.ndarray) -> float:
+    """Fraction of pixels at or above the dtype's saturation level."""
+    if image.size == 0:
+        return 0.0
+    sat = _saturation_max(image)
+    # Treat anything within one quantisation step of the max as saturated.
+    if np.issubdtype(image.dtype, np.integer):
+        return float(np.count_nonzero(image >= sat)) / image.size
+    return float(np.count_nonzero(image >= sat - 1e-6)) / image.size
+
 
 # ---------------------------------------------------------------------------
 # Layout helpers
@@ -91,31 +124,70 @@ def _fitting_tab(bp: BeamProfiler) -> dbc.Tab:
         children=dbc.Card(
             dbc.CardBody(
                 [
-                    # Row 1 — Play / Pause + Save
+                    # Row 1 — Play / Pause (full-width) with Spacebar shortcut hint.
+                    dbc.Row(
+                        dbc.Col(
+                            dbc.Button(
+                                [html.I(className="bi bi-pause-fill me-1"), "Pause"],
+                                id="btn-play-pause",
+                                color="primary",
+                                size="sm",
+                                className="w-100",
+                                title="Toggle Play / Pause (Spacebar)",
+                            ),
+                        ),
+                        className="mb-2",
+                    ),
+                    # Row 1b — view + save controls.
                     dbc.Row(
                         [
                             dbc.Col(
                                 dbc.Button(
-                                    [html.I(className="bi bi-pause-fill me-1"), "Pause"],
-                                    id="btn-play-pause",
-                                    color="primary",
-                                    size="sm",
-                                    className="w-100",
-                                ),
-                                width=6,
-                            ),
-                            dbc.Col(
-                                dbc.Button(
-                                    [html.I(className="bi bi-download me-1"), "Save"],
-                                    id="btn-save",
+                                    [html.I(className="bi bi-aspect-ratio me-1"), "Auto-fit"],
+                                    id="btn-zoom-fit",
                                     color="secondary",
                                     size="sm",
                                     className="w-100",
+                                    title="Zoom to ±3σ around the fit center",
                                 ),
-                                width=6,
+                                width=4,
+                            ),
+                            dbc.Col(
+                                dbc.Button(
+                                    [html.I(className="bi bi-arrows-fullscreen me-1"), "Reset"],
+                                    id="btn-zoom-reset",
+                                    color="secondary",
+                                    size="sm",
+                                    className="w-100",
+                                    title="Reset zoom to full sensor",
+                                ),
+                                width=4,
+                            ),
+                            dbc.Col(
+                                dbc.DropdownMenu(
+                                    [
+                                        dbc.DropdownMenuItem(
+                                            [html.I(className="bi bi-image me-2"), "PNG"],
+                                            id="btn-save-png",
+                                        ),
+                                        dbc.DropdownMenuItem(
+                                            [
+                                                html.I(className="bi bi-filetype-raw me-2"),
+                                                "NumPy (.npy)",
+                                            ],
+                                            id="btn-save-npy",
+                                        ),
+                                    ],
+                                    label=[html.I(className="bi bi-download me-1"), "Save"],
+                                    color="secondary",
+                                    size="sm",
+                                    className="w-100",
+                                    align_end=True,
+                                ),
+                                width=4,
                             ),
                         ],
-                        className="mb-3",
+                        className="mb-3 g-1",
                     ),
                     # Row 2 — Color Scale switch + dropdown
                     dbc.Row(
@@ -267,6 +339,34 @@ def _fitting_tab(bp: BeamProfiler) -> dbc.Tab:
                                     dbc.InputGroupText("μm/px", style={"fontSize": "0.8rem"}),
                                 ],
                                 size="sm",
+                            ),
+                        ),
+                        className="mb-3",
+                    ),
+                    # Row 5b — Frame averaging (running mean over N frames).
+                    dbc.Row(
+                        dbc.Col(
+                            html.Div(
+                                dbc.InputGroup(
+                                    [
+                                        dbc.InputGroupText(
+                                            "Average",
+                                            style={"fontSize": "0.8rem"},
+                                        ),
+                                        dbc.Input(
+                                            id="input-avg-n",
+                                            type="number",
+                                            value=1,
+                                            min=1,
+                                            max=_MAX_AVG_FRAMES,
+                                            step=1,
+                                            size="sm",
+                                        ),
+                                        dbc.InputGroupText("frames", style={"fontSize": "0.8rem"}),
+                                    ],
+                                    size="sm",
+                                ),
+                                title="Running mean over the last N frames (1 = off)",
                             ),
                         ),
                         className="mb-3",
@@ -1040,9 +1140,10 @@ window.addEventListener('load', function() {
 
     initial_img = None
     if bp._mode == "camera" and bp.camera is not None:
+        first_frame_timeout = max(3.0, (bp.camera.exposure_time or 0) + 2.0)
         try:
-            initial_img = bp.camera.get_image()
-        except (TimeoutError, Exception) as e:
+            initial_img = bp.camera.get_image(timeout=first_frame_timeout)
+        except Exception as e:
             logger.warning("Could not grab initial frame: %s", e)
     else:
         initial_img = bp.last_img
@@ -1054,21 +1155,34 @@ window.addEventListener('load', function() {
         initial_fig = go.Figure()
 
     # ── Layout ──────────────────────────────────────────────────
-    app.layout = dbc.Container(
+    # The two-column split is implemented with explicit pixel widths so a
+    # draggable divider (``#col-divider``) can resize them on the client.
+    # Defaults match the original 75/25% Bootstrap row.
+    app.layout = html.Div(
         [
-            dbc.Row(
+            html.Div(
                 [
-                    dbc.Col(
+                    html.Div(
                         dcc.Graph(
                             id="live-graph",
                             figure=initial_fig,
                             style={"height": "100vh"},
                             config={"responsive": True, "displaylogo": False},
                         ),
-                        width=9,
-                        className="pe-0",
+                        id="col-graph",
+                        style={"flex": "1 1 0", "minWidth": "200px", "overflow": "hidden"},
                     ),
-                    dbc.Col(
+                    html.Div(
+                        id="col-divider",
+                        title="Drag to resize",
+                        style={
+                            "width": "5px",
+                            "cursor": "col-resize",
+                            "backgroundColor": "#444",
+                            "flex": "0 0 5px",
+                        },
+                    ),
+                    html.Div(
                         [
                             html.H6(
                                 "pyBeamprofiler",
@@ -1087,21 +1201,31 @@ window.addEventListener('load', function() {
                                 className="small text-muted text-center mt-2",
                             ),
                         ],
-                        width=3,
+                        id="col-side",
                         className="ps-1",
-                        style={"height": "100vh", "overflowY": "auto"},
+                        style={
+                            "flex": "0 0 320px",
+                            "minWidth": "240px",
+                            "maxWidth": "60%",
+                            "height": "100vh",
+                            "overflowY": "auto",
+                        },
                     ),
                 ],
-                className="g-0",
+                style={"display": "flex", "width": "100%", "height": "100vh"},
             ),
             dcc.Interval(id="interval", interval=DEFAULT_UPDATE_INTERVAL_MS, n_intervals=0),
             dcc.Store(id="store-paused", data=False),
             dcc.Store(id="store-frame", data=0),
             dcc.Store(id="store-dark-theme", data=True),
+            # Pulse-counter store for "auto-fit zoom" / "reset zoom" requests.
+            # Bumped by the buttons; clientside callback applies the change
+            # without disturbing the live update loop.
+            dcc.Store(id="store-zoom-fit", data=0),
+            dcc.Store(id="store-zoom-reset", data=0),
             dcc.Download(id="download-png"),
+            dcc.Download(id="download-npy"),
         ],
-        fluid=True,
-        className="p-0",
         id="main-container",
         style={"backgroundColor": "#222"},
     )
@@ -1116,6 +1240,96 @@ window.addEventListener('load', function() {
 
 _callback_lock = threading.Lock()
 _server_paused = False
+
+# Rolling FPS tracker for the status bar.
+_recent_frame_times: collections.deque[float] = collections.deque(maxlen=20)
+
+# Rolling buffer for N-frame averaging. Recreated when N or shape changes.
+_avg_buffer: collections.deque[np.ndarray] = collections.deque(maxlen=1)
+_avg_buffer_shape: tuple[int, ...] | None = None
+
+
+def _measured_fps() -> float:
+    """Compute frames-per-second from the rolling timestamp window."""
+    if len(_recent_frame_times) < 2:
+        return 0.0
+    span = _recent_frame_times[-1] - _recent_frame_times[0]
+    if span <= 0:
+        return 0.0
+    return (len(_recent_frame_times) - 1) / span
+
+
+def _build_status(bp: BeamProfiler, img: np.ndarray, frame_count: int) -> Any:
+    """Build the status bar contents (frame, fps, exposure, gain, saturation)."""
+    pieces: list[Any] = [f"Frame #{frame_count}"]
+
+    fps = _measured_fps()
+    if fps:
+        pieces.append(f"{fps:.1f} fps")
+
+    cam = bp.camera
+    if cam is not None:
+        exp = getattr(cam, "exposure_time", None)
+        if exp:
+            pieces.append(f"Exp {exp * 1000:.2f} ms" if exp < 1.0 else f"Exp {exp:.2f} s")
+        gain = getattr(cam, "gain", None)
+        if gain is not None:
+            pieces.append(f"Gain {gain:.1f}")
+
+    children: list[Any] = []
+    for i, p in enumerate(pieces):
+        if i:
+            children.append(html.Span(" · ", className="text-muted mx-1"))
+        children.append(html.Span(p))
+
+    sat = _saturation_fraction(img)
+    if sat >= _SATURATION_PIXEL_FRACTION:
+        children.append(html.Span(" · ", className="text-muted mx-1"))
+        children.append(
+            html.Span(
+                [
+                    html.I(className="bi bi-exclamation-triangle-fill me-1"),
+                    f"{sat * 100:.1f}% saturated",
+                ],
+                className="text-danger fw-bold",
+                title=(
+                    f"{sat * 100:.2f}% of pixels reached the saturation level "
+                    f"({_saturation_max(img):.0f}). Reduce exposure or gain."
+                ),
+            )
+        )
+
+    return children
+
+
+def _averaged_image(image: np.ndarray, n: int) -> np.ndarray:
+    """Return a running mean of the last *n* frames including *image*.
+
+    Resets the internal buffer when *n* or the frame shape changes, so
+    callers don't have to worry about ROI changes mid-stream. Returns
+    *image* unchanged when ``n == 1``.
+    """
+    global _avg_buffer, _avg_buffer_shape  # noqa: PLW0603
+
+    n = max(1, min(int(n), _MAX_AVG_FRAMES))
+    if n == 1:
+        if _avg_buffer.maxlen != 1:
+            _avg_buffer = collections.deque(maxlen=1)
+        _avg_buffer_shape = image.shape
+        _avg_buffer.clear()
+        return image
+
+    if _avg_buffer.maxlen != n or _avg_buffer_shape != image.shape:
+        _avg_buffer = collections.deque(maxlen=n)
+        _avg_buffer_shape = image.shape
+
+    _avg_buffer.append(image)
+    if len(_avg_buffer) == 1:
+        return image
+    # Sum in float32 to avoid overflow then cast back to the source dtype
+    # so downstream code (saturation check, peak value) keeps its meaning.
+    stacked = np.stack(list(_avg_buffer)).astype(np.float32, copy=False)
+    return stacked.mean(axis=0).astype(image.dtype)
 
 
 def _register_callbacks(app: dash.Dash, bp: BeamProfiler) -> None:
@@ -1144,6 +1358,8 @@ def _register_callbacks(app: dash.Dash, bp: BeamProfiler) -> None:
                     bp.camera.stop_acquisition()
                 else:
                     bp.camera.start_acquisition()
+            _recent_frame_times.clear()
+            _avg_buffer.clear()
 
             items = _build_setting_items(bp)
 
@@ -1161,13 +1377,13 @@ def _register_callbacks(app: dash.Dash, bp: BeamProfiler) -> None:
 
         return new_paused, label, color, settings_body
 
-    # -- Save current frame ---------------------------------------------------
+    # -- Save current frame as PNG -------------------------------------------
     @app.callback(
         Output("download-png", "data"),
-        Input("btn-save", "n_clicks"),
+        Input("btn-save-png", "n_clicks"),
         prevent_initial_call=True,
     )
-    def save_frame(_n: int) -> dict[str, Any] | None:
+    def save_frame_png(_n: int) -> dict[str, Any] | None:
         img = bp.last_img
         if img is None:
             return None
@@ -1178,6 +1394,26 @@ def _register_callbacks(app: dash.Dash, bp: BeamProfiler) -> None:
         return {
             "content": b64,
             "filename": f"beam_{ts}.png",
+            "base64": True,
+        }
+
+    # -- Save current frame as raw NumPy array -------------------------------
+    @app.callback(
+        Output("download-npy", "data"),
+        Input("btn-save-npy", "n_clicks"),
+        prevent_initial_call=True,
+    )
+    def save_frame_npy(_n: int) -> dict[str, Any] | None:
+        img = bp.last_img
+        if img is None:
+            return None
+        buf = io.BytesIO()
+        np.save(buf, img, allow_pickle=False)
+        b64 = base64.b64encode(buf.getvalue()).decode()
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        return {
+            "content": b64,
+            "filename": f"beam_{ts}.npy",
             "base64": True,
         }
 
@@ -1211,6 +1447,122 @@ def _register_callbacks(app: dash.Dash, bp: BeamProfiler) -> None:
         Input("switch-theme", "value"),
     )
 
+    # -- Spacebar toggles Play / Pause (clientside) --------------------------
+    # Installs a single window-level keydown listener that ignores keystrokes
+    # in form fields so it doesn't hijack typing in inputs / sliders.
+    app.clientside_callback(
+        """function() {
+            if (window.__pbpSpaceHooked) { return window.dash_clientside.no_update; }
+            window.__pbpSpaceHooked = true;
+            document.addEventListener('keydown', function(e) {
+                if (e.code !== 'Space') return;
+                var t = e.target;
+                if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' ||
+                          t.tagName === 'SELECT' || t.isContentEditable)) {
+                    return;
+                }
+                var btn = document.getElementById('btn-play-pause');
+                if (btn) { e.preventDefault(); btn.click(); }
+            });
+            return window.dash_clientside.no_update;
+        }""",
+        Output("btn-play-pause", "title"),
+        Input("btn-play-pause", "id"),
+    )
+
+    # -- Auto-fit / reset zoom buttons → clientside relayout -----------------
+    # Pushes a relayout straight into the live-graph instead of round-tripping
+    # through the server, so the response is instantaneous even mid-stream.
+    app.clientside_callback(
+        """function(n) {
+            if (!n) return window.dash_clientside.no_update;
+            var gd = document.getElementById('live-graph');
+            if (!gd || !gd._fullLayout) return window.dash_clientside.no_update;
+            var fig = gd.data;
+            // Find the cached fit ellipse (the one whose name is undefined and has
+            // exactly 100 points, drawn dashed red) — fall back to data extents.
+            var cx = null, cy = null, rx = null, ry = null;
+            for (var i = 0; i < fig.length; i++) {
+                var t = fig[i];
+                if (t.type === 'scatter' && t.line && t.line.dash === 'dash' &&
+                    t.x && t.x.length === 100) {
+                    var xmin = Math.min.apply(null, t.x);
+                    var xmax = Math.max.apply(null, t.x);
+                    var ymin = Math.min.apply(null, t.y);
+                    var ymax = Math.max.apply(null, t.y);
+                    cx = (xmin + xmax) / 2;
+                    cy = (ymin + ymax) / 2;
+                    rx = (xmax - xmin) / 2;
+                    ry = (ymax - ymin) / 2;
+                    break;
+                }
+            }
+            if (cx === null) return window.dash_clientside.no_update;
+            // ±3σ box ≈ 3× the 1/e² ellipse semi-axes.
+            var pad = 1.5;
+            window.Plotly.relayout(gd, {
+                'xaxis.range': [cx - pad * rx, cx + pad * rx],
+                'yaxis.range': [cy - pad * ry, cy + pad * ry],
+            });
+            return window.dash_clientside.no_update;
+        }""",
+        Output("store-zoom-fit", "data"),
+        Input("btn-zoom-fit", "n_clicks"),
+        prevent_initial_call=True,
+    )
+
+    app.clientside_callback(
+        """function(n) {
+            if (!n) return window.dash_clientside.no_update;
+            var gd = document.getElementById('live-graph');
+            if (!gd) return window.dash_clientside.no_update;
+            window.Plotly.relayout(gd, {
+                'xaxis.autorange': true, 'yaxis.autorange': true,
+            });
+            return window.dash_clientside.no_update;
+        }""",
+        Output("store-zoom-reset", "data"),
+        Input("btn-zoom-reset", "n_clicks"),
+        prevent_initial_call=True,
+    )
+
+    # -- Draggable column divider (clientside) -------------------------------
+    # Keeps the layout state purely in the DOM — no Dash store round-trip
+    # while dragging, so it stays smooth even on slower machines.
+    app.clientside_callback(
+        """function() {
+            if (window.__pbpSplitHooked) { return window.dash_clientside.no_update; }
+            window.__pbpSplitHooked = true;
+            var divider = document.getElementById('col-divider');
+            var side = document.getElementById('col-side');
+            if (!divider || !side) return window.dash_clientside.no_update;
+            var dragging = false;
+            divider.addEventListener('mousedown', function(e) {
+                dragging = true;
+                document.body.style.userSelect = 'none';
+                e.preventDefault();
+            });
+            window.addEventListener('mousemove', function(e) {
+                if (!dragging) return;
+                var w = Math.max(240, Math.min(window.innerWidth - 240,
+                                               window.innerWidth - e.clientX));
+                side.style.flex = '0 0 ' + w + 'px';
+                if (window.Plotly) {
+                    var gd = document.getElementById('live-graph');
+                    if (gd) { window.Plotly.Plots.resize(gd); }
+                }
+            });
+            window.addEventListener('mouseup', function() {
+                if (!dragging) return;
+                dragging = false;
+                document.body.style.userSelect = '';
+            });
+            return window.dash_clientside.no_update;
+        }""",
+        Output("col-divider", "title"),
+        Input("col-divider", "id"),
+    )
+
     # -- Pixel scale override -------------------------------------------------
     @app.callback(
         Output("input-pixel-scale", "value"),
@@ -1238,6 +1590,8 @@ def _register_callbacks(app: dash.Dash, bp: BeamProfiler) -> None:
                     bp.camera.set_exposure(val / 1000.0)
                     if was_acquiring and not bp.camera.is_acquiring:
                         bp.camera.start_acquisition()
+                    _recent_frame_times.clear()
+                    _avg_buffer.clear()
                 except Exception as e:
                     logger.warning(f"Failed to set exposure: {e}")
         return val
@@ -1412,8 +1766,9 @@ def _register_callbacks(app: dash.Dash, bp: BeamProfiler) -> None:
         State("dropdown-analysis", "value"),
         State("dropdown-definition", "value"),
         State("store-dark-theme", "data"),
+        State("input-avg-n", "value"),
     )
-    async def update_live(
+    def update_live(
         _n: int,
         paused: bool,
         color_on: bool,
@@ -1425,15 +1780,18 @@ def _register_callbacks(app: dash.Dash, bp: BeamProfiler) -> None:
         analysis: str,
         definition: str,
         dark_theme: bool,
+        avg_n: int | None,
     ) -> tuple[Any, ...]:
         if paused or _server_paused:
             return (dash.no_update,) * 4
 
         if not _callback_lock.acquire(blocking=False):
+            # A previous tick is still running; skip this one and let the
+            # next interval fire. Keeps the UI responsive when a camera
+            # fetch takes longer than the tick interval.
             return (dash.no_update,) * 4
 
         try:
-            # Sync settings from GUI state
             if analysis and bp.fit_method != analysis:
                 bp.fit_method = analysis
                 bp._last_popt_x = None
@@ -1443,22 +1801,29 @@ def _register_callbacks(app: dash.Dash, bp: BeamProfiler) -> None:
                 bp.definition = definition
 
             if bp._mode == "camera" and bp.camera is not None:
-                img = await asyncio.to_thread(bp.camera.get_image)
+                # Cap fetch at one tick so sliders/buttons (which share
+                # ``_callback_lock``) never wait more than ~100 ms. During
+                # multi-second exposures this just times out repeatedly
+                # until the producer delivers the next frame.
+                try:
+                    img = bp.camera.get_image(timeout=0.1)
+                except TimeoutError:
+                    return (dash.no_update,) * 4
             else:
                 img = bp.last_img
 
             if img is None:
                 return (dash.no_update,) * 4
 
+            img = _averaged_image(img, avg_n or 1)
             bp.last_img = img
-
-            popt_x, popt_y = await asyncio.to_thread(bp.analyze, img)
+            popt_x, popt_y = bp.analyze(img)
 
             cs = cs_name if color_on else GRAY_COLORSCALE
             zmin = None if auto_range else (zmin_val if zmin_val is not None else 0)
-            zmax = None if auto_range else (zmax_val if zmax_val is not None else 255)
-            fig = await asyncio.to_thread(
-                build_figure,
+            zmax_default = _saturation_max(img)
+            zmax = None if auto_range else (zmax_val if zmax_val is not None else zmax_default)
+            fig = build_figure(
                 bp,
                 img,
                 popt_x,
@@ -1469,13 +1834,16 @@ def _register_callbacks(app: dash.Dash, bp: BeamProfiler) -> None:
                 dark_theme=dark_theme,
             )
 
+            _recent_frame_times.append(time.monotonic())
             frame_count += 1
-            results = _format_results(bp)
-            status = f"Frame #{frame_count}"
-
-            return fig, results, status, frame_count
-        except Exception as e:
-            logger.debug(f"Update error: {e}")
+            return (
+                fig,
+                _format_results(bp),
+                _build_status(bp, img, frame_count),
+                frame_count,
+            )
+        except Exception:
+            logger.exception("Update error")
             return (dash.no_update,) * 4
         finally:
             _callback_lock.release()
