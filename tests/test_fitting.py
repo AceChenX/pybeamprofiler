@@ -62,7 +62,9 @@ class TestOneDimensionalFitting:
         bp.camera.stop_acquisition()
 
         popt_x2, _ = bp.analyze(img2)
-        assert abs(popt_x2[2] - popt_x1[2]) < 100
+        # Sigma can converge to either sign (Gaussian is symmetric in sigma);
+        # production code uses abs(popt[2]), so compare widths the same way.
+        assert abs(abs(popt_x2[2]) - abs(popt_x1[2])) < 100
 
 
 class TestTwoDimensionalFitting:
