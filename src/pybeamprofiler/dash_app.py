@@ -189,7 +189,12 @@ def _fitting_tab(bp: BeamProfiler) -> dbc.Tab:
                                     label=[html.I(className="bi bi-download me-1"), "Save"],
                                     color="secondary",
                                     size="sm",
+                                    # ``className`` only styles the outer
+                                    # ``.dropdown`` wrapper; the toggle <button>
+                                    # stays content-sized unless we target it
+                                    # explicitly.
                                     className="w-100",
+                                    toggle_class_name="w-100",
                                     align_end=True,
                                 ),
                                 width=4,
