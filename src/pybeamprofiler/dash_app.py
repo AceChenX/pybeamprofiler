@@ -105,7 +105,8 @@ def _saturation_fraction(image: np.ndarray) -> float:
     if image.size == 0:
         return 0.0
     sat = _saturation_max(image)
-    # Treat anything within one quantisation step of the max as saturated.
+    # For integer images, only the exact dtype max counts as saturated.
+    # For floating-point images, allow a small epsilon near the inferred max.
     if np.issubdtype(image.dtype, np.integer):
         return float(np.count_nonzero(image >= sat)) / image.size
     return float(np.count_nonzero(image >= sat - 1e-6)) / image.size
