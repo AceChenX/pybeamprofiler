@@ -17,7 +17,7 @@ try:
     from genicam.genapi import (  # ty: ignore[unresolved-import]
         EInterfaceType as _EInterfaceType,
     )
-    from genicam.genapi import (
+    from genicam.genapi import (  # ty: ignore[unresolved-import]
         EVisibility as _EVisibility,
     )
 except ImportError:  # pragma: no cover - exercised only on non-GenICam envs
