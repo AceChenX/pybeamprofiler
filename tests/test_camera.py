@@ -595,7 +595,8 @@ class TestGenCameraGetImage:
 
     def test_harvesters_timeout_normalised(self):
         """The real ``harvesters.core.TimeoutException`` maps to ``TimeoutError``."""
-        from harvesters.core import TimeoutException
+        harvesters_core = pytest.importorskip("harvesters.core")
+        TimeoutException = harvesters_core.TimeoutException
 
         cam = self._make_mock_camera()
         cam.ia.fetch.side_effect = TimeoutException
@@ -636,7 +637,8 @@ class TestGenCameraGetImage:
 
     def test_stall_recovery_restarts_acquisition(self):
         """Consecutive timeouts beyond the stall window trigger stop/start."""
-        from harvesters.core import TimeoutException
+        harvesters_core = pytest.importorskip("harvesters.core")
+        TimeoutException = harvesters_core.TimeoutException
 
         cam = self._make_mock_camera()
         cam.ia.fetch.side_effect = TimeoutException
@@ -652,7 +654,8 @@ class TestGenCameraGetImage:
 
     def test_stall_recovery_is_one_shot(self):
         """A second timeout within the same stall window doesn't re-trigger recovery."""
-        from harvesters.core import TimeoutException
+        harvesters_core = pytest.importorskip("harvesters.core")
+        TimeoutException = harvesters_core.TimeoutException
 
         cam = self._make_mock_camera()
         cam.ia.fetch.side_effect = TimeoutException
@@ -671,7 +674,8 @@ class TestGenCameraGetImage:
 
     def test_first_timeout_seeds_stall_timer(self):
         """The very first fetch timing out should NOT trigger recovery."""
-        from harvesters.core import TimeoutException
+        harvesters_core = pytest.importorskip("harvesters.core")
+        TimeoutException = harvesters_core.TimeoutException
 
         cam = self._make_mock_camera()
         cam.ia.fetch.side_effect = TimeoutException
@@ -2149,10 +2153,9 @@ class TestDiscoverFeatures:
         iterable where each entry has ``principal_interface_type`` /
         ``visibility`` / ``name``. This drives the SWIG-shaped branch
         (lines 438-458) that ``dir()``-based discovery bypasses."""
-        from genicam.genapi import (  # ty: ignore[unresolved-import]
-            EInterfaceType,
-            EVisibility,
-        )
+        genapi = pytest.importorskip("genicam.genapi")
+        EInterfaceType = genapi.EInterfaceType
+        EVisibility = genapi.EVisibility
 
         cam = SimulatedCamera()
 

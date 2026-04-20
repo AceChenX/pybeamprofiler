@@ -2,12 +2,18 @@ version = 1
 revision = 3
 requires-python = ">=3.10"
 resolution-markers = [
-    "python_full_version >= '3.11'",
-    "python_full_version < '3.11'",
+    "python_full_version >= '3.14' and sys_platform == 'darwin'",
+    "python_full_version >= '3.11' and python_full_version < '3.14' and sys_platform == 'darwin'",
+    "python_full_version >= '3.11' and sys_platform != 'darwin'",
+    "python_full_version < '3.11' and sys_platform == 'darwin'",
+    "python_full_version < '3.11' and sys_platform != 'darwin'",
 ]
 
 [manifest]
-overrides = [{ name = "genicam", marker = "python_full_version < '3.14' and sys_platform == 'darwin'", specifier = "==1.5.0" }]
+overrides = [
+    { name = "genicam", marker = "sys_platform != 'darwin'", specifier = ">=1.2" },
+    { name = "genicam", marker = "python_full_version < '3.14' and sys_platform == 'darwin'", specifier = "==1.5.0" },
+]
 
 [[package]]
 name = "asgiref"
@@ -181,7 +187,8 @@ name = "contourpy"
 version = "1.3.2"
 source = { registry = "https://pypi.org/simple" }
 resolution-markers = [
-    "python_full_version < '3.11'",
+    "python_full_version < '3.11' and sys_platform == 'darwin'",
+    "python_full_version < '3.11' and sys_platform != 'darwin'",
 ]
 dependencies = [
     { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
@@ -251,7 +258,9 @@ name = "contourpy"
 version = "1.3.3"
 source = { registry = "https://pypi.org/simple" }
 resolution-markers = [
-    "python_full_version >= '3.11'",
+    "python_full_version >= '3.14' and sys_platform == 'darwin'",
+    "python_full_version >= '3.11' and python_full_version < '3.14' and sys_platform == 'darwin'",
+    "python_full_version >= '3.11' and sys_platform != 'darwin'",
 ]
 dependencies = [
     { name = "numpy", version = "2.4.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
@@ -628,9 +637,17 @@ version = "1.5.0"
 source = { registry = "https://pypi.org/simple" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/fa/26/07f3969f2d86599c3d7c2c6c19d993546a85b4f81dc0268ecf742ac4eb65/genicam-1.5.0-cp310-cp310-macosx_13_0_arm64.whl", hash = "sha256:a050e219a9b1d315bb00069643c58f9b902926a2096385d0f9edd5d56a63fb20", size = 3963641, upload-time = "2025-08-29T16:18:43.599Z" },
+    { url = "https://files.pythonhosted.org/packages/1e/1a/80e24557b031976b1a46638ab3a8eb92a50e7e2c7a8eeafd41dc2692adbe/genicam-1.5.0-cp310-cp310-manylinux2014_x86_64.whl", hash = "sha256:54fee0de0502239faeec1e2ddd271d60ff35c6f7c4e98c538811a208a214fd34", size = 2959640, upload-time = "2025-08-29T16:18:45.687Z" },
+    { url = "https://files.pythonhosted.org/packages/b8/5f/4fe42bc525c55a2d5d3bc1c2c0f1599c100c1ddda61e5227aa60ef7da859/genicam-1.5.0-cp310-cp310-win_amd64.whl", hash = "sha256:57512f9daaa360bd11af12bb6d3c617e7ad2fafd61d198f04f41892672d9d2dc", size = 1880891, upload-time = "2025-08-29T16:18:46.956Z" },
     { url = "https://files.pythonhosted.org/packages/fa/83/5755e630a0b31a1b3a6d695943e9d2f1d37df0865b93da3180dec58b6288/genicam-1.5.0-cp311-cp311-macosx_13_0_arm64.whl", hash = "sha256:61667b320d384451233f6cc5718ffa181d4c5a95d9a853f64277b96140a6d624", size = 3963847, upload-time = "2025-08-29T16:18:48.47Z" },
+    { url = "https://files.pythonhosted.org/packages/7d/64/063730f9a9f48ddb32ea3c341ddc40dc82e47ed0d6d791d5952c742d60b4/genicam-1.5.0-cp311-cp311-manylinux2014_x86_64.whl", hash = "sha256:a6044f508ec7c6099cadb55ec75fb77268bd4ff792982387ec82ed639467cad7", size = 2954725, upload-time = "2025-08-29T16:18:50.455Z" },
+    { url = "https://files.pythonhosted.org/packages/d1/1c/38d0f637a2320f4c8f6757a22a0cebb23fbd10fcf1549ef693b9ee9f8ca9/genicam-1.5.0-cp311-cp311-win_amd64.whl", hash = "sha256:13a2f6c40874c8c57bf8e685f0ff68e2913eea1a57201dd46de076a14acff08f", size = 1880796, upload-time = "2025-08-29T16:18:51.705Z" },
     { url = "https://files.pythonhosted.org/packages/55/71/f49417ec4e7c1c3b6fd17936d7e76615b91af64fda661f3c04fc2a439ff0/genicam-1.5.0-cp312-cp312-macosx_13_0_arm64.whl", hash = "sha256:decfd1b05526e4eb5d5a4ea61adfb7f4566f1ea849c3cd4ed8474f012e1e817e", size = 3968437, upload-time = "2025-08-29T16:18:53.346Z" },
+    { url = "https://files.pythonhosted.org/packages/42/e2/2a35e6c90ba4378852d7ad9caa7479771360d3a3956bf1cc7fbc9c791127/genicam-1.5.0-cp312-cp312-manylinux2014_x86_64.whl", hash = "sha256:a0f3f655991eff76330bd8ff6bad8653f56ca87738e6c89bdef1b7f8a0e3a523", size = 2957207, upload-time = "2025-08-29T16:18:54.971Z" },
+    { url = "https://files.pythonhosted.org/packages/14/b5/4cfb0d5e242358a5d011a5bab72f78324f42a9e3f91e60912e58ac0ce253/genicam-1.5.0-cp312-cp312-win_amd64.whl", hash = "sha256:40257a687d01843b14ec6d126e3701812b9c073e4fd4b87d7594f85e71fbb9e4", size = 1881986, upload-time = "2025-08-29T16:18:56.629Z" },
     { url = "https://files.pythonhosted.org/packages/24/74/88427466666f9f83a74e27e19bcf000a24bc4564535c95d972a4c7b265e5/genicam-1.5.0-cp313-cp313-macosx_13_0_arm64.whl", hash = "sha256:9a94ed226f483a54a142eddf87d622b4fdd916ef3400df7fe2e52536c5c5ed0d", size = 3968446, upload-time = "2025-08-29T16:18:58.242Z" },
+    { url = "https://files.pythonhosted.org/packages/da/2a/89d61f2c15cb4c2aa7e12a50868885d095ed4de2030f6dd698669f798395/genicam-1.5.0-cp313-cp313-manylinux2014_x86_64.whl", hash = "sha256:2b7a384de05f45a96fafe5040cc7d10cc520940fd1332fafb26ff9106fb7fa51", size = 2957204, upload-time = "2025-08-29T16:18:59.536Z" },
+    { url = "https://files.pythonhosted.org/packages/58/ea/2fba243c51258e0a7a0321f0b0126de3e1127ae6bd3ca41fe0e8f51f6745/genicam-1.5.0-cp313-cp313-win_amd64.whl", hash = "sha256:eb72ba98ae7041cb45a5685eb464b515fc2e2aa84da9f9a91f6ae2f5476e2ca5", size = 1881994, upload-time = "2025-08-29T16:19:00.978Z" },
 ]
 
 [[package]]
@@ -638,7 +655,7 @@ name = "harvesters"
 version = "1.4.3"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "genicam", marker = "python_full_version < '3.14' and sys_platform == 'darwin'" },
+    { name = "genicam", marker = "python_full_version < '3.14' or sys_platform != 'darwin'" },
     { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "numpy", version = "2.4.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
 ]
@@ -691,7 +708,8 @@ name = "ipython"
 version = "8.38.0"
 source = { registry = "https://pypi.org/simple" }
 resolution-markers = [
-    "python_full_version < '3.11'",
+    "python_full_version < '3.11' and sys_platform == 'darwin'",
+    "python_full_version < '3.11' and sys_platform != 'darwin'",
 ]
 dependencies = [
     { name = "colorama", marker = "python_full_version < '3.11' and sys_platform == 'win32'" },
@@ -716,7 +734,9 @@ name = "ipython"
 version = "9.10.0"
 source = { registry = "https://pypi.org/simple" }
 resolution-markers = [
-    "python_full_version >= '3.11'",
+    "python_full_version >= '3.14' and sys_platform == 'darwin'",
+    "python_full_version >= '3.11' and python_full_version < '3.14' and sys_platform == 'darwin'",
+    "python_full_version >= '3.11' and sys_platform != 'darwin'",
 ]
 dependencies = [
     { name = "colorama", marker = "python_full_version >= '3.11' and sys_platform == 'win32'" },
@@ -1119,7 +1139,8 @@ name = "numpy"
 version = "2.2.6"
 source = { registry = "https://pypi.org/simple" }
 resolution-markers = [
-    "python_full_version < '3.11'",
+    "python_full_version < '3.11' and sys_platform == 'darwin'",
+    "python_full_version < '3.11' and sys_platform != 'darwin'",
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/76/21/7d2a95e4bba9dc13d043ee156a356c0a8f0c6309dff6b21b4d71a073b8a8/numpy-2.2.6.tar.gz", hash = "sha256:e29554e2bef54a90aa5cc07da6ce955accb83f21ab5de01a62c8478897b264fd", size = 20276440, upload-time = "2025-05-17T22:38:04.611Z" }
 wheels = [
@@ -1184,7 +1205,9 @@ name = "numpy"
 version = "2.4.2"
 source = { registry = "https://pypi.org/simple" }
 resolution-markers = [
-    "python_full_version >= '3.11'",
+    "python_full_version >= '3.14' and sys_platform == 'darwin'",
+    "python_full_version >= '3.11' and python_full_version < '3.14' and sys_platform == 'darwin'",
+    "python_full_version >= '3.11' and sys_platform != 'darwin'",
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/57/fd/0005efbd0af48e55eb3c7208af93f2862d4b1a56cd78e84309a2d959208d/numpy-2.4.2.tar.gz", hash = "sha256:659a6107e31a83c4e33f763942275fd278b21d095094044eb35569e86a21ddae", size = 20723651, upload-time = "2026-01-31T23:13:10.135Z" }
 wheels = [
@@ -1509,11 +1532,11 @@ requires-dist = [
     { name = "numpy" },
     { name = "pillow" },
     { name = "plotly" },
-    { name = "pre-commit", marker = "extra == 'dev'", specifier = ">=4.5.0" },
+    { name = "pre-commit", marker = "extra == 'dev'", specifier = ">=4.5" },
     { name = "pybeamprofiler", extras = ["test"], marker = "extra == 'dev'" },
     { name = "pytest", marker = "extra == 'test'", specifier = ">=9.0" },
     { name = "pytest-cov", marker = "extra == 'test'", specifier = ">=7.0" },
-    { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.15.0" },
+    { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.15" },
     { name = "scipy" },
     { name = "ty", marker = "extra == 'dev'", specifier = ">=0.0.30" },
 ]
@@ -1712,7 +1735,8 @@ name = "scipy"
 version = "1.15.3"
 source = { registry = "https://pypi.org/simple" }
 resolution-markers = [
-    "python_full_version < '3.11'",
+    "python_full_version < '3.11' and sys_platform == 'darwin'",
+    "python_full_version < '3.11' and sys_platform != 'darwin'",
 ]
 dependencies = [
     { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
@@ -1771,7 +1795,9 @@ name = "scipy"
 version = "1.17.0"
 source = { registry = "https://pypi.org/simple" }
 resolution-markers = [
-    "python_full_version >= '3.11'",
+    "python_full_version >= '3.14' and sys_platform == 'darwin'",
+    "python_full_version >= '3.11' and python_full_version < '3.14' and sys_platform == 'darwin'",
+    "python_full_version >= '3.11' and sys_platform != 'darwin'",
 ]
 dependencies = [
     { name = "numpy", version = "2.4.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
