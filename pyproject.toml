@@ -49,19 +49,22 @@ pybeamprofiler = "pybeamprofiler.beamprofiler:main"
 packages = ["src/pybeamprofiler"]
 
 [tool.uv]
-# Override harvesters' ``genicam>=1.2`` dep per platform:
-# * macOS Python <3.14: pin 1.5.0 (last version with ``macosx_13_0_arm64``
-#   wheels; 1.5.1+ dropped all macOS wheels).
-# * macOS Python 3.14+: no wheel exists for any genicam release — no override
-#   here; ``harvesters`` will import-fail at runtime, which the package
-#   already handles gracefully.
-# * Linux / Windows: ``genicam>=1.2`` (matches harvesters' own declaration),
-#   so uv installs it on CI runners. Without this entry the macOS-only
-#   override above would *replace* harvesters' dep entirely, and uv would
-#   skip genicam everywhere.
+# Override harvesters' ``genicam>=1.2`` dep per platform. The version
+# constraints below are deliberately *disjoint* per platform: this forces
+# uv's resolver to fork by marker rather than unifying to a single version
+# (which would otherwise pin 1.5.0 globally and break Python 3.14 on
+# Linux/Windows, where 1.5.0 has no cp314 wheel).
+#
+# * macOS Python <3.14: pin 1.5.0 — the last release with macOS wheels
+#   (``macosx_13_0_arm64``, cp310–cp313). 1.5.1+ dropped all macOS wheels.
+# * macOS Python 3.14+: no wheel exists for any genicam release on macOS.
+#   No override matches; uv excludes genicam here and ``harvesters`` will
+#   import-fail at runtime — handled gracefully by the package.
+# * Linux / Windows: pin 1.5.1+ (the first release with cp314 wheels;
+#   cp310–cp313 wheels for 1.5.1 still exist for older Pythons too).
 override-dependencies = [
     "genicam==1.5.0 ; sys_platform == 'darwin' and python_version < '3.14'",
-    "genicam>=1.2 ; sys_platform != 'darwin'",
+    "genicam>=1.5.1 ; sys_platform != 'darwin'",
 ]
 
 [project.optional-dependencies]
