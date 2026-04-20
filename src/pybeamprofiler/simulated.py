@@ -159,6 +159,15 @@ class SimulatedCamera(Camera):
 
         self.node_map: _SimulatedNodeMap | None = None
 
+        # Precompute coordinate axes and reusable scratch buffer so that
+        # get_image() avoids reallocating ~16 MB of meshgrid every frame.
+        # The Gaussian is separable (G(x,y) = Gx(x) * Gy(y)) so we only
+        # need 1D exp() over W+H elements instead of a 2D one over W*H.
+        self._x_axis = np.arange(SIMULATED_WIDTH, dtype=np.float32)
+        self._y_axis = np.arange(SIMULATED_HEIGHT, dtype=np.float32)
+        self._frame_buf = np.empty((SIMULATED_HEIGHT, SIMULATED_WIDTH), dtype=np.float32)
+        self._rng = np.random.default_rng()
+
     def open(self) -> None:
         """Open the simulated camera and initialize the node map."""
         self.node_map = _SimulatedNodeMap(self)
@@ -191,27 +200,30 @@ class SimulatedCamera(Camera):
             2D numpy array of uint8 intensity values.
         """
         del timeout
-        cx = self._center_x + np.random.normal(0, self._noise_center)
-        cy = self._center_y + np.random.normal(0, self._noise_center)
-        sx = self._sigma_x + np.random.normal(0, self._noise_sigma)
-        sy = self._sigma_y + np.random.normal(0, self._noise_sigma)
-        amp = max(1.0, self._amplitude + np.random.normal(0, self._noise_amp))
-        bg = max(0.0, self._background + np.random.normal(0, self._noise_bg))
-        noise = np.random.normal(0, self._noise_image, (SIMULATED_HEIGHT, SIMULATED_WIDTH))
+        rng = self._rng
+        cx = self._center_x + rng.normal(0, self._noise_center)
+        cy = self._center_y + rng.normal(0, self._noise_center)
+        sx = self._sigma_x + rng.normal(0, self._noise_sigma)
+        sy = self._sigma_y + rng.normal(0, self._noise_sigma)
+        amp = max(1.0, self._amplitude + rng.normal(0, self._noise_amp))
+        bg = max(0.0, self._background + rng.normal(0, self._noise_bg))
 
-        x = np.arange(0, SIMULATED_WIDTH)
-        y = np.arange(0, SIMULATED_HEIGHT)
-        xv, yv = np.meshgrid(x, y)
+        # Separable Gaussian: G(x,y) = amp * Gx(x) * Gy(y). Computing two
+        # 1D exponentials over W and H elements is ~30x cheaper than one
+        # 2D exponential over W*H, and avoids meshgrid allocations.
+        gx = np.exp(-((self._x_axis - cx) ** 2) / (2 * sx * sx))
+        gy = np.exp(-((self._y_axis - cy) ** 2) / (2 * sy * sy))
+        np.outer(gy, gx, out=self._frame_buf)
+        self._frame_buf *= amp
+        self._frame_buf += bg
+        self._frame_buf += rng.normal(
+            0, self._noise_image, (SIMULATED_HEIGHT, SIMULATED_WIDTH)
+        ).astype(np.float32, copy=False)
 
-        gaussian = amp * np.exp(-((xv - cx) ** 2 / (2 * sx**2) + (yv - cy) ** 2 / (2 * sy**2)))
-
-        image = gaussian + bg + noise
-        image = np.clip(image, 0, 255).astype(np.uint8)
-
-        # Apply ROI crop
         ox, oy = self._roi_offset_x, self._roi_offset_y
         rw, rh = self._roi_width, self._roi_height
-        image = image[oy : oy + rh, ox : ox + rw]
+        cropped = self._frame_buf[oy : oy + rh, ox : ox + rw]
+        image = np.clip(cropped, 0, 255).astype(np.uint8)
 
         self.image_buffer = image
         return image
