@@ -2323,15 +2323,13 @@ class TestCallbackErrorBranches:
 class TestIsReadonlyEAccessMode:
     """``_is_readonly`` branches that depend on GenICam's ``EAccessMode``
     enum — exercised only when a node exposes ``get_access_mode`` AND
-    ``genicam.genapi`` is importable. Skipped on platforms with no
-    ``genicam`` wheel (e.g. macOS Python 3.14+)."""
+    ``genicam.genapi`` is importable (it is, in our dev env)."""
 
     @pytest.mark.parametrize("mode_name", ["RO", "NA", "NI"])
     def test_access_mode_readonly_states(self, mode_name: str):
         # Import the real enum so the ``mode in (...)`` comparison hits
         # the true branch inside the helper.
-        genapi = pytest.importorskip("genicam.genapi")
-        EAccessMode = genapi.EAccessMode
+        from genicam.genapi import EAccessMode  # ty: ignore[unresolved-import]
 
         from pybeamprofiler.dash_app import _is_readonly
 
@@ -2347,8 +2345,7 @@ class TestIsReadonlyEAccessMode:
         assert _is_readonly(Node(mode)) is True
 
     def test_access_mode_writable(self):
-        genapi = pytest.importorskip("genicam.genapi")
-        EAccessMode = genapi.EAccessMode
+        from genicam.genapi import EAccessMode  # ty: ignore[unresolved-import]
 
         from pybeamprofiler.dash_app import _is_readonly
 
