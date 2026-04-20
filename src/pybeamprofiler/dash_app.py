@@ -19,7 +19,7 @@ import dash
 import dash_bootstrap_components as dbc
 import numpy as np
 import plotly.graph_objs as go
-from dash import MATCH, Input, Output, State, ctx, dcc, html
+from dash import MATCH, Input, Output, Patch, State, ctx, dcc, html
 from PIL import Image
 from scipy.ndimage import zoom as _ndimage_zoom
 
@@ -908,6 +908,8 @@ def build_figure(
     zmin: float | None = None,
     zmax: float | None = None,
     dark_theme: bool = True,
+    xrange: list[float] | None = None,
+    yrange: list[float] | None = None,
 ) -> go.Figure:
     """Build a single-plot figure with profiles overlaid on the heatmap.
 
@@ -1095,14 +1097,14 @@ def build_figure(
         yaxis=dict(
             scaleanchor="x",
             scaleratio=1,
-            range=[0, y_max],
+            range=yrange if yrange is not None else [0, y_max],
             showgrid=False,
             title="Y (μm)",
             title_font_size=11,
         ),
         xaxis=dict(
             constrain="domain",
-            range=[0, x_max],
+            range=xrange if xrange is not None else [0, x_max],
             showgrid=False,
             title="X (μm)",
             title_font_size=11,
@@ -1184,6 +1186,10 @@ def create_app(bp: BeamProfiler) -> dash.Dash:
             dbc.icons.BOOTSTRAP,
         ],
         title="pyBeamprofiler",
+        # Don't attach Dash's own StreamHandler; the parent CLI manages logging
+        # (otherwise the "Dash is running on..." banner appears twice -- once
+        # from Dash's handler and once propagated to the root logger).
+        add_log_handler=False,
     )
 
     app.index_string = """<!DOCTYPE html>
@@ -1289,11 +1295,6 @@ window.addEventListener('load', function() {
             dcc.Store(id="store-paused", data=False),
             dcc.Store(id="store-frame", data=0),
             dcc.Store(id="store-dark-theme", data=True),
-            # Pulse-counter store for "auto-fit zoom" / "reset zoom" requests.
-            # Bumped by the buttons; clientside callback applies the change
-            # without disturbing the live update loop.
-            dcc.Store(id="store-zoom-fit", data=0),
-            dcc.Store(id="store-zoom-reset", data=0),
             dcc.Download(id="download-png"),
             dcc.Download(id="download-npy"),
         ],
@@ -1322,6 +1323,13 @@ _recent_frame_times: collections.deque[float] = collections.deque(maxlen=20)
 _avg_buffer: collections.deque[np.ndarray] = collections.deque(maxlen=1)
 _avg_buffer_shape: tuple[int, ...] | None = None
 _avg_running_sum: np.ndarray | None = None
+
+# Authoritative zoom state, mutated by Auto-fit / Reset under
+# ``_callback_lock`` and read by ``update_live``. Using a module
+# variable (rather than a Dash ``State``) avoids a 50–100 ms
+# stale-snapshot race that would otherwise blink the previous zoom
+# for one frame whenever a click landed mid-tick.
+_zoom_range: dict[str, list[float]] | None = None
 
 
 def _measured_fps() -> float:
@@ -1431,8 +1439,9 @@ def _averaged_image(image: np.ndarray, n: int) -> np.ndarray:
 
 def _register_callbacks(app: dash.Dash, bp: BeamProfiler) -> None:
     """Wire up all Dash callbacks."""
-    global _server_paused  # noqa: PLW0603
+    global _server_paused, _zoom_range  # noqa: PLW0603
     _server_paused = False
+    _zoom_range = None
 
     # -- Play / Pause toggle --------------------------------------------------
     @app.callback(
@@ -1567,61 +1576,58 @@ def _register_callbacks(app: dash.Dash, bp: BeamProfiler) -> None:
         Input("btn-play-pause", "id"),
     )
 
-    # -- Auto-fit / reset zoom buttons → clientside relayout -----------------
-    # Pushes a relayout straight into the live-graph instead of round-tripping
-    # through the server, so the response is instantaneous even mid-stream.
-    app.clientside_callback(
-        """function(n) {
-            if (!n) return window.dash_clientside.no_update;
-            var gd = document.getElementById('live-graph');
-            if (!gd || !gd._fullLayout) return window.dash_clientside.no_update;
-            var fig = gd.data;
-            // Find the cached fit ellipse (the one whose name is undefined and has
-            // exactly 100 points, drawn dashed red) — fall back to data extents.
-            var cx = null, cy = null, rx = null, ry = null;
-            for (var i = 0; i < fig.length; i++) {
-                var t = fig[i];
-                if (t.type === 'scatter' && t.line && t.line.dash === 'dash' &&
-                    t.x && t.x.length === 100) {
-                    var xmin = Math.min.apply(null, t.x);
-                    var xmax = Math.max.apply(null, t.x);
-                    var ymin = Math.min.apply(null, t.y);
-                    var ymax = Math.max.apply(null, t.y);
-                    cx = (xmin + xmax) / 2;
-                    cy = (ymin + ymax) / 2;
-                    rx = (xmax - xmin) / 2;
-                    ry = (ymax - ymin) / 2;
-                    break;
-                }
-            }
-            if (cx === null) return window.dash_clientside.no_update;
-            // ±3σ box ≈ 3× the 1/e² ellipse semi-axes.
-            var pad = 1.5;
-            window.Plotly.relayout(gd, {
-                'xaxis.range': [cx - pad * rx, cx + pad * rx],
-                'yaxis.range': [cy - pad * ry, cy + pad * ry],
-            });
-            return window.dash_clientside.no_update;
-        }""",
-        Output("store-zoom-fit", "data"),
+    # -- Auto-fit / reset zoom buttons ---------------------------------------
+    # The zoom range is held in the module-level ``_zoom_range`` variable
+    # (the live source of truth read by ``update_live``) and a ``Patch``
+    # is sent to the figure so the change is visible immediately, whether
+    # the stream is running or paused.
+    @app.callback(
+        Output("live-graph", "figure", allow_duplicate=True),
         Input("btn-zoom-fit", "n_clicks"),
         prevent_initial_call=True,
     )
+    def auto_fit_zoom(n_clicks: int | None) -> Any:
+        global _zoom_range  # noqa: PLW0603
+        if not n_clicks:
+            return dash.no_update
+        popt_x = bp._last_popt_x
+        popt_y = bp._last_popt_y
+        if popt_x is None or popt_y is None:
+            return dash.no_update
+        ps = bp.pixel_size
+        cx, cy = popt_x[1] * ps, popt_y[1] * ps
+        # 1/e² semi-axis = 2σ.  Pad by 1.5× → ±3σ box around the beam.
+        rx, ry = 2 * abs(popt_x[2]) * ps, 2 * abs(popt_y[2]) * ps
+        pad = 1.5
+        zoom = {
+            "x": [cx - pad * rx, cx + pad * rx],
+            "y": [cy - pad * ry, cy + pad * ry],
+        }
+        with _callback_lock:
+            _zoom_range = zoom
+        patch = Patch()
+        patch["layout"]["xaxis"]["range"] = zoom["x"]
+        patch["layout"]["yaxis"]["range"] = zoom["y"]
+        return patch
 
-    app.clientside_callback(
-        """function(n) {
-            if (!n) return window.dash_clientside.no_update;
-            var gd = document.getElementById('live-graph');
-            if (!gd) return window.dash_clientside.no_update;
-            window.Plotly.relayout(gd, {
-                'xaxis.autorange': true, 'yaxis.autorange': true,
-            });
-            return window.dash_clientside.no_update;
-        }""",
-        Output("store-zoom-reset", "data"),
+    @app.callback(
+        Output("live-graph", "figure", allow_duplicate=True),
         Input("btn-zoom-reset", "n_clicks"),
         prevent_initial_call=True,
     )
+    def reset_zoom(n_clicks: int | None) -> Any:
+        global _zoom_range  # noqa: PLW0603
+        if not n_clicks:
+            return dash.no_update
+        with _callback_lock:
+            _zoom_range = None
+        patch = Patch()
+        img = bp.last_img
+        if img is not None:
+            ps = bp.pixel_size
+            patch["layout"]["xaxis"]["range"] = [0, img.shape[1] * ps]
+            patch["layout"]["yaxis"]["range"] = [0, img.shape[0] * ps]
+        return patch
 
     # -- Draggable column divider (clientside) -------------------------------
     # Keeps the layout state purely in the DOM — no Dash store round-trip
@@ -1957,6 +1963,14 @@ def _register_callbacks(app: dash.Dash, bp: BeamProfiler) -> None:
             zmin = None if auto_range else (zmin_val if zmin_val is not None else 0)
             zmax_default = _saturation_max(img)
             zmax = None if auto_range else (zmax_val if zmax_val is not None else zmax_default)
+            # Read the live source of truth (mutated by Auto-fit / Reset
+            # under ``_callback_lock``) instead of capturing it as Dash
+            # ``State``: a State snapshot can be 50–100 ms stale if a
+            # zoom click fires after this tick started, which would
+            # cause a one-frame blink to the previous zoom.
+            current_zoom = _zoom_range
+            xrange = current_zoom["x"] if current_zoom else None
+            yrange = current_zoom["y"] if current_zoom else None
             fig = build_figure(
                 bp,
                 img,
@@ -1966,6 +1980,8 @@ def _register_callbacks(app: dash.Dash, bp: BeamProfiler) -> None:
                 zmin=zmin,
                 zmax=zmax,
                 dark_theme=dark_theme,
+                xrange=xrange,
+                yrange=yrange,
             )
 
             _recent_frame_times.append(time.monotonic())

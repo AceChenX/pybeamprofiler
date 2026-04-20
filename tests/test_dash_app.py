@@ -1030,7 +1030,13 @@ def _fire_slider(fn: Any, slider_id: str, val: float) -> Any:
 
 
 def _extract_callback(bp: BeamProfiler, output_id: str) -> Any:
-    """Register callbacks on a throwaway Dash app and find one by output id."""
+    """Register callbacks on a throwaway Dash app and find one by output id.
+
+    For ``live-graph`` (which has multiple writers — the live update loop,
+    plus Auto-fit / Reset that emit a ``Patch``), this returns the
+    ``update_live`` callback specifically, identified by its ``interval``
+    Input which no other callback uses.
+    """
     from pybeamprofiler.dash_app import _register_callbacks
 
     app = dash.Dash(__name__)
@@ -1049,6 +1055,13 @@ def _extract_callback(bp: BeamProfiler, output_id: str) -> Any:
     app.callback = tracking_callback  # ty: ignore[invalid-assignment]
     _register_callbacks(app, bp)
 
+    if output_id == "live-graph":
+        # Disambiguate the live update loop from the Patch-emitting
+        # Auto-fit / Reset callbacks that also write to live-graph.
+        for key, func in captured.items():
+            if output_id in key and "interval" in key:
+                return func
+        return None
     for key, func in captured.items():
         if output_id in key:
             return func
@@ -2490,3 +2503,207 @@ class TestApplyRoiMissingFields:
         assert fn is not None
         result = fn(1, None, 0, 512, 512)
         assert "Please enter" in result
+
+
+# ─── Server-managed Auto-fit / Reset zoom ──────────────────────────────────
+
+
+def _extract_callback_by_input(bp: BeamProfiler, input_id: str) -> Any:
+    """Find a registered callback whose Input id matches ``input_id``.
+
+    Several callbacks now write to ``store-zoom-range`` (Auto-fit,
+    Reset), so we disambiguate by the trigger they listen to.
+    """
+    from pybeamprofiler.dash_app import _register_callbacks
+
+    app = dash.Dash(__name__)
+    app.layout = html.Div()
+    captured: list[tuple[str, Any]] = []
+    original_callback = app.callback
+
+    def tracking_callback(*args, **kwargs):
+        def decorator(f):
+            captured.append((str(args), f))
+            return original_callback(*args, **kwargs)(f)
+
+        return decorator
+
+    app.callback = tracking_callback  # ty: ignore[invalid-assignment]
+    _register_callbacks(app, bp)
+
+    for key, func in captured:
+        if input_id in key:
+            return func
+    return None
+
+
+class TestZoomCallbacks:
+    """Auto-fit and Reset return a layout-only ``Patch`` for instant
+    feedback (works even when paused), and publish to the module-level
+    ``_zoom_range`` so ``update_live`` keeps the same view on subsequent
+    live ticks."""
+
+    def test_auto_fit_no_clicks_returns_no_update(self):
+        bp = BeamProfiler(camera="simulated")
+        fn = _extract_callback_by_input(bp, "btn-zoom-fit")
+        assert fn is not None
+        assert isinstance(fn(0), dash._no_update.NoUpdate)
+
+    def test_auto_fit_without_fit_data_returns_no_update(self):
+        bp = BeamProfiler(camera="simulated")
+        bp._last_popt_x = None
+        bp._last_popt_y = None
+        fn = _extract_callback_by_input(bp, "btn-zoom-fit")
+        assert fn is not None
+        assert isinstance(fn(1), dash._no_update.NoUpdate)
+
+    def test_auto_fit_publishes_zoom_and_returns_patch(self):
+        """Auto-fit must publish to ``_zoom_range`` (so the next tick of
+        ``update_live`` keeps the view) AND return a Patch (so the click
+        is reflected immediately, even when paused)."""
+        from dash import Patch
+
+        import pybeamprofiler.dash_app as da
+
+        bp = BeamProfiler(camera="simulated")
+        assert bp.camera is not None
+        bp.camera.start_acquisition()
+        img = bp.camera.get_image()
+        bp.camera.stop_acquisition()
+        bp.fit_method = "1d"
+        bp.analyze(img)
+        assert bp._last_popt_x is not None and bp._last_popt_y is not None
+        fn = _extract_callback_by_input(bp, "btn-zoom-fit")
+        assert fn is not None
+        original = da._zoom_range
+        da._zoom_range = None
+        try:
+            patch = fn(1)
+            assert isinstance(patch, Patch)
+            assert da._zoom_range is not None
+            zoom = da._zoom_range
+            cx = bp._last_popt_x[1] * bp.pixel_size
+            cy = bp._last_popt_y[1] * bp.pixel_size
+            assert abs((zoom["x"][0] + zoom["x"][1]) / 2 - cx) < bp.pixel_size
+            assert abs((zoom["y"][0] + zoom["y"][1]) / 2 - cy) < bp.pixel_size
+            assert zoom["x"][1] > zoom["x"][0]
+            assert zoom["y"][1] > zoom["y"][0]
+        finally:
+            da._zoom_range = original
+
+    def test_reset_zoom_clears_zoom_and_returns_patch(self):
+        from dash import Patch
+
+        import pybeamprofiler.dash_app as da
+
+        bp = BeamProfiler(camera="simulated")
+        assert bp.camera is not None
+        bp.camera.start_acquisition()
+        bp.last_img = bp.camera.get_image()
+        bp.camera.stop_acquisition()
+        fn = _extract_callback_by_input(bp, "btn-zoom-reset")
+        assert fn is not None
+        original = da._zoom_range
+        da._zoom_range = {"x": [0.0, 1.0], "y": [0.0, 1.0]}
+        try:
+            patch = fn(1)
+            assert isinstance(patch, Patch)
+            assert da._zoom_range is None
+        finally:
+            da._zoom_range = original
+
+    def test_reset_zoom_without_image_does_not_crash(self):
+        """Reset clicked before any frame arrives must not crash; the
+        patch is empty and the next tick will set the proper range."""
+        from dash import Patch
+
+        bp = BeamProfiler(camera="simulated")
+        bp.last_img = None
+        fn = _extract_callback_by_input(bp, "btn-zoom-reset")
+        assert fn is not None
+        assert isinstance(fn(1), Patch)
+
+    def test_reset_zoom_no_clicks_returns_no_update(self):
+        bp = BeamProfiler(camera="simulated")
+        fn = _extract_callback_by_input(bp, "btn-zoom-reset")
+        assert fn is not None
+        assert isinstance(fn(0), dash._no_update.NoUpdate)
+
+    def test_update_live_reads_module_zoom(self):
+        """``update_live`` must read ``_zoom_range`` (the live source of
+        truth) so a click that fires *after* a tick starts is still
+        applied at figure-build time — no one-frame blink."""
+        from unittest.mock import patch
+
+        import pybeamprofiler.dash_app as da
+
+        bp = BeamProfiler(camera="simulated")
+        assert bp.camera is not None
+        bp.camera.start_acquisition()
+        fn = _extract_callback(bp, "live-graph")
+        assert fn is not None
+        zoom = {"x": [100.0, 500.0], "y": [50.0, 450.0]}
+        original = da._zoom_range
+        da._zoom_range = zoom
+        try:
+            with patch("pybeamprofiler.dash_app.build_figure") as mock_bf:
+                mock_bf.return_value = "FIG"
+                fn(1, False, True, "Hot", True, None, None, 0, "1d", "gaussian", True, 1)
+                kwargs = mock_bf.call_args.kwargs
+            assert kwargs["xrange"] == [100.0, 500.0]
+            assert kwargs["yrange"] == [50.0, 450.0]
+        finally:
+            da._zoom_range = original
+            bp.camera.stop_acquisition()
+
+    def test_update_live_no_zoom_passes_none(self):
+        from unittest.mock import patch
+
+        import pybeamprofiler.dash_app as da
+
+        bp = BeamProfiler(camera="simulated")
+        assert bp.camera is not None
+        bp.camera.start_acquisition()
+        fn = _extract_callback(bp, "live-graph")
+        assert fn is not None
+        original = da._zoom_range
+        da._zoom_range = None
+        try:
+            with patch("pybeamprofiler.dash_app.build_figure") as mock_bf:
+                mock_bf.return_value = "FIG"
+                fn(1, False, True, "Hot", True, None, None, 0, "1d", "gaussian", True, 1)
+                kwargs = mock_bf.call_args.kwargs
+            assert kwargs["xrange"] is None
+            assert kwargs["yrange"] is None
+        finally:
+            da._zoom_range = original
+            bp.camera.stop_acquisition()
+
+
+class TestBuildFigureZoomRange:
+    """``build_figure`` defaults to the full sensor extent and accepts an
+    explicit override that wins over the default."""
+
+    def test_default_range_covers_sensor(self):
+        from pybeamprofiler.dash_app import build_figure
+
+        bp = BeamProfiler(camera="simulated")
+        assert bp.camera is not None
+        bp.camera.start_acquisition()
+        img = bp.camera.get_image()
+        bp.camera.stop_acquisition()
+        fig = build_figure(bp, img, None, None)
+        assert list(fig.layout.xaxis.range) == [0, img.shape[1] * bp.pixel_size]
+        assert list(fig.layout.yaxis.range) == [0, img.shape[0] * bp.pixel_size]
+
+    def test_explicit_range_overrides_default(self):
+        from pybeamprofiler.dash_app import build_figure
+
+        bp = BeamProfiler(camera="simulated")
+        assert bp.camera is not None
+        bp.camera.start_acquisition()
+        img = bp.camera.get_image()
+        bp.camera.stop_acquisition()
+        fig = build_figure(bp, img, None, None, xrange=[10.0, 200.0], yrange=[20.0, 300.0])
+        assert list(fig.layout.xaxis.range) == [10.0, 200.0]
+        assert list(fig.layout.yaxis.range) == [20.0, 300.0]

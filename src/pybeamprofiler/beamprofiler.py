@@ -1201,25 +1201,21 @@ class BeamProfiler:
         the live loop.  Outside Jupyter, falls back to Dash or matplotlib and
         returns ``None`` (blocks until interrupted).
         """
-        # Ensure camera is ready for continuous acquisition
         if self._mode == "camera":
             if self.camera is None:
                 raise RuntimeError("Camera is not initialized")
             if not self.camera.is_acquiring:
                 self.camera.start_acquisition()
 
-        # Check for heatmap only mode
         heatmap_only = getattr(self, "_heatmap_only", False)
 
         try:
-            # Check if running in Jupyter
             from IPython import get_ipython
             from IPython.display import clear_output, display
 
             if get_ipython() is None:
                 raise ImportError("Not in IPython")
 
-            # Use clear_output for live updates
             if heatmap_only:
                 logger.info("Starting live stream (heatmap only)...")
             else:
@@ -1232,17 +1228,17 @@ class BeamProfiler:
                 try:
                     while True:
                         try:
-                            # Give kernel event loop a tiny slice to process interrupts/callbacks
+                            # Yield to the kernel event loop so interrupts and
+                            # other callbacks can fire promptly.
                             await asyncio.sleep(0)
 
-                            # Get image
                             if self._mode == "camera" and self.camera is not None:
-                                # Offload potentially blocking camera acquisition to a thread
+                                # Camera fetch can block on the producer; run
+                                # it in a thread so the event loop stays free.
                                 img = await asyncio.to_thread(self.camera.get_image)
                             else:
                                 img = self.last_img
                             if img is None:
-                                # If camera is still acquiring but returned no frame (timeout etc), keep trying
                                 if (
                                     self._mode == "camera"
                                     and self.camera is not None
@@ -1252,10 +1248,8 @@ class BeamProfiler:
                                 await asyncio.sleep(0.01)
                                 continue
 
-                            # Offload Gaussian fitting
                             popt_x, popt_y = await asyncio.to_thread(self.analyze, img)
 
-                            # Offload figure creation
                             if heatmap_only:
                                 fig = await asyncio.to_thread(
                                     self._create_fast_figure, img, popt_x, popt_y
@@ -1265,23 +1259,25 @@ class BeamProfiler:
                                     self._create_figure, img, popt_x, popt_y
                                 )
 
-                            # Add frame info to title
                             frame_count += 1
                             elapsed = time.time() - start_time
                             fps = frame_count / elapsed if elapsed > 0 else 0
 
                             current_title = fig.layout.title.text if fig.layout.title else ""
                             fig.update_layout(
-                                title_text=f"{current_title}<br><span style='font-size:11px; color:#666'>Frame #{frame_count} | FPS: {fps:.1f}</span>"
+                                title_text=(
+                                    f"{current_title}<br>"
+                                    f"<span style='font-size:11px; color:#666'>"
+                                    f"Frame #{frame_count} | FPS: {fps:.1f}</span>"
+                                )
                             )
 
-                            # Clear and display updated figure
                             clear_output(wait=True)
                             display(fig)
 
                         except Exception as e:
-                            # Frame failure (e.g., camera timeout or corrupted frame).
-                            # Log and continue instead of breaking to keep stream alive.
+                            # Keep the stream alive across transient frame
+                            # errors (timeouts, malformed frames, etc.).
                             logger.debug(f"Frame error in stream loop: {e}")
                             await asyncio.sleep(0.01)
                             continue
@@ -1297,26 +1293,21 @@ class BeamProfiler:
                         f"\nStream stopped: {frame_count} frames in {elapsed:.1f}s ({fps:.1f} fps)"
                     )
 
-            # Create the loop task within Jupyter's existing event loop
             try:
                 loop = asyncio.get_running_loop()
                 task = loop.create_task(jupyter_stream_loop())
                 self._stream_task = task
-                # Return the task so Jupyter displays standard outputs correctly
                 return task
             except RuntimeError:
-                # Fallback if no loop is somehow running
                 asyncio.run(jupyter_stream_loop())
 
         except (NameError, ImportError):
-            # Running from command line - use Dash
             try:
                 import dash  # noqa: F401
             except ImportError:
                 logger.info("\nDash not available. Using matplotlib fallback.")
                 logger.info("Install dash for better performance: pip install dash\n")
 
-                # Matplotlib fallback
                 try:
                     import matplotlib.pyplot as plt  # ty: ignore[unresolved-import]
                     from matplotlib.animation import FuncAnimation  # ty: ignore[unresolved-import]
@@ -1402,7 +1393,7 @@ class BeamProfiler:
                             family="monospace",
                         )
 
-                    logger.info("Starting matplotlib animation (press Ctrl+C to stop)...")
+                    print("\nStarting matplotlib animation. Press Ctrl+C to stop.\n", flush=True)
                     _anim = FuncAnimation(
                         fig_plt, update_frame, interval=50, cache_frame_data=False
                     )
@@ -1421,12 +1412,23 @@ class BeamProfiler:
 
             app = create_app(self)
 
-            logger.info(f"Starting Dash server at http://127.0.0.1:{DEFAULT_DASH_PORT}")
+            url = f"http://127.0.0.1:{DEFAULT_DASH_PORT}"
+            print(f"\npyBeamprofiler running at {url}")
+            print("Press Ctrl+C to stop.\n", flush=True)
+            logger.info(f"Starting Dash server at {url}")
             logger.info("Opening browser automatically...")
-            logger.info("Press Ctrl+C to stop")
 
+            # Suppress dev-server chatter so the only startup output users see
+            # is the two lines above. Werkzeug/Flask still print errors.
             logging.getLogger("werkzeug").setLevel(logging.ERROR)
-            logging.getLogger("dash").setLevel(logging.ERROR)
+            logging.getLogger("dash").setLevel(logging.WARNING)
+            logging.getLogger("dash.dash").setLevel(logging.WARNING)
+            try:
+                import flask.cli as _flask_cli
+
+                _flask_cli.show_server_banner = lambda *a, **kw: None  # ty: ignore[invalid-assignment]
+            except ImportError:
+                pass
 
             if os.environ.get("PYBEAMPROFILER_NO_BROWSER") != "1":
 
@@ -1559,12 +1561,11 @@ def main() -> None:
         logger.info("Single shot acquisition...")
     else:
         logger.info("Starting continuous streaming...")
-        logger.info("   Press Ctrl+C to stop")
 
     try:
         bp.plot(num_img=args.num_img, heatmap_only=args.heatmap_only)
     except KeyboardInterrupt:
-        pass
+        print("\nStopped by user (Ctrl+C).")
     except Exception:
         logger.error("Fatal error during plotting", exc_info=True)
     finally:

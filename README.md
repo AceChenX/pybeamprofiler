@@ -23,9 +23,14 @@ pip install pybeamprofiler
 
 # Run the browser GUI with a simulated camera (no hardware needed)
 pybeamprofiler --camera simulated
+
+# Or connect to real hardware
+pybeamprofiler --camera flir       # FLIR / Spinnaker
+pybeamprofiler --camera basler     # Basler / Pylon
 ```
 
-The browser opens automatically at http://127.0.0.1:8050.
+The browser opens automatically at http://127.0.0.1:8050. Press **Ctrl+C** in
+the terminal to stop the server and exit.
 
 ## Installation
 
@@ -60,6 +65,8 @@ pybeamprofiler --file beam.png         # static image
 pybeamprofiler --fit 2d --definition fwhm
 pybeamprofiler --help                  # all options
 ```
+
+Press **Ctrl+C** in the terminal to stop streaming and exit.
 
 ### Python API
 
@@ -120,7 +127,7 @@ uv run pytest --cov-report=html        # HTML coverage report
 uv run pytest tests/test_profiler.py   # single file
 ```
 
-Current suite: **474 tests, 93% coverage**.
+Current suite: **588 tests, 97% coverage**.
 
 ### Architecture
 
