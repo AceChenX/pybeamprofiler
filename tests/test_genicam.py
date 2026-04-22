@@ -320,8 +320,11 @@ class TestHarvesterCameraGetImage:
         mock_buffer.__exit__ = lambda s, *a: None
         cam.ia.fetch.return_value = mock_buffer
 
-        cam.get_image()
-        cam.ia.start.assert_called_once()
+        try:
+            cam.get_image(timeout=1.0)
+            cam.ia.start.assert_called_once()
+        finally:
+            cam.stop_acquisition()
 
     def test_get_image_raises_runtime_when_not_opened(self):
         """get_image raises RuntimeError if camera has not been opened."""
@@ -331,14 +334,15 @@ class TestHarvesterCameraGetImage:
             cam.get_image()
 
     def test_get_image_wraps_timeout_exception(self):
-        """get_image wraps GenTL TimeoutException as TimeoutError."""
+        """get_image raises TimeoutError when no frame arrives within timeout."""
+        from harvesters.core import TimeoutException
+
         cam = self._make_camera()
         cam.is_acquiring = True
+        cam.ia.fetch.side_effect = TimeoutException
 
-        class TimeoutException(Exception):
-            pass
-
-        cam.ia.fetch.side_effect = TimeoutException("timed out")
-
-        with pytest.raises(TimeoutError, match="did not deliver a frame"):
-            cam.get_image()
+        try:
+            with pytest.raises(TimeoutError, match="did not deliver a frame"):
+                cam.get_image(timeout=0.2)
+        finally:
+            cam.stop_acquisition()

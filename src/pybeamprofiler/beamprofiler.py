@@ -6,6 +6,7 @@ import argparse
 import asyncio
 import logging
 import os
+import signal
 import threading
 import time
 import webbrowser
@@ -19,37 +20,17 @@ from plotly.subplots import make_subplots
 from scipy.ndimage import zoom as _ndimage_zoom
 from scipy.optimize import curve_fit
 
-try:
-    from .basler import BaslerCamera
-    from .camera import Camera
-    from .constants import (
-        D4SIGMA_FACTOR,
-        DEFAULT_DASH_PORT,
-        GAUSSIAN_TO_FWHM,
-        MAX_DISPLAY_DIM,
-        MAX_FIT_ITERATIONS,
-    )
-    from .flir import FlirCamera
-    from .simulated import SimulatedCamera
-except ImportError:
-    import sys
-    from pathlib import Path
-
-    script_dir = Path(__file__).resolve().parent
-    if str(script_dir.parent) not in sys.path:
-        sys.path.insert(0, str(script_dir.parent))
-
-    from pybeamprofiler.basler import BaslerCamera  # type: ignore[no-redef]  # noqa: I001
-    from pybeamprofiler.camera import Camera  # type: ignore[no-redef]
-    from pybeamprofiler.constants import (
-        D4SIGMA_FACTOR,
-        DEFAULT_DASH_PORT,
-        GAUSSIAN_TO_FWHM,
-        MAX_DISPLAY_DIM,
-        MAX_FIT_ITERATIONS,
-    )  # type: ignore[no-redef]
-    from pybeamprofiler.flir import FlirCamera  # type: ignore[no-redef]
-    from pybeamprofiler.simulated import SimulatedCamera  # type: ignore[no-redef]
+from .basler import BaslerCamera
+from .camera import Camera
+from .constants import (
+    D4SIGMA_FACTOR,
+    DEFAULT_DASH_PORT,
+    GAUSSIAN_TO_FWHM,
+    MAX_DISPLAY_DIM,
+    MAX_FIT_ITERATIONS,
+)
+from .flir import FlirCamera
+from .simulated import SimulatedCamera
 
 logger = logging.getLogger(__name__)
 
@@ -113,6 +94,8 @@ class BeamProfiler:
         self._stream_task: asyncio.Task[None] | None = None
 
         self.last_img: np.ndarray | None = None
+        self._last_proj_x: np.ndarray | None = None
+        self._last_proj_y: np.ndarray | None = None
 
         if file:
             self._load_file(file)
@@ -207,6 +190,7 @@ class BeamProfiler:
         return False
 
     def __getattr__(self, name: str) -> object:
+        """Delegate unknown attribute access to the underlying camera."""
         try:
             camera = object.__getattribute__(self, "camera")
         except AttributeError:
@@ -260,15 +244,26 @@ class BeamProfiler:
             Flattened 2D Gaussian values
         """
         x, y = xy
-        x0 = float(x0)
-        y0 = float(y0)
-        a = (np.cos(theta) ** 2) / (2 * sigma_x**2) + (np.sin(theta) ** 2) / (2 * sigma_y**2)
-        b = -(np.sin(2 * theta)) / (4 * sigma_x**2) + (np.sin(2 * theta)) / (4 * sigma_y**2)
-        c = (np.sin(theta) ** 2) / (2 * sigma_x**2) + (np.cos(theta) ** 2) / (2 * sigma_y**2)
-        g = offset + amplitude * np.exp(
-            -(a * ((x - x0) ** 2) + 2 * b * (x - x0) * (y - y0) + c * ((y - y0) ** 2))
-        )
-        return g.ravel()
+        cos_t = np.cos(theta)
+        sin_t = np.sin(theta)
+        cos2 = cos_t * cos_t
+        sin2 = sin_t * sin_t
+        sin2t = 2.0 * sin_t * cos_t
+        sx2_inv = 0.5 / (sigma_x * sigma_x)
+        sy2_inv = 0.5 / (sigma_y * sigma_y)
+
+        a = cos2 * sx2_inv + sin2 * sy2_inv
+        b = 0.5 * sin2t * (sy2_inv - sx2_inv)
+        c = sin2 * sx2_inv + cos2 * sy2_inv
+
+        dx = x - float(x0)
+        dy = y - float(y0)
+        out = a * dx * dx + 2.0 * b * dx * dy + c * dy * dy
+        np.negative(out, out=out)
+        np.exp(out, out=out)
+        out *= amplitude
+        out += offset
+        return out.ravel()
 
     @property
     def width(self) -> float:
@@ -328,12 +323,12 @@ class BeamProfiler:
 
     @property
     def height_x(self) -> float:
-        """Peak height in X profile (intensity units)."""
+        """Peak image intensity (intensity units)."""
         return self.peak_value
 
     @property
     def height_y(self) -> float:
-        """Peak height in Y profile (intensity units)."""
+        """Peak image intensity (intensity units)."""
         return self.peak_value
 
     def _measure_fwhm(self, profile: np.ndarray) -> tuple[float, float, float]:
@@ -423,33 +418,42 @@ class BeamProfiler:
             last_popt: Previous fit parameters for initial guess
 
         Returns:
-            Fit parameters ``[amplitude, center, sigma, offset]``
+            Fit parameters ``[amplitude, center, sigma, offset]``.
         """
         n = len(profile)
         if n == 0:
             return [0, 0, 1, 0]
 
         if last_popt is not None:
-            p0 = last_popt
+            p0 = list(last_popt)
         else:
             pmax, pmin = np.max(profile), np.min(profile)
-            p0 = [pmax - pmin, np.argmax(profile), n / 10.0, pmin]
+            p0 = [pmax - pmin, float(np.argmax(profile)), n / 10.0, pmin]
 
         try:
             x = np.arange(n)
-            # Bounds constrain parameters for faster convergence:
-            # amplitude > 0, center in [0, n], sigma in [0.1, n], offset unbounded
-            bounds = ([0, 0, 0.1, -np.inf], [np.inf, n, n, np.inf])
             popt, _ = curve_fit(
-                BeamProfiler.gaussian, x, profile, p0=p0, bounds=bounds, maxfev=MAX_FIT_ITERATIONS
+                BeamProfiler.gaussian,
+                x,
+                profile,
+                p0=p0,
+                maxfev=MAX_FIT_ITERATIONS,
             )
-            return popt
         except (RuntimeError, ValueError) as e:
-            logger.warning(f"1D fit failed: {e}, using initial guess")
-            return p0
+            logger.debug("1D fit failed: %s, using initial guess", e)
+            popt = np.array(p0)
+
+        return popt
+
+    _MAX_FIT_2D_DIM = 256
 
     def _fit_2d_gaussian(self, image: np.ndarray) -> np.ndarray | list[Any]:
         """Fit 2D Gaussian to image.
+
+        Large images are downsampled to at most :attr:`_MAX_FIT_2D_DIM` pixels
+        on the longest edge before fitting, then coordinates are scaled back to
+        the original resolution.  This keeps 2D fitting real-time even for
+        megapixel sensors.
 
         Args:
             image: 2D intensity array
@@ -459,32 +463,89 @@ class BeamProfiler:
         """
         h, w = image.shape
 
-        if self._last_popt_2d is not None:
-            p0 = self._last_popt_2d
+        # Downsample for performance — 2D curve_fit on 1M+ pixels is too slow
+        if max(h, w) > self._MAX_FIT_2D_DIM:
+            ds = self._MAX_FIT_2D_DIM / max(h, w)
+            fit_img = _ndimage_zoom(image.astype(float), ds, order=1)
+            inv_ds = 1.0 / ds
         else:
-            pmax, pmin = np.max(image), np.min(image)
-            y0, x0 = np.unravel_index(np.argmax(image), image.shape)
-            p0 = [pmax - pmin, x0, y0, w / 10.0, h / 10.0, 0.0, pmin]
+            fit_img = image
+            inv_ds = 1.0
+
+        fh, fw = fit_img.shape
+
+        if self._last_popt_2d is not None:
+            p0 = list(self._last_popt_2d)
+            # Scale cached params into the downsampled coordinate system
+            if inv_ds != 1.0:
+                p0[1] /= inv_ds  # x0
+                p0[2] /= inv_ds  # y0
+                p0[3] /= inv_ds  # sigma_x
+                p0[4] /= inv_ds  # sigma_y
+        else:
+            pmax, pmin = np.max(fit_img), np.min(fit_img)
+            y0, x0 = np.unravel_index(np.argmax(fit_img), fit_img.shape)
+            p0 = [pmax - pmin, x0, y0, fw / 10.0, fh / 10.0, 0.0, pmin]
 
         try:
-            x, y = np.arange(w), np.arange(h)
+            x, y = np.arange(fw), np.arange(fh)
             xv, yv = np.meshgrid(x, y)
-
-            # Bounds constrain parameters for faster convergence:
-            # amplitude > 0, centers in image, sigmas > 0.1, theta in [-π, π]
-            bounds = ([0, 0, 0, 0.1, 0.1, -np.pi, -np.inf], [np.inf, w, h, w, h, np.pi, np.inf])
-            popt, _ = curve_fit(
-                BeamProfiler.gaussian_2d,
-                (xv.ravel(), yv.ravel()),
-                image.ravel(),
-                p0=p0,
-                bounds=bounds,
-                maxfev=MAX_FIT_ITERATIONS,
+            xy_flat = (xv.ravel(), yv.ravel())
+            data_flat = fit_img.ravel()
+            bounds = (
+                [0, 0, 0, 0.1, 0.1, -np.pi, -np.inf],
+                [np.inf, fw, fh, fw, fh, np.pi, np.inf],
             )
+
+            if self._last_popt_2d is not None:
+                # Warm: try unbounded LM first (~1.8x faster), fall back to bounded
+                try:
+                    popt, _ = curve_fit(
+                        BeamProfiler.gaussian_2d,
+                        xy_flat,
+                        data_flat,
+                        p0=p0,
+                        method="lm",
+                        maxfev=MAX_FIT_ITERATIONS,
+                    )
+                    if abs(popt[3]) < 0.1 or abs(popt[4]) < 0.1 or popt[3] > fw or popt[4] > fh:
+                        raise RuntimeError("LM diverged")
+                except (RuntimeError, ValueError):
+                    popt, _ = curve_fit(
+                        BeamProfiler.gaussian_2d,
+                        xy_flat,
+                        data_flat,
+                        p0=p0,
+                        bounds=bounds,
+                        maxfev=MAX_FIT_ITERATIONS,
+                    )
+            else:
+                popt, _ = curve_fit(
+                    BeamProfiler.gaussian_2d,
+                    xy_flat,
+                    data_flat,
+                    p0=p0,
+                    bounds=bounds,
+                    maxfev=MAX_FIT_ITERATIONS,
+                )
+
+            # Scale coordinates back to original resolution
+            if inv_ds != 1.0:
+                popt[1] *= inv_ds  # x0
+                popt[2] *= inv_ds  # y0
+                popt[3] *= inv_ds  # sigma_x
+                popt[4] *= inv_ds  # sigma_y
+
             self._last_popt_2d = popt
             return popt
         except (RuntimeError, ValueError) as e:
-            logger.warning(f"2D fit failed: {e}, using initial guess")
+            logger.debug("2D fit failed: %s, using initial guess", e)
+            # Scale p0 back if it was downsampled
+            if inv_ds != 1.0:
+                p0[1] *= inv_ds
+                p0[2] *= inv_ds
+                p0[3] *= inv_ds
+                p0[4] *= inv_ds
             return p0
 
     def analyze(
@@ -499,7 +560,8 @@ class BeamProfiler:
             tuple of (x_fit_params, y_fit_params) for 1D projections
 
         Raises:
-            ValueError: If image is None or not 2D
+            ValueError: If image is None, empty, or not 2D.
+            TypeError: If image is not a numpy array.
         """
         if image is None:
             raise ValueError("Image cannot be None")
@@ -514,11 +576,15 @@ class BeamProfiler:
             raise ValueError("Image cannot be empty")
 
         self.peak_value = float(np.max(image))
+        self._last_proj_x = None
+        self._last_proj_y = None
 
         # Use direct measurement for FWHM and D4σ (no Gaussian assumption)
         if self.definition in ["fwhm", "d4s"]:
             proj_x = np.sum(image, axis=0)
             proj_y = np.sum(image, axis=1)
+            self._last_proj_x = proj_x
+            self._last_proj_y = proj_y
 
             if self.definition == "fwhm":
                 center_x, width_x, _ = self._measure_fwhm(proj_x)
@@ -570,6 +636,8 @@ class BeamProfiler:
 
             proj_x = np.sum(image, axis=0)
             proj_y = np.sum(image, axis=1)
+            self._last_proj_x = proj_x
+            self._last_proj_y = proj_y
             popt_x = self._fit_1d_gaussian(proj_x, self._last_popt_x)
             popt_y = self._fit_1d_gaussian(proj_y, self._last_popt_y)
             self._last_popt_x, self._last_popt_y = popt_x, popt_y
@@ -579,6 +647,8 @@ class BeamProfiler:
         else:
             proj_x = np.sum(image, axis=0)
             proj_y = np.sum(image, axis=1)
+            self._last_proj_x = proj_x
+            self._last_proj_y = proj_y
 
             popt_x = self._fit_1d_gaussian(proj_x, self._last_popt_x)
             popt_y = self._fit_1d_gaussian(proj_y, self._last_popt_y)
@@ -616,7 +686,7 @@ class BeamProfiler:
         self,
         num_img: int | None = None,
         heatmap_only: bool = False,
-    ) -> asyncio.Task | None:
+    ) -> asyncio.Task[None] | None:
         """Display beam profile with Gaussian fitting visualization.
 
         Args:
@@ -1131,25 +1201,21 @@ class BeamProfiler:
         the live loop.  Outside Jupyter, falls back to Dash or matplotlib and
         returns ``None`` (blocks until interrupted).
         """
-        # Ensure camera is ready for continuous acquisition
         if self._mode == "camera":
             if self.camera is None:
                 raise RuntimeError("Camera is not initialized")
             if not self.camera.is_acquiring:
                 self.camera.start_acquisition()
 
-        # Check for heatmap only mode
         heatmap_only = getattr(self, "_heatmap_only", False)
 
         try:
-            # Check if running in Jupyter
             from IPython import get_ipython
             from IPython.display import clear_output, display
 
             if get_ipython() is None:
                 raise ImportError("Not in IPython")
 
-            # Use clear_output for live updates
             if heatmap_only:
                 logger.info("Starting live stream (heatmap only)...")
             else:
@@ -1162,17 +1228,17 @@ class BeamProfiler:
                 try:
                     while True:
                         try:
-                            # Give kernel event loop a tiny slice to process interrupts/callbacks
+                            # Yield to the kernel event loop so interrupts and
+                            # other callbacks can fire promptly.
                             await asyncio.sleep(0)
 
-                            # Get image
                             if self._mode == "camera" and self.camera is not None:
-                                # Offload potentially blocking camera acquisition to a thread
+                                # Camera fetch can block on the producer; run
+                                # it in a thread so the event loop stays free.
                                 img = await asyncio.to_thread(self.camera.get_image)
                             else:
                                 img = self.last_img
                             if img is None:
-                                # If camera is still acquiring but returned no frame (timeout etc), keep trying
                                 if (
                                     self._mode == "camera"
                                     and self.camera is not None
@@ -1182,10 +1248,8 @@ class BeamProfiler:
                                 await asyncio.sleep(0.01)
                                 continue
 
-                            # Offload Gaussian fitting
                             popt_x, popt_y = await asyncio.to_thread(self.analyze, img)
 
-                            # Offload figure creation
                             if heatmap_only:
                                 fig = await asyncio.to_thread(
                                     self._create_fast_figure, img, popt_x, popt_y
@@ -1195,23 +1259,25 @@ class BeamProfiler:
                                     self._create_figure, img, popt_x, popt_y
                                 )
 
-                            # Add frame info to title
                             frame_count += 1
                             elapsed = time.time() - start_time
                             fps = frame_count / elapsed if elapsed > 0 else 0
 
                             current_title = fig.layout.title.text if fig.layout.title else ""
                             fig.update_layout(
-                                title_text=f"{current_title}<br><span style='font-size:11px; color:#666'>Frame #{frame_count} | FPS: {fps:.1f}</span>"
+                                title_text=(
+                                    f"{current_title}<br>"
+                                    f"<span style='font-size:11px; color:#666'>"
+                                    f"Frame #{frame_count} | FPS: {fps:.1f}</span>"
+                                )
                             )
 
-                            # Clear and display updated figure
                             clear_output(wait=True)
                             display(fig)
 
                         except Exception as e:
-                            # Frame failure (e.g., camera timeout or corrupted frame).
-                            # Log and continue instead of breaking to keep stream alive.
+                            # Keep the stream alive across transient frame
+                            # errors (timeouts, malformed frames, etc.).
                             logger.debug(f"Frame error in stream loop: {e}")
                             await asyncio.sleep(0.01)
                             continue
@@ -1227,28 +1293,21 @@ class BeamProfiler:
                         f"\nStream stopped: {frame_count} frames in {elapsed:.1f}s ({fps:.1f} fps)"
                     )
 
-            # Create the loop task within Jupyter's existing event loop
             try:
                 loop = asyncio.get_running_loop()
                 task = loop.create_task(jupyter_stream_loop())
                 self._stream_task = task
-                # Return the task so Jupyter displays standard outputs correctly
                 return task
             except RuntimeError:
-                # Fallback if no loop is somehow running
                 asyncio.run(jupyter_stream_loop())
 
         except (NameError, ImportError):
-            # Running from command line - use Dash
             try:
-                import dash
-                from dash import dcc, html
-                from dash.dependencies import Input, Output
+                import dash  # noqa: F401
             except ImportError:
                 logger.info("\nDash not available. Using matplotlib fallback.")
                 logger.info("Install dash for better performance: pip install dash\n")
 
-                # Matplotlib fallback
                 try:
                     import matplotlib.pyplot as plt  # ty: ignore[unresolved-import]
                     from matplotlib.animation import FuncAnimation  # ty: ignore[unresolved-import]
@@ -1334,7 +1393,7 @@ class BeamProfiler:
                             family="monospace",
                         )
 
-                    logger.info("Starting matplotlib animation (press Ctrl+C to stop)...")
+                    print("\nStarting matplotlib animation. Press Ctrl+C to stop.\n", flush=True)
                     _anim = FuncAnimation(
                         fig_plt, update_frame, interval=50, cache_frame_data=False
                     )
@@ -1349,155 +1408,27 @@ class BeamProfiler:
 
                 return
 
-            # Dash is available, use it
-            app = dash.Dash(__name__)
+            from .dash_app import create_app
 
-            # Inject JavaScript to close tab when server disconnects (Ctrl-C)
-            # Uses the same approach as camera_streamer.py
-            app.index_string = """
-            <!DOCTYPE html>
-            <html>
-                <head>
-                    {%metas%}
-                    <title>{%title%}</title>
-                    {%favicon%}
-                    {%css%}
-                    <script>
-                        // Close tab when Dash server disconnects
-                        window.addEventListener('load', function() {
-                            var failedAttempts = 0;
-                            setInterval(function() {
-                                fetch('/_dash-component-suites/dash/dcc/async-graph.js', {
-                                    method: 'HEAD',
-                                    cache: 'no-cache'
-                                }).then(function() {
-                                    failedAttempts = 0;
-                                }).catch(function() {
-                                    failedAttempts++;
-                                    if (failedAttempts >= 2) {
-                                        window.open('', '_self').close();
-                                    }
-                                });
-                            }, 500);
-                        });
-                    </script>
-                </head>
-                <body>
-                    {%app_entry%}
-                    <footer>
-                        {%config%}
-                        {%scripts%}
-                        {%renderer%}
-                    </footer>
-                </body>
-            </html>
-            """
+            app = create_app(self)
 
-            shutdown_flag = {"stop": False}
-            _callback_busy = threading.Lock()
-
-            # Start acquisition before Dash server
-            if self._mode == "camera" and self.camera is not None and not self.camera.is_acquiring:
-                self.camera.start_acquisition()
-
-            # Get initial image for display
-            initial_img = (
-                self.camera.get_image()
-                if self._mode == "camera" and self.camera is not None
-                else self.last_img
-            )
-            initial_popt_x, initial_popt_y = (
-                self.analyze(initial_img) if initial_img is not None else (None, None)
-            )
-            initial_fig = (
-                self._create_figure(initial_img, initial_popt_x, initial_popt_y)
-                if initial_img is not None
-                else go.Figure()
-            )
-
-            app.layout = html.Div(
-                [
-                    dcc.Graph(
-                        id="live-update-graph",
-                        figure=initial_fig,
-                        style={"height": "92vh", "width": "96vw"},
-                        config={"responsive": True},
-                    ),
-                    dcc.Interval(
-                        id="interval-component",
-                        interval=100,
-                        n_intervals=0,
-                    ),
-                ],
-                style={"margin": "0 auto", "padding": "4px"},
-            )
-
-            @app.callback(
-                Output("live-update-graph", "figure"),
-                Input("interval-component", "n_intervals"),
-            )
-            async def update_graph_live(n: int):
-                if shutdown_flag["stop"]:
-                    return dash.no_update
-
-                if not _callback_busy.acquire(blocking=False):
-                    return dash.no_update
-
-                try:
-                    return await _do_update(n)
-                finally:
-                    _callback_busy.release()
-
-            async def _do_update(n: int):
-                if n % 10 == 0:
-                    logger.debug(f"Processing frame {n}")
-
-                if (
-                    self._mode == "camera"
-                    and self.camera is not None
-                    and not self.camera.is_acquiring
-                ):
-                    try:
-                        self.camera.start_acquisition()
-                    except Exception:
-                        return go.Figure()
-
-                try:
-                    if self._mode == "camera" and self.camera is not None:
-                        img = await asyncio.to_thread(self.camera.get_image)
-                    else:
-                        img = self.last_img
-                except Exception as e:
-                    logger.debug(f"Failed to get image: {e}")
-                    return dash.no_update
-
-                if img is None:
-                    return dash.no_update
-
-                try:
-                    popt_x, popt_y = await asyncio.to_thread(self.analyze, img)
-
-                    if heatmap_only:
-                        fig = await asyncio.to_thread(self._create_fast_figure, img, popt_x, popt_y)
-                    else:
-                        fig = await asyncio.to_thread(self._create_figure, img, popt_x, popt_y)
-
-                    current_title = fig.layout.title.text if fig.layout.title else ""
-                    fig.update_layout(
-                        title_text=f"{current_title}<br><span style='font-size:11px; color:#666'>Frame #{n}</span>"
-                    )
-
-                    return fig
-                except Exception as e:
-                    logger.debug(f"Frame analysis/generation failed: {e}")
-                    return dash.no_update
-
-            logger.info(f"Starting Dash server at http://127.0.0.1:{DEFAULT_DASH_PORT}")
+            url = f"http://127.0.0.1:{DEFAULT_DASH_PORT}"
+            print(f"\npyBeamprofiler running at {url}")
+            print("Press Ctrl+C to stop.\n", flush=True)
+            logger.info(f"Starting Dash server at {url}")
             logger.info("Opening browser automatically...")
-            logger.info("Press Ctrl+C to stop")
 
+            # Suppress dev-server chatter so the only startup output users see
+            # is the two lines above. Werkzeug/Flask still print errors.
             logging.getLogger("werkzeug").setLevel(logging.ERROR)
-            logging.getLogger("dash").setLevel(logging.ERROR)
+            logging.getLogger("dash").setLevel(logging.WARNING)
+            logging.getLogger("dash.dash").setLevel(logging.WARNING)
+            try:
+                import flask.cli as _flask_cli
+
+                _flask_cli.show_server_banner = lambda *a, **kw: None  # ty: ignore[invalid-assignment]
+            except ImportError:
+                pass
 
             if os.environ.get("PYBEAMPROFILER_NO_BROWSER") != "1":
 
@@ -1507,14 +1438,12 @@ class BeamProfiler:
 
                 threading.Thread(target=open_browser, daemon=True).start()
 
-            import signal
-
             def _sigint_handler(signum: int, frame: Any) -> None:
-                shutdown_flag["stop"] = True
                 if self._mode == "camera" and self.camera is not None:
                     try:
                         if self.camera.is_acquiring:
                             self.camera.stop_acquisition()
+                        self.camera.close()
                     except Exception:
                         pass
                 raise KeyboardInterrupt
@@ -1632,12 +1561,11 @@ def main() -> None:
         logger.info("Single shot acquisition...")
     else:
         logger.info("Starting continuous streaming...")
-        logger.info("   Press Ctrl+C to stop")
 
     try:
         bp.plot(num_img=args.num_img, heatmap_only=args.heatmap_only)
     except KeyboardInterrupt:
-        pass
+        print("\nStopped by user (Ctrl+C).")
     except Exception:
         logger.error("Fatal error during plotting", exc_info=True)
     finally:

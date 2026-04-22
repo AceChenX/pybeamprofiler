@@ -1,5 +1,6 @@
 """Tests for BeamProfiler properties, attributes, and integration."""
 
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import numpy as np
@@ -978,3 +979,343 @@ class TestCLI:
             assert bp.camera is not None
             assert bp.definition == defn
             bp.camera.close()
+
+
+# ─── CLI main() entry point ────────────────────────────────────────────────
+
+
+class TestCLIMain:
+    """Drive the ``main()`` CLI entry point to exercise the argparse +
+    plot + cleanup glue. ``plot`` is patched in every case because the
+    real one blocks on a Dash server or Jupyter loop.
+    """
+
+    def _run_main(self, argv: list[str], plot_side_effect: Any = None) -> MagicMock:
+        """Invoke ``main`` with the given argv and a patched ``plot``.
+
+        Returns the plot mock so tests can inspect call args.
+        """
+        from pybeamprofiler.beamprofiler import main
+
+        plot_mock = MagicMock(side_effect=plot_side_effect)
+        with (
+            patch("sys.argv", ["pybeamprofiler", *argv]),
+            patch.object(BeamProfiler, "plot", plot_mock),
+        ):
+            main()
+        return plot_mock
+
+    def test_default_args_invokes_plot_continuous(self):
+        plot = self._run_main([])
+        plot.assert_called_once()
+        kwargs = plot.call_args.kwargs
+        assert kwargs["num_img"] is None
+        assert kwargs["heatmap_only"] is False
+
+    def test_num_img_single_shot(self):
+        plot = self._run_main(["--num-img", "1"])
+        assert plot.call_args.kwargs["num_img"] == 1
+
+    def test_heatmap_only_flag_propagates(self):
+        plot = self._run_main(["--heatmap-only"])
+        assert plot.call_args.kwargs["heatmap_only"] is True
+
+    def test_verbose_configures_info_log_level(self):
+        """``-v`` must request INFO via ``logging.basicConfig`` (the actual
+        effective level may vary across test runs because pytest itself
+        configures logging, so we assert on the call rather than the level)."""
+        import logging
+
+        from pybeamprofiler.beamprofiler import main
+
+        with (
+            patch("sys.argv", ["pybeamprofiler", "-v"]),
+            patch.object(BeamProfiler, "plot"),
+            patch("logging.basicConfig") as mock_basic,
+        ):
+            main()
+        mock_basic.assert_called_once_with(level=logging.INFO)
+
+    def test_default_configures_warning_log_level(self):
+        """Without ``-v`` the CLI configures ``logging.WARNING``."""
+        import logging
+
+        from pybeamprofiler.beamprofiler import main
+
+        with (
+            patch("sys.argv", ["pybeamprofiler"]),
+            patch.object(BeamProfiler, "plot"),
+            patch("logging.basicConfig") as mock_basic,
+        ):
+            main()
+        mock_basic.assert_called_once_with(level=logging.WARNING)
+
+    def test_exposure_time_passed_to_profiler(self):
+        """``--exposure-time`` should reach the simulated camera."""
+        with (
+            patch("sys.argv", ["pybeamprofiler", "--exposure-time", "0.042"]),
+            patch.object(BeamProfiler, "plot") as mock_plot,
+        ):
+            from pybeamprofiler.beamprofiler import main
+
+            main()
+            mock_plot.assert_called_once()
+        # Not strictly asserting on the camera here because ``main`` creates
+        # and cleans up its own BeamProfiler; the important thing is that
+        # argparse accepted the flag and ``plot`` ran without raising.
+
+    def test_keyboard_interrupt_swallowed(self):
+        """Ctrl+C during ``plot`` must not propagate out of ``main``."""
+        # If KeyboardInterrupt escaped, this call itself would raise.
+        self._run_main([], plot_side_effect=KeyboardInterrupt)
+
+    def test_plot_exception_logged_not_raised(self, caplog):
+        """Unexpected errors inside ``plot`` are logged, not propagated —
+        otherwise the cleanup ``finally`` would be skipped on CLI exits."""
+        import logging
+
+        with caplog.at_level(logging.ERROR, logger="pybeamprofiler.beamprofiler"):
+            self._run_main([], plot_side_effect=RuntimeError("boom"))
+        assert any("Fatal error" in rec.message for rec in caplog.records)
+
+    def test_python_m_entrypoint_invokes_main(self):
+        """Running ``python -m pybeamprofiler`` must end up calling
+        ``beamprofiler.main``. We exercise the tiny ``__main__`` shim via
+        ``runpy`` rather than spawning a subprocess (avoids side effects
+        and keeps the test fast / deterministic)."""
+        import runpy
+
+        with (
+            patch("sys.argv", ["pybeamprofiler"]),
+            patch("pybeamprofiler.beamprofiler.main") as mock_main,
+        ):
+            runpy.run_module("pybeamprofiler.__main__", run_name="__main__")
+            mock_main.assert_called_once()
+
+    def test_finally_closes_camera(self):
+        """After ``plot`` returns, ``main`` must stop + close the camera."""
+        from pybeamprofiler.beamprofiler import main
+
+        # Capture the BeamProfiler instance that ``main`` constructs so we
+        # can spy on its camera.
+        created: list[BeamProfiler] = []
+        real_init = BeamProfiler.__init__
+
+        def capturing_init(self, *args, **kwargs):
+            real_init(self, *args, **kwargs)
+            created.append(self)
+
+        with (
+            patch("sys.argv", ["pybeamprofiler"]),
+            patch.object(BeamProfiler, "__init__", capturing_init),
+            patch.object(BeamProfiler, "plot"),
+        ):
+            main()
+
+        assert created, "main should have constructed a BeamProfiler"
+        cam = created[0].camera
+        assert cam is not None
+        # ``main``'s finally block calls close(); acquiring must be False now.
+        assert not cam.is_acquiring
+
+
+# ─── _camera_info_html ─────────────────────────────────────────────────────
+
+
+class TestCameraInfoHtml:
+    """Tests for BeamProfiler._camera_info_html."""
+
+    def test_simulated_camera_info(self):
+        bp = BeamProfiler(camera="simulated")
+        assert bp.camera is not None
+        html = bp._camera_info_html()
+        assert "Simulated" in html
+        assert "1024×1024" in html
+
+    def test_no_camera_returns_empty(self):
+        bp = BeamProfiler(camera="simulated")
+        bp.camera = None
+        assert bp._camera_info_html() == ""
+
+    def test_with_exposure_and_gain(self):
+        bp = BeamProfiler(camera="simulated")
+        assert bp.camera is not None
+        bp.camera.set_exposure(0.05)
+        bp.camera.set_gain(5.0)
+        html = bp._camera_info_html()
+        assert "Exp:" in html
+        assert "Gain:" in html
+
+    def test_with_vendor_and_model(self):
+        bp = BeamProfiler(camera="simulated")
+        assert bp.camera is not None
+        bp.camera.device_vendor = "TestVendor"  # ty: ignore[unresolved-attribute]
+        bp.camera.device_model = "TestModel"  # ty: ignore[unresolved-attribute]
+        html = bp._camera_info_html()
+        assert "TestVendor TestModel" in html
+
+
+# ─── 2D fit warm start ────────────────────────────────────────────────────
+
+
+class TestFit2DWarmStart:
+    """Test 2D Gaussian fitting with warm-start (cached parameters)."""
+
+    def test_warm_start_reuses_previous(self):
+        bp = BeamProfiler(camera="simulated")
+        assert bp.camera is not None
+        bp.fit_method = "2d"
+        img = bp.camera.get_image()
+        bp.analyze(img)
+        assert bp._last_popt_2d is not None
+        assert len(list(bp._last_popt_2d)) == 7
+
+        img2 = bp.camera.get_image()
+        bp.analyze(img2)
+        assert bp._last_popt_2d is not None
+        assert len(bp._last_popt_2d) == 7
+
+    def test_warm_start_with_large_image(self):
+        bp = BeamProfiler(camera="simulated")
+        assert bp.camera is not None
+        bp.fit_method = "2d"
+        img = bp.camera.get_image()
+        assert max(img.shape) > bp._MAX_FIT_2D_DIM
+        bp.analyze(img)
+        assert bp._last_popt_2d is not None
+
+        bp.analyze(img)
+        assert bp._last_popt_2d is not None
+        second = list(bp._last_popt_2d)
+        assert len(second) == 7
+
+
+# ─── __getattr__ delegation ───────────────────────────────────────────────
+
+
+class TestGetAttrDelegation:
+    """Test BeamProfiler.__getattr__ camera delegation."""
+
+    def test_delegates_to_camera(self):
+        bp = BeamProfiler(camera="simulated")
+        assert bp.camera is not None
+        assert bp.exposure_time == bp.camera.exposure_time
+
+    def test_missing_attr_raises(self):
+        bp = BeamProfiler(camera="simulated")
+        with pytest.raises(AttributeError):
+            _ = bp.nonexistent_attribute_xyz
+
+    def test_no_camera_raises(self):
+        bp = BeamProfiler(camera="simulated")
+        bp.camera = None
+        with pytest.raises(AttributeError):
+            _ = bp.exposure_time
+
+
+# ─── _camera_info_html branches ────────────────────────────────────────────
+
+
+class TestCameraInfoHtmlBranches:
+    """Exercise the branches of ``_camera_info_html`` that weren't
+    covered by the existing suite: model-only, serial-only, and the
+    all-fields-missing early return."""
+
+    def _bp_with_camera_stub(self, **attrs: Any) -> BeamProfiler:
+        bp = BeamProfiler(camera="simulated")
+        # Throw away the real simulated camera and replace with a bare
+        # mock so we can dictate exactly which attributes are set.
+        assert bp.camera is not None
+        bp.camera.close()
+        cam = MagicMock()
+        cam.exposure_time = None
+        cam.gain = None
+        cam.width = None
+        cam.height = None
+        cam.width_pixels = None
+        cam.height_pixels = None
+        cam.device_model = None
+        cam.device_vendor = None
+        cam.serial_number = None
+        for k, v in attrs.items():
+            setattr(cam, k, v)
+        bp.camera = cam
+        return bp
+
+    def test_model_without_vendor(self):
+        bp = self._bp_with_camera_stub(device_model="FooCam 1000")
+        html = bp._camera_info_html()
+        assert "FooCam 1000" in html
+
+    def test_serial_number_included(self):
+        bp = self._bp_with_camera_stub(serial_number="SN12345")
+        html = bp._camera_info_html()
+        assert "S/N: SN12345" in html
+
+    def test_all_fields_missing_returns_empty(self):
+        """No model/vendor/serial/dims/exposure/gain → empty string,
+        not an empty ``<span>`` wrapper (line 764)."""
+        bp = self._bp_with_camera_stub()
+        # Simulated fallback branch ("Simulated") is triggered by type;
+        # our mock is *not* a SimulatedCamera, so parts stays empty.
+        assert bp._camera_info_html() == ""
+
+    def test_no_camera_returns_empty(self):
+        bp = BeamProfiler(camera="simulated")
+        assert bp.camera is not None
+        bp.camera.close()
+        bp.camera = None
+        assert bp._camera_info_html() == ""
+
+
+# ─── plot() early failure paths ────────────────────────────────────────────
+
+
+class TestPlotEarlyFailure:
+    """The plot entry point has an early guard for ``camera is None``
+    when we're supposedly in camera mode (line 1206). Exercise it."""
+
+    def test_camera_mode_without_camera_raises(self):
+        bp = BeamProfiler(camera="simulated")
+        # Close and nullify the camera but keep _mode = "camera" to
+        # trigger the defensive check at the top of plot().
+        assert bp.camera is not None
+        bp.camera.close()
+        bp.camera = None
+        assert bp._mode == "camera"
+        with pytest.raises(RuntimeError, match="not initialized"):
+            bp.plot()
+
+
+# ─── 2D fit downsample-fallback path ───────────────────────────────────────
+
+
+class TestFit2DDownsampledFallback:
+    """``_fit_2d_gaussian`` downsamples large images for speed, then
+    scales the result back. If the fit fails on the downsampled data
+    we still need to scale ``p0`` back so callers get sensible units
+    (lines 544-547)."""
+
+    def test_large_image_fit_failure_scales_p0_back(self):
+        bp = BeamProfiler(camera="simulated")
+        bp.fit_method = "2d"
+
+        # Image larger than _MAX_FIT_2D_DIM → triggers downsampling.
+        h = w = bp._MAX_FIT_2D_DIM * 2
+        img = np.zeros((h, w), dtype=np.uint8)
+        img[h // 2, w // 2] = 255  # single pixel → curve_fit will fail
+
+        with patch(
+            "pybeamprofiler.beamprofiler.curve_fit",
+            side_effect=RuntimeError("no convergence"),
+        ):
+            result = bp._fit_2d_gaussian(img)
+
+        # The initial guess must come back in *original* (un-downsampled)
+        # coordinates: x0/y0/sigmas should be around the original center,
+        # not half-size.
+        assert result is not None
+        # Centre coords must be near the original image centre, not the
+        # downsampled centre — sanity-check against the downsample factor.
+        assert result[1] > bp._MAX_FIT_2D_DIM / 2  # x0 scaled back
+        assert result[2] > bp._MAX_FIT_2D_DIM / 2  # y0 scaled back

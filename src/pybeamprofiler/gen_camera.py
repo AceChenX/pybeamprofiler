@@ -5,14 +5,17 @@ from __future__ import annotations
 import logging
 import os
 import platform
+import time
 from typing import Any
 
 import numpy as np
 
 try:
     from harvesters.core import Harvester
+    from harvesters.core import TimeoutException as _HarvestersTimeout
 except ImportError:
     Harvester = None  # ty:ignore[invalid-assignment]
+    _HarvestersTimeout = None  # ty:ignore[invalid-assignment]
 
 from .camera import Camera
 
@@ -63,6 +66,11 @@ class HarvesterCamera(Camera):
 
     Attributes:
         node_map: GenICam node map for direct feature access, or ``None``.
+        device_model: Camera model name (e.g. ``"BFS-PGE-50S5M"``).
+        device_vendor: Camera vendor name (e.g. ``"FLIR"``).
+        serial_number: Camera serial number string.
+        width_pixels: Sensor width in pixels.
+        height_pixels: Sensor height in pixels.
     """
 
     def __init__(
@@ -115,6 +123,12 @@ class HarvesterCamera(Camera):
         self._roi_offset_y: int = 0
         self.width: int = 0
         self.height: int = 0
+        # Time of the most recent successful frame. Used to detect when the
+        # producer has silently stalled (a known issue on some GenTL stacks
+        # after long-running acquisition) so ``get_image`` can attempt a
+        # stop/start recovery instead of timing out forever.
+        self._last_successful_fetch: float = 0.0
+        self._stall_recovery_attempted: bool = False
 
     @staticmethod
     def _parse_gentl_path(gentl_path: str) -> str | list[str] | None:
@@ -418,59 +432,126 @@ class HarvesterCamera(Camera):
             logger.warning(f"Could not detect gain range: {e}")
 
     def close(self) -> None:
-        """Close camera connection."""
-        if self.ia:
-            self.ia.destroy()
-        self.h.reset()
+        """Close camera connection and release hardware."""
+        try:
+            self.stop_acquisition()
+        except Exception:
+            logger.debug("Error stopping acquisition during close", exc_info=True)
+        try:
+            if self.ia:
+                self.ia.destroy()
+        except Exception:
+            logger.debug("Error destroying ImageAcquirer", exc_info=True)
+        try:
+            self.h.reset()
+        except Exception:
+            logger.debug("Error resetting Harvester", exc_info=True)
 
     def start_acquisition(self) -> None:
-        """Start image acquisition."""
-        if self.ia:
+        """Start image acquisition on the GenTL producer."""
+        if not self.ia:
+            return
+        if not self.is_acquiring:
             self.ia.start()
             self.is_acquiring = True
+            self._last_successful_fetch = 0.0
+            self._stall_recovery_attempted = False
 
     def stop_acquisition(self) -> None:
-        """Stop image acquisition."""
-        if self.ia:
-            self.ia.stop()
+        """Stop image acquisition on the GenTL producer."""
+        if self.ia and self.is_acquiring:
+            try:
+                self.ia.stop()
+            except Exception:
+                logger.debug("Error stopping acquisition", exc_info=True)
             self.is_acquiring = False
 
-    def get_image(self) -> np.ndarray:
-        """Retrieve image from camera.
+    def get_image(self, timeout: float | None = None) -> np.ndarray:
+        """Fetch the next frame from the GenTL producer.
 
-        Automatically starts acquisition if not already running.
+        For default short exposures this returns within a few ms. For long
+        exposures the caller should pass a small ``timeout`` (e.g. ``0.2``)
+        and treat :class:`TimeoutError` as "no new frame yet, try again
+        next tick" so the UI stays responsive.
+
+        Args:
+            timeout: Maximum seconds to wait for a frame.
+                Defaults to ``max(2.0, exposure_time + 2.0)``.
 
         Returns:
-            2D numpy array of image data
+            2D numpy array containing the frame data.
+
+        Raises:
+            RuntimeError: If the camera has not been opened.
+            TimeoutError: If no frame arrives within ``timeout``.
         """
         if not self.ia:
             raise RuntimeError("Camera not opened.")
-
         if not self.is_acquiring:
             self.start_acquisition()
 
+        if timeout is None:
+            timeout = max(2.0, (self.exposure_time or 0) + 2.0)
+
+        # One-shot stop/start recovery: if the producer has been silent for
+        # roughly ``max(5 s, 3× exposure)`` we assume the acquirer has
+        # stalled (a known issue on some GenTL stacks after long runs).
+        now = time.monotonic()
+        if self._last_successful_fetch and not self._stall_recovery_attempted:
+            stall_window = max(5.0, 3.0 * (self.exposure_time or 0.0))
+            if now - self._last_successful_fetch > stall_window:
+                logger.warning(
+                    "Acquisition appears stalled (no frame for %.1f s); "
+                    "attempting to recover by restarting acquisition.",
+                    now - self._last_successful_fetch,
+                )
+                self._stall_recovery_attempted = True
+                try:
+                    self.stop_acquisition()
+                    self.start_acquisition()
+                except Exception:
+                    logger.debug("Stall recovery failed", exc_info=True)
+
         try:
-            with self.ia.fetch(timeout=2.0) as buffer:
+            with self.ia.fetch(timeout=timeout) as buffer:
                 component = buffer.payload.components[0]
-                image = component.data.reshape(component.height, component.width).copy()
                 self.width_pixels = component.width
                 self.height_pixels = component.height
-                return image
+                img = component.data.reshape(component.height, component.width).copy()
+            self._last_successful_fetch = time.monotonic()
+            self._stall_recovery_attempted = False
+            return img
         except Exception as exc:
-            if type(exc).__name__ == "TimeoutException":
+            # Harvesters re-exports ``_gentl.TimeoutException`` which isn't a
+            # subclass of Python's built-in ``TimeoutError`` (they merely share
+            # a name), so we catch it explicitly and re-raise as ``TimeoutError``
+            # so callers can use a single, standard-library-only except clause.
+            is_timeout = isinstance(exc, TimeoutError) or (
+                _HarvestersTimeout is not None and isinstance(exc, _HarvestersTimeout)
+            )
+            if is_timeout:
+                # Seed the stall timer on the very first call so we don't
+                # falsely trigger recovery for a camera that simply hasn't
+                # warmed up yet.
+                if not self._last_successful_fetch:
+                    self._last_successful_fetch = now
                 raise TimeoutError(
-                    "Camera did not deliver a frame within 2 s. "
-                    "Check that the camera is connected, powered, and not in use "
-                    "by another application."
+                    f"Camera did not deliver a frame within {timeout:.1f} s. "
+                    "Check that the camera is connected, powered, and not in "
+                    "use by another application."
                 ) from exc
             raise
 
     def set_exposure(self, exposure_time: float) -> None:
-        """Set exposure time.
+        """Set exposure time, restarting acquisition to flush stale buffers.
 
         Args:
             exposure_time: Exposure time in seconds
         """
+        was_acquiring = self.is_acquiring
+        if was_acquiring:
+            self.stop_acquisition()
+
         if self.node_map:
             try:
                 self.node_map.ExposureTime.value = exposure_time * 1_000_000
@@ -480,6 +561,9 @@ class HarvesterCamera(Camera):
                 except (AttributeError, ValueError, TypeError):
                     logger.error("Could not set exposure time.")
         self.exposure_time = exposure_time
+
+        if was_acquiring:
+            self.start_acquisition()
 
     def set_gain(self, gain: float) -> None:
         """Set camera gain.
@@ -539,6 +623,11 @@ class HarvesterCamera(Camera):
                 width = self._roi_max_width
             if height is None:
                 height = self._roi_max_height
+
+            offset_x = max(0, min(offset_x, self._roi_max_width - 1))
+            offset_y = max(0, min(offset_y, self._roi_max_height - 1))
+            width = max(1, min(width, self._roi_max_width - offset_x))
+            height = max(1, min(height, self._roi_max_height - offset_y))
 
             # Order matters: set offsets before dimensions
             if hasattr(self.node_map, "OffsetX"):

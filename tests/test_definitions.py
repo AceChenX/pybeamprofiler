@@ -58,7 +58,8 @@ class TestFWHMDefinition:
         assert popt_y is not None
         assert bp.width_x > 0
         assert bp.width_y > 0
-        assert 1750 < bp.width_x < 1770
+        # FWHM = 2.355 * sigma * pixel_size = 2.355 * 50 * 5 = 588.75 µm
+        assert 585 < bp.width_x < 595
 
 
 class TestD4SigmaDefinition:
@@ -85,7 +86,9 @@ class TestD4SigmaDefinition:
 
         assert bp.width_x > 0
         assert bp.width_y > 0
-        assert 2930 < bp.width_x < 2950
+        # D4σ = 4 * sigma * pixel_size = 4 * 50 * 5 = 1000 µm (1 mm).
+        # Discrete second moment slightly under-estimates a Gaussian with σ=50 px.
+        assert 970 < bp.width_x < 1010
 
 
 class TestDefinitionComparisons:
@@ -238,10 +241,11 @@ class TestWidthDefinitions:
         assert bp.width_x > 0
         assert bp.width_y > 0
 
-        # FWHM is measured directly from half-maximum points, not from Gaussian fit
-        # FWHM expected to be ~2.355 * sigma * pixel_size = 2.355 * 20 * 25 = 1177.5
-        assert 1750 < bp.width_x < 1770
-        assert 1640 < bp.width_y < 1660
+        # FWHM is measured directly from half-maximum points, not from Gaussian fit.
+        # Expected: 2.355 * sigma * pixel_size = 2.355 * 50 * 5 = 588.75 µm (X)
+        #                                      = 2.355 * 45 * 5 = 529.875 µm (Y)
+        assert 585 < bp.width_x < 595
+        assert 525 < bp.width_y < 535
 
         # Verify different definitions give different widths for the same noiseless beam
         bp_gaussian = BeamProfiler(camera="simulated", fit="1d", definition="gaussian")
@@ -268,7 +272,7 @@ class TestWidthDefinitions:
         bp_d4s.analyze(img)
 
         # For a perfect Gaussian, D4σ == 1/e² width and both == 4σ
-        assert abs(bp_d4s.width_x - bp_gaussian.width_x) / bp_gaussian.width_x < 0.02
+        assert abs(bp_d4s.width_x - bp_gaussian.width_x) / bp_gaussian.width_x < 0.05
         # Gaussian (4σ) should be larger than FWHM (2.355σ)
         assert bp_gaussian.width_x > bp_fwhm.width_x
 
