@@ -1725,6 +1725,30 @@ class TestGenicamCallbackBranches:
             result = fn(1.0, None)
             assert result[1] == 1.0
 
+    def test_numeric_ignores_a_trigger_without_a_feature(self):
+        """Guards against a malformed pattern-matching id reaching the setter
+        and raising KeyError inside the callback."""
+        bp = BeamProfiler(camera="simulated")
+        captured = self._capture(bp)
+        fn = self._find(captured, "genicam-num")
+        assert fn is not None
+
+        with patch("pybeamprofiler.dash_app.ctx") as mock_ctx:
+            mock_ctx.triggered_id = {"type": "genicam-num"}  # no "feature"
+            result = fn(1.0, None)
+        assert all(isinstance(r, dash._no_update.NoUpdate) for r in result)
+
+    def test_numeric_ignores_a_non_dict_trigger(self):
+        bp = BeamProfiler(camera="simulated")
+        captured = self._capture(bp)
+        fn = self._find(captured, "genicam-num")
+        assert fn is not None
+
+        with patch("pybeamprofiler.dash_app.ctx") as mock_ctx:
+            mock_ctx.triggered_id = "not-a-pattern-id"
+            result = fn(1.0, 2.0)
+        assert all(isinstance(r, dash._no_update.NoUpdate) for r in result)
+
     def test_select_set_exception_swallowed(self):
         from unittest.mock import patch
 

@@ -21,12 +21,12 @@ import numpy as np
 import plotly.graph_objs as go
 from dash import MATCH, Input, Output, Patch, State, ctx, dcc, html
 from PIL import Image
-from scipy.ndimage import zoom as _ndimage_zoom
 
 from .constants import (
     DEFAULT_UPDATE_INTERVAL_MS,
     MAX_DISPLAY_DIM,
 )
+from .fitting import downsample
 
 # Optional: only present when a real GenTL backend is installed. Used by
 # ``_is_readonly`` to map GenICam access modes to our read-only flag.
@@ -114,9 +114,13 @@ def _saturation_fraction(image: np.ndarray) -> float:
     sat = _saturation_max(image)
     # For integer images, only the exact dtype max counts as saturated.
     # For floating-point images, allow a small epsilon near the inferred max.
-    if np.issubdtype(image.dtype, np.integer):
-        return float(np.count_nonzero(image >= sat)) / image.size
-    return float(np.count_nonzero(image >= sat - 1e-6)) / image.size
+    threshold = sat if np.issubdtype(image.dtype, np.integer) else sat - 1e-6
+    # A plain max() reduction is several times cheaper than the comparison
+    # below, which has to allocate a full-frame boolean temporary. Nothing is
+    # saturated far more often than not, so check the cheap way first.
+    if float(image.max()) < threshold:
+        return 0.0
+    return float(np.count_nonzero(image >= threshold)) / image.size
 
 
 # ---------------------------------------------------------------------------
@@ -935,11 +939,7 @@ def build_figure(
         return go.Figure()
 
     h, w = image.shape
-    if max(h, w) > MAX_DISPLAY_DIM:
-        scale = MAX_DISPLAY_DIM / max(h, w)
-        display_img = _ndimage_zoom(image, scale, order=1)
-    else:
-        display_img = image
+    display_img = downsample(image, MAX_DISPLAY_DIM)
     dh, dw = display_img.shape
 
     ps = bp.pixel_size
@@ -981,23 +981,12 @@ def build_figure(
             )
 
     # ── Ellipse overlay ─────────────────────────────────────────
-    if popt_x is not None and popt_y is not None:
-        cx, cy = popt_x[1], popt_y[1]
-        rx, ry = 2 * abs(popt_x[2]), 2 * abs(popt_y[2])
-        theta = np.linspace(0, 2 * np.pi, 100)
-
-        if bp.fit_method == "2d" and hasattr(bp, "angle_deg"):
-            a = np.radians(bp.angle_deg)
-            xe = cx + rx * np.cos(theta) * np.cos(a) - ry * np.sin(theta) * np.sin(a)
-            ye = cy + rx * np.cos(theta) * np.sin(a) + ry * np.sin(theta) * np.cos(a)
-        else:
-            xe = cx + rx * np.cos(theta)
-            ye = cy + ry * np.sin(theta)
-
+    ellipse = bp._ellipse_points()
+    if ellipse is not None:
         fig.add_trace(
             go.Scatter(
-                x=xe * ps,
-                y=ye * ps,
+                x=ellipse[0],
+                y=ellipse[1],
                 mode="lines",
                 line=dict(color="#FF4444", width=2.5, dash="dash"),
                 showlegend=False,
@@ -1434,6 +1423,11 @@ def _averaged_image(image: np.ndarray, n: int) -> np.ndarray:
     _avg_running_sum += image
 
     mean = _avg_running_sum / len(_avg_buffer)
+    if np.issubdtype(image.dtype, np.integer):
+        # Round rather than truncate: casting straight to int would shave a
+        # consistent ~0.5 count off every pixel, which shows up as a darker
+        # image the moment averaging is switched on.
+        mean = np.rint(mean)
     return mean.astype(image.dtype)
 
 
@@ -1820,12 +1814,14 @@ def _register_callbacks(app: dash.Dash, bp: BeamProfiler) -> None:
         def set_genicam_numeric(
             slider_val: float | None, input_val: float | None
         ) -> tuple[Any, Any]:
-            trigger = ctx.triggered_id or {}
+            trigger = ctx.triggered_id
             source = trigger.get("type") if isinstance(trigger, dict) else None
             value = slider_val if source == "genicam-num" else input_val
-            if value is None or bp.camera is None:
+            if value is None or bp.camera is None or not isinstance(trigger, dict):
                 return dash.no_update, dash.no_update
-            feature = trigger["feature"]
+            feature = trigger.get("feature")
+            if feature is None:
+                return dash.no_update, dash.no_update
             with _callback_lock:
                 nm = getattr(bp.camera, "node_map", None)
                 if nm is not None:

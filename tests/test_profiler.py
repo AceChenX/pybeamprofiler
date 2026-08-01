@@ -1,5 +1,6 @@
 """Tests for BeamProfiler properties, attributes, and integration."""
 
+import math
 from typing import Any
 from unittest.mock import MagicMock, patch
 
@@ -52,7 +53,12 @@ class TestBeamProfilerProperties:
         assert bp.height_y > 0
 
     def test_property_relationships(self, beam_profiler):
-        """Test relationships between width properties hold for all definitions."""
+        """Width properties must stay correctly ordered for every definition.
+
+        A lower intensity threshold is crossed further out on the Gaussian
+        flanks, so the widths grow as the threshold falls:
+        FWHM (1/2) < FW@1/e < FW@1/e².
+        """
         bp = beam_profiler
         assert bp.camera is not None
 
@@ -64,8 +70,28 @@ class TestBeamProfilerProperties:
             bp.definition = definition
             bp.analyze(img)
 
-            assert bp.fw_1e_x < bp.fwhm_x < bp.fw_1e2_x, f"Failed for {definition}"
-            assert bp.fw_1e_y < bp.fwhm_y < bp.fw_1e2_y, f"Failed for {definition}"
+            assert bp.fwhm_x < bp.fw_1e_x < bp.fw_1e2_x, f"Failed for {definition}"
+            assert bp.fwhm_y < bp.fw_1e_y < bp.fw_1e2_y, f"Failed for {definition}"
+
+    def test_property_conversion_factors(self, beam_profiler):
+        """Derived widths must sit at the exact analytic multiples of sigma."""
+        bp = beam_profiler
+        assert bp.camera is not None
+
+        bp.camera.start_acquisition()
+        img = bp.camera.get_image()
+        bp.camera.stop_acquisition()
+        bp.analyze(img)
+
+        # Default definition is 'gaussian', so width_x is 4σ.
+        sigma_x = bp.width_x / 4.0
+        assert bp.fwhm_x == pytest.approx(2 * math.sqrt(2 * math.log(2)) * sigma_x)
+        assert bp.fw_1e_x == pytest.approx(2 * math.sqrt(2) * sigma_x)
+        assert bp.fw_1e2_x == pytest.approx(4 * sigma_x)
+
+        # Ratios are definition-independent.
+        assert bp.fw_1e_x / bp.fwhm_x == pytest.approx(1.2011, rel=1e-3)
+        assert bp.fw_1e2_x / bp.fwhm_x == pytest.approx(1.6986, rel=1e-3)
 
 
 class TestBeamProfilerStaticImages:
@@ -500,7 +526,7 @@ class TestFitFailures:
         bp = BeamProfiler(camera="simulated")
         assert bp.camera is not None
         noisy = np.random.uniform(0, 255, 10).astype(np.float64)
-        with patch("pybeamprofiler.beamprofiler.curve_fit", side_effect=RuntimeError("fit failed")):
+        with patch("pybeamprofiler.fitting.curve_fit", side_effect=RuntimeError("fit failed")):
             result = bp._fit_1d_gaussian(noisy)
         assert len(result) == 4
         bp.camera.close()
@@ -510,7 +536,7 @@ class TestFitFailures:
         bp = BeamProfiler(camera="simulated")
         assert bp.camera is not None
         img = np.random.uniform(0, 255, (32, 32)).astype(np.float64)
-        with patch("pybeamprofiler.beamprofiler.curve_fit", side_effect=RuntimeError("fit failed")):
+        with patch("pybeamprofiler.fitting.curve_fit", side_effect=RuntimeError("fit failed")):
             result = bp._fit_2d_gaussian(img)
         assert len(result) == 7
         bp.camera.close()
@@ -521,7 +547,7 @@ class TestFitFailures:
         assert bp.camera is not None
         img = np.random.uniform(0, 255, (32, 32)).astype(np.float64)
         bp._last_popt_2d = [100, 16, 16, 5, 5, 0, 10]
-        with patch("pybeamprofiler.beamprofiler.curve_fit", side_effect=RuntimeError("fit failed")):
+        with patch("pybeamprofiler.fitting.curve_fit", side_effect=RuntimeError("fit failed")):
             result = bp._fit_2d_gaussian(img)
         assert result == [100, 16, 16, 5, 5, 0, 10]
         bp.camera.close()
@@ -1306,7 +1332,7 @@ class TestFit2DDownsampledFallback:
         img[h // 2, w // 2] = 255  # single pixel → curve_fit will fail
 
         with patch(
-            "pybeamprofiler.beamprofiler.curve_fit",
+            "pybeamprofiler.fitting.curve_fit",
             side_effect=RuntimeError("no convergence"),
         ):
             result = bp._fit_2d_gaussian(img)

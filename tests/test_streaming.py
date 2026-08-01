@@ -712,3 +712,139 @@ def test_dash_shutdown_flag_stops_callback():
         assert result[0] is mock_fig
 
     bp.camera.close()
+
+
+# ─── Stream-loop branches that only fire when the camera misbehaves ────────
+
+
+def _jupyter_modules() -> dict[str, MagicMock]:
+    """Mock IPython modules that make ``_plot_stream`` take the Jupyter path."""
+    display_module = MagicMock()
+    display_module.display = MagicMock()
+    display_module.clear_output = MagicMock()
+
+    ipython = MagicMock()
+    ipython.get_ipython = MagicMock(return_value=MagicMock())
+    return {"IPython": ipython, "IPython.display": display_module}
+
+
+def test_jupyter_loop_exits_when_acquisition_stops():
+    """A ``None`` frame from a stopped camera ends the loop rather than
+    spinning forever on a device that will never deliver again."""
+    bp = BeamProfiler(camera="simulated")
+    assert bp.camera is not None
+    bp.camera.get_image = MagicMock(return_value=None)  # type: ignore
+    # _plot_stream starts acquisition on entry; keep it a no-op so the camera
+    # stays "stopped" for the duration of the test.
+    bp.camera.start_acquisition = MagicMock()  # type: ignore
+    bp.camera.is_acquiring = False
+
+    async def run_test():
+        with patch.dict("sys.modules", _jupyter_modules()):
+            task = bp.plot(heatmap_only=True)
+            assert isinstance(task, asyncio.Task)
+            await asyncio.wait_for(task, timeout=5.0)
+        assert task.done()
+
+    asyncio.run(run_test())
+    bp.camera.close()
+
+
+def test_jupyter_loop_waits_out_a_dropped_frame():
+    """A ``None`` frame while still acquiring is a hiccup, not the end."""
+    bp = BeamProfiler(camera="simulated")
+    assert bp.camera is not None
+    bp.camera.start_acquisition()
+
+    frames = [None, None, np.ones((10, 10))]
+    bp.camera.get_image = MagicMock(  # ty: ignore[invalid-assignment]
+        side_effect=lambda *a, **k: frames.pop(0) if frames else np.ones((10, 10))
+    )
+    bp._create_fast_figure = MagicMock(return_value=MagicMock())  # type: ignore
+
+    async def run_test():
+        modules = _jupyter_modules()
+        with patch.dict("sys.modules", modules):
+            task = bp.plot(heatmap_only=True)
+            assert isinstance(task, asyncio.Task)
+            display_mock = modules["IPython.display"].display
+            for _ in range(300):
+                if display_mock.call_count > 0:
+                    break
+                await asyncio.sleep(0.01)
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            assert display_mock.call_count >= 1
+
+    asyncio.run(run_test())
+    bp.camera.close()
+
+
+def test_plot_stream_runs_the_loop_when_there_is_no_event_loop():
+    """Outside a running loop, ``_plot_stream`` drives it with asyncio.run."""
+    bp = BeamProfiler(camera="simulated")
+    assert bp.camera is not None
+    bp.camera.get_image = MagicMock(return_value=None)  # type: ignore
+    bp.camera.start_acquisition = MagicMock()  # type: ignore
+    bp.camera.is_acquiring = False
+
+    with patch.dict("sys.modules", _jupyter_modules()):
+        assert bp._plot_stream() is None  # asyncio.run path, returns on break
+
+    bp.camera.close()
+
+
+def test_matplotlib_frame_update_renders_2d_angle():
+    """The matplotlib info panel shows the rotation angle in 2D mode."""
+    bp = BeamProfiler(camera="simulated", fit="2d")
+    assert bp.camera is not None
+
+    captured = {}
+    mock_fig_plt = MagicMock()
+    mock_axes = MagicMock()
+    mock_axes.flat = [MagicMock() for _ in range(4)]
+
+    mock_plt = MagicMock()
+    mock_plt.subplots.return_value = (mock_fig_plt, mock_axes)
+
+    def capture_anim(fig, update, **kwargs):
+        captured["update"] = update
+        return MagicMock()
+
+    mock_animation = MagicMock()
+    mock_animation.FuncAnimation = capture_anim
+
+    mock_matplotlib = MagicMock()
+    mock_matplotlib.pyplot = mock_plt
+    mock_matplotlib.animation = mock_animation
+
+    mock_ipython = MagicMock()
+    mock_ipython.get_ipython = MagicMock(return_value=None)
+
+    with patch.dict(
+        sys.modules,
+        {
+            "IPython": mock_ipython,
+            "dash": None,
+            "matplotlib": mock_matplotlib,
+            "matplotlib.pyplot": mock_plt,
+            "matplotlib.animation": mock_animation,
+            "matplotlib.patches": MagicMock(),
+        },
+    ):
+        bp._plot_stream()
+
+        update = captured["update"]
+        # A real frame renders the full panel, angle line included.
+        update(1)
+        info_text = mock_axes.__getitem__.return_value.text.call_args
+        assert info_text is not None
+
+        # A dropped frame returns early without touching the axes.
+        bp.camera.get_image = MagicMock(return_value=None)  # type: ignore
+        assert update(2) is None
+
+    bp.camera.close()

@@ -1345,14 +1345,6 @@ class TestCameraSettingMethod:
         assert result == []
         cam.close()
 
-    def test_create_advanced_controls_no_node_map(self):
-        """Test _create_advanced_controls returns empty list without node_map."""
-        cam = self._make_cam_with_mocks()
-        cam.node_map = None
-        result = cam._create_advanced_controls({"description_width": "initial"})
-        assert result == []
-        cam.close()
-
     def test_create_genicam_controls_with_features(self):
         """Test _create_genicam_controls discovers features from node_map."""
         cam = self._make_cam_with_mocks()
@@ -1445,10 +1437,14 @@ class TestCameraSettingMethod:
         # Boolean feature
         cam.node_map.GammaEnable.value = True
 
-        # Numeric feature with min/max
-        cam.node_map.Gamma.value = 1.0
-        cam.node_map.Gamma.min = 0.0
-        cam.node_map.Gamma.max = 4.0
+        # Numeric feature with min/max and — like a real numeric node — no
+        # ``symbolics``. The spec matters: a bare MagicMock would answer to
+        # every attribute and get mistaken for an enumeration.
+        numeric_node = MagicMock(spec=["value", "min", "max"])
+        numeric_node.value = 1.0
+        numeric_node.min = 0.0
+        numeric_node.max = 4.0
+        cam.node_map.Gamma = numeric_node
 
         # Enum feature (no min/max)
         enum_node = MagicMock(spec=["value", "symbolics"])
@@ -1460,13 +1456,6 @@ class TestCameraSettingMethod:
             ["GammaEnable", "Gamma", "Sharpness"], {"description_width": "initial"}
         )
         assert len(controls) == 3
-        cam.close()
-
-    def test_create_advanced_controls_returns_empty(self):
-        """Test _create_advanced_controls returns empty (features are now auto-discovered)."""
-        cam = self._make_cam_with_mocks()
-        result = cam._create_advanced_controls({"description_width": "initial"})
-        assert result == []
         cam.close()
 
 

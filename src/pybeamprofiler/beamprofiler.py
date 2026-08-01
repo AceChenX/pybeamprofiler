@@ -17,17 +17,17 @@ import numpy as np
 import plotly.graph_objs as go
 from PIL import Image
 from plotly.subplots import make_subplots
-from scipy.ndimage import zoom as _ndimage_zoom
-from scipy.optimize import curve_fit
 
+from . import fitting
 from .basler import BaslerCamera
 from .camera import Camera
 from .constants import (
     D4SIGMA_FACTOR,
     DEFAULT_DASH_PORT,
+    FW_1E_FACTOR,
     GAUSSIAN_TO_FWHM,
     MAX_DISPLAY_DIM,
-    MAX_FIT_ITERATIONS,
+    MAX_FIT_2D_DIM,
 )
 from .flir import FlirCamera
 from .simulated import SimulatedCamera
@@ -42,20 +42,22 @@ class BeamProfiler:
     or camera streams. Provides beam width measurements in various definitions.
 
     Args:
-        camera: Camera type ('simulated', 'flir', 'basler') or None for default
-        file: Path to static image file to analyze
+        camera: Camera type ('simulated', 'flir', 'basler'), or None for default
+        file: Path to a static image file to analyze
         fit: Fitting method ('1d', '2d', 'linecut')
         definition: Width definition ('gaussian' for 1/e², 'fwhm', 'd4s')
         exposure_time: Camera exposure time in seconds (default: camera default)
-        pixel_size: Pixel size in micrometers
+        pixel_size: Pixel pitch in micrometers. Required with *file*; with a
+            camera it overrides the value the camera reports, which is worth
+            doing when binning is on or the camera reports nothing useful.
 
     Attributes:
-        width_x: Beam width in x direction (μm)
-        width_y: Beam width in y direction (μm)
+        width_x: Beam width in x, in the selected definition (μm)
+        width_y: Beam width in y, in the selected definition (μm)
         center_x: Beam center x position (pixels)
         center_y: Beam center y position (pixels)
-        angle_deg: Beam rotation angle (degrees, for 2D fit)
-        peak_value: Peak intensity value
+        angle_deg: Beam rotation angle (degrees; 2D fit only, else 0)
+        peak_value: Peak intensity of the last analyzed frame
     """
 
     def __init__(
@@ -73,8 +75,8 @@ class BeamProfiler:
         :class:`SimulatedCamera` is used by default.
 
         Raises:
-            ValueError: If ``pixel_size`` is not provided for static image files,
-                or if neither camera nor file is successfully loaded.
+            ValueError: If ``pixel_size`` is missing (or not positive) for a
+                static image file, or if neither camera nor file loaded.
             RuntimeError: If a physical camera (FLIR/Basler) fails to open.
         """
         self.camera: Camera | None = None
@@ -97,6 +99,9 @@ class BeamProfiler:
         self._last_proj_x: np.ndarray | None = None
         self._last_proj_y: np.ndarray | None = None
 
+        if pixel_size is not None and pixel_size <= 0:
+            raise ValueError(f"pixel_size must be greater than zero, got {pixel_size}")
+
         if file:
             self._load_file(file)
             self._mode = "static"
@@ -113,7 +118,8 @@ class BeamProfiler:
         if self.camera:
             self.width_pixels = self.camera.width
             self.height_pixels = self.camera.height
-            self.pixel_size = self.camera.pixel_size
+            # An explicit pixel_size wins over whatever the camera reports.
+            self.pixel_size = pixel_size if pixel_size is not None else self.camera.pixel_size
             if exposure_time is not None:
                 self.camera.set_exposure(exposure_time)
         elif file and self.last_img is not None:
@@ -157,19 +163,37 @@ class BeamProfiler:
                 self._mode = "camera"
 
     def _load_file(self, filename: str) -> None:
-        """Load static image file.
+        """Load a static image file as a 2D intensity array.
+
+        Colour images are collapsed to a single channel: an alpha channel is
+        dropped and RGB is converted with the usual luminance weights, so a
+        camera screenshot saved as a colour PNG still analyses correctly rather
+        than blowing up on a 3D array later.
 
         Args:
-            filename: Path to image file
+            filename: Path to the image file.
         """
         try:
             with Image.open(filename) as img:
-                self.last_img = np.array(img)
-                self.width_pixels = self.last_img.shape[1]
-                self.height_pixels = self.last_img.shape[0]
+                data = np.array(img)
         except Exception as e:
             logger.error(f"Error loading image file {filename}: {e}")
             raise
+
+        if data.ndim == 3:
+            channels = data.shape[2]
+            if channels >= 3:
+                logger.info("Converting %d-channel image to grayscale", channels)
+                rgb = data[:, :, :3].astype(np.float64)
+                data = (rgb @ [0.299, 0.587, 0.114]).astype(data.dtype)
+            else:
+                # Grayscale + alpha, or a single-channel image stored as 3D.
+                data = data[:, :, 0]
+        elif data.ndim != 2:
+            raise ValueError(f"Expected a 2D or 3D image, got a {data.ndim}D array from {filename}")
+
+        self.last_img = data
+        self.height_pixels, self.width_pixels = data.shape
 
     def __enter__(self) -> BeamProfiler:
         """Context manager entry."""
@@ -201,69 +225,11 @@ class BeamProfiler:
             return getattr(camera, name)
         raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
 
-    @staticmethod
-    def gaussian(x: np.ndarray, a: float, x0: float, sigma: float, offset: float) -> np.ndarray:
-        """1D Gaussian function.
-
-        Args:
-            x: Input array
-            a: Amplitude
-            x0: Center position
-            sigma: Standard deviation
-            offset: Baseline offset
-
-        Returns:
-            Gaussian values at x positions
-        """
-        return a * np.exp(-((x - x0) ** 2) / (2 * sigma**2)) + offset
-
-    @staticmethod
-    def gaussian_2d(
-        xy: tuple[np.ndarray, np.ndarray],
-        amplitude: float,
-        x0: float,
-        y0: float,
-        sigma_x: float,
-        sigma_y: float,
-        theta: float,
-        offset: float,
-    ) -> np.ndarray:
-        """2D Gaussian function with rotation.
-
-        Args:
-            xy: tuple of (x, y) mesh grids
-            amplitude: Peak amplitude
-            x0: Center x position
-            y0: Center y position
-            sigma_x: Standard deviation in x
-            sigma_y: Standard deviation in y
-            theta: Rotation angle in radians
-            offset: Baseline offset
-
-        Returns:
-            Flattened 2D Gaussian values
-        """
-        x, y = xy
-        cos_t = np.cos(theta)
-        sin_t = np.sin(theta)
-        cos2 = cos_t * cos_t
-        sin2 = sin_t * sin_t
-        sin2t = 2.0 * sin_t * cos_t
-        sx2_inv = 0.5 / (sigma_x * sigma_x)
-        sy2_inv = 0.5 / (sigma_y * sigma_y)
-
-        a = cos2 * sx2_inv + sin2 * sy2_inv
-        b = 0.5 * sin2t * (sy2_inv - sx2_inv)
-        c = sin2 * sx2_inv + cos2 * sy2_inv
-
-        dx = x - float(x0)
-        dy = y - float(y0)
-        out = a * dx * dx + 2.0 * b * dx * dy + c * dy * dy
-        np.negative(out, out=out)
-        np.exp(out, out=out)
-        out *= amplitude
-        out += offset
-        return out.ravel()
+    # The model functions live in :mod:`pybeamprofiler.fitting`; they are
+    # re-exposed here because ``BeamProfiler.gaussian`` is part of the public
+    # API (and handy for plotting a fit alongside your own data).
+    gaussian = staticmethod(fitting.gaussian)
+    gaussian_2d = staticmethod(fitting.gaussian_2d)
 
     @property
     def width(self) -> float:
@@ -281,14 +247,16 @@ class BeamProfiler:
         return self.width / 2
 
     def _to_sigma(self, width: float) -> float:
-        """Convert a reported width back to sigma (μm) based on the current definition.
+        """Convert a reported width back to sigma (μm) for the current definition.
 
-        This allows all derived width properties to work correctly regardless
-        of which definition was used for the primary width measurement.
+        ``width_x`` / ``width_y`` are stored in whichever definition the user
+        selected.  Normalising through sigma lets every derived property below
+        report the right number no matter which definition produced the
+        measurement.
         """
         if self.definition == "fwhm":
             return width / GAUSSIAN_TO_FWHM
-        # Both 'gaussian' (1/e²) and 'd4s' use 4*sigma
+        # Both 'gaussian' (1/e²) and 'd4s' report 4σ.
         return width / D4SIGMA_FACTOR
 
     @property
@@ -303,13 +271,13 @@ class BeamProfiler:
 
     @property
     def fw_1e_x(self) -> float:
-        """Full Width at 1/e in X direction (μm)."""
-        return 2.0 * self._to_sigma(self.width_x)
+        """Full Width at 1/e of peak intensity in X direction (μm)."""
+        return FW_1E_FACTOR * self._to_sigma(self.width_x)
 
     @property
     def fw_1e_y(self) -> float:
-        """Full Width at 1/e in Y direction (μm)."""
-        return 2.0 * self._to_sigma(self.width_y)
+        """Full Width at 1/e of peak intensity in Y direction (μm)."""
+        return FW_1E_FACTOR * self._to_sigma(self.width_y)
 
     @property
     def fw_1e2_x(self) -> float:
@@ -332,232 +300,114 @@ class BeamProfiler:
         return self.peak_value
 
     def _measure_fwhm(self, profile: np.ndarray) -> tuple[float, float, float]:
-        """Measure Full Width at Half Maximum directly from profile.
-
-        Uses linear interpolation for sub-pixel accuracy without assuming
-        Gaussian distribution.
-
-        Args:
-            profile: 1D intensity profile
-
-        Returns:
-            Tuple of (center, fwhm_width, peak_value)
-        """
-        profile = profile - np.min(profile)  # Remove baseline
-        peak_idx = np.argmax(profile)
-        peak_value = profile[peak_idx]
-        half_max = peak_value / 2.0
-
-        # Find left half-maximum point
-        left_idx = peak_idx
-        while left_idx > 0 and profile[left_idx] > half_max:
-            left_idx -= 1
-        # Interpolate
-        if left_idx < peak_idx and profile[left_idx] < half_max:
-            frac = (half_max - profile[left_idx]) / (profile[left_idx + 1] - profile[left_idx])
-            left_pos = left_idx + frac
-        else:
-            left_pos = float(left_idx)
-
-        # Find right half-maximum point
-        right_idx = peak_idx
-        while right_idx < len(profile) - 1 and profile[right_idx] > half_max:
-            right_idx += 1
-        # Interpolate
-        if right_idx > peak_idx and profile[right_idx] < half_max:
-            frac = (half_max - profile[right_idx]) / (profile[right_idx - 1] - profile[right_idx])
-            right_pos = right_idx - frac
-        else:
-            right_pos = float(right_idx)
-
-        fwhm = right_pos - left_pos
-        center = (left_pos + right_pos) / 2.0
-
-        return center, fwhm, peak_value
+        """Measure FWHM directly from a profile — see :func:`fitting.measure_fwhm`."""
+        return fitting.measure_fwhm(profile)
 
     def _measure_d4s(self, profile: np.ndarray) -> tuple[float, float]:
-        """Measure D4σ (ISO 11146 second moment width) directly from profile.
-
-        Uses intensity-weighted second moment without assuming Gaussian distribution.
-
-        Args:
-            profile: 1D intensity profile
-
-        Returns:
-            Tuple of (center, d4sigma_width)
-        """
-        profile = profile - np.min(profile)  # Remove baseline
-        profile = np.maximum(profile, 0)  # Ensure non-negative
-
-        total_intensity = np.sum(profile)
-        if total_intensity == 0:
-            return len(profile) / 2.0, 1.0
-
-        x = np.arange(len(profile))
-
-        # First moment (center)
-        center = np.sum(x * profile) / total_intensity
-
-        # Second moment (variance)
-        variance = np.sum(((x - center) ** 2) * profile) / total_intensity
-        sigma = np.sqrt(variance)
-
-        d4sigma = 4.0 * sigma
-
-        return center, d4sigma
+        """Measure D4σ directly from a profile — see :func:`fitting.measure_d4s`."""
+        return fitting.measure_d4s(profile)
 
     def _fit_1d_gaussian(
         self,
         profile: np.ndarray,
         last_popt: np.ndarray | list[Any] | None = None,
     ) -> np.ndarray | list[Any]:
-        """Fit 1D Gaussian to profile.
+        """Fit a 1D Gaussian — see :func:`fitting.fit_1d_gaussian`."""
+        return fitting.fit_1d_gaussian(profile, last_popt)
 
-        Args:
-            profile: 1D intensity profile
-            last_popt: Previous fit parameters for initial guess
-
-        Returns:
-            Fit parameters ``[amplitude, center, sigma, offset]``.
-        """
-        n = len(profile)
-        if n == 0:
-            return [0, 0, 1, 0]
-
-        if last_popt is not None:
-            p0 = list(last_popt)
-        else:
-            pmax, pmin = np.max(profile), np.min(profile)
-            p0 = [pmax - pmin, float(np.argmax(profile)), n / 10.0, pmin]
-
-        try:
-            x = np.arange(n)
-            popt, _ = curve_fit(
-                BeamProfiler.gaussian,
-                x,
-                profile,
-                p0=p0,
-                maxfev=MAX_FIT_ITERATIONS,
-            )
-        except (RuntimeError, ValueError) as e:
-            logger.debug("1D fit failed: %s, using initial guess", e)
-            popt = np.array(p0)
-
-        return popt
-
-    _MAX_FIT_2D_DIM = 256
+    _MAX_FIT_2D_DIM = MAX_FIT_2D_DIM
 
     def _fit_2d_gaussian(self, image: np.ndarray) -> np.ndarray | list[Any]:
-        """Fit 2D Gaussian to image.
+        """Fit a rotated 2D Gaussian, warm-starting from the previous frame.
 
-        Large images are downsampled to at most :attr:`_MAX_FIT_2D_DIM` pixels
-        on the longest edge before fitting, then coordinates are scaled back to
-        the original resolution.  This keeps 2D fitting real-time even for
-        megapixel sensors.
+        Only converged parameters are cached as the next warm start — a failed
+        fit returns its initial guess but leaves ``_last_popt_2d`` alone, so one
+        bad frame can't poison every frame after it.
 
         Args:
-            image: 2D intensity array
+            image: 2D intensity array.
 
         Returns:
-            Fit parameters ``[amplitude, x0, y0, sigma_x, sigma_y, theta, offset]``
+            ``[amplitude, x0, y0, sigma_x, sigma_y, theta, offset]``.
         """
-        h, w = image.shape
+        popt, converged = fitting.fit_2d_gaussian(
+            image, self._last_popt_2d, max_dim=self._MAX_FIT_2D_DIM
+        )
+        if converged:
+            self._last_popt_2d = popt
+        return popt
 
-        # Downsample for performance — 2D curve_fit on 1M+ pixels is too slow
-        if max(h, w) > self._MAX_FIT_2D_DIM:
-            ds = self._MAX_FIT_2D_DIM / max(h, w)
-            fit_img = _ndimage_zoom(image.astype(float), ds, order=1)
-            inv_ds = 1.0 / ds
-        else:
-            fit_img = image
-            inv_ds = 1.0
+    def beam_ellipse(self) -> tuple[float, float, float, float, float] | None:
+        """Return the fitted 1/e² beam ellipse in pixel coordinates.
 
-        fh, fw = fit_img.shape
+        Returns ``(cx, cy, rx, ry, angle_rad)`` where *rx* / *ry* are the 1/e²
+        semi-axes (2σ).  In ``2d`` mode these come from the rotated 2D fit —
+        using the 1D projection widths there would draw a badly wrong ellipse,
+        since projecting a tilted beam onto the axes smears both widths toward
+        each other.  Otherwise the two independent axis fits are used and the
+        angle is zero.
 
-        if self._last_popt_2d is not None:
-            p0 = list(self._last_popt_2d)
-            # Scale cached params into the downsampled coordinate system
-            if inv_ds != 1.0:
-                p0[1] /= inv_ds  # x0
-                p0[2] /= inv_ds  # y0
-                p0[3] /= inv_ds  # sigma_x
-                p0[4] /= inv_ds  # sigma_y
-        else:
-            pmax, pmin = np.max(fit_img), np.min(fit_img)
-            y0, x0 = np.unravel_index(np.argmax(fit_img), fit_img.shape)
-            p0 = [pmax - pmin, x0, y0, fw / 10.0, fh / 10.0, 0.0, pmin]
-
-        try:
-            x, y = np.arange(fw), np.arange(fh)
-            xv, yv = np.meshgrid(x, y)
-            xy_flat = (xv.ravel(), yv.ravel())
-            data_flat = fit_img.ravel()
-            bounds = (
-                [0, 0, 0, 0.1, 0.1, -np.pi, -np.inf],
-                [np.inf, fw, fh, fw, fh, np.pi, np.inf],
+        Returns:
+            The ellipse parameters, or ``None`` if nothing has been fitted yet.
+        """
+        if self.fit_method == "2d" and self._last_popt_2d is not None:
+            _, x0, y0, sigma_x, sigma_y, theta, _ = self._last_popt_2d
+            return (
+                float(x0),
+                float(y0),
+                2.0 * abs(float(sigma_x)),
+                2.0 * abs(float(sigma_y)),
+                float(theta),
             )
 
-            if self._last_popt_2d is not None:
-                # Warm: try unbounded LM first (~1.8x faster), fall back to bounded
-                try:
-                    popt, _ = curve_fit(
-                        BeamProfiler.gaussian_2d,
-                        xy_flat,
-                        data_flat,
-                        p0=p0,
-                        method="lm",
-                        maxfev=MAX_FIT_ITERATIONS,
-                    )
-                    if abs(popt[3]) < 0.1 or abs(popt[4]) < 0.1 or popt[3] > fw or popt[4] > fh:
-                        raise RuntimeError("LM diverged")
-                except (RuntimeError, ValueError):
-                    popt, _ = curve_fit(
-                        BeamProfiler.gaussian_2d,
-                        xy_flat,
-                        data_flat,
-                        p0=p0,
-                        bounds=bounds,
-                        maxfev=MAX_FIT_ITERATIONS,
-                    )
-            else:
-                popt, _ = curve_fit(
-                    BeamProfiler.gaussian_2d,
-                    xy_flat,
-                    data_flat,
-                    p0=p0,
-                    bounds=bounds,
-                    maxfev=MAX_FIT_ITERATIONS,
-                )
+        popt_x, popt_y = self._last_popt_x, self._last_popt_y
+        if popt_x is None or popt_y is None:
+            return None
+        return (
+            float(popt_x[1]),
+            float(popt_y[1]),
+            2.0 * abs(float(popt_x[2])),
+            2.0 * abs(float(popt_y[2])),
+            0.0,
+        )
 
-            # Scale coordinates back to original resolution
-            if inv_ds != 1.0:
-                popt[1] *= inv_ds  # x0
-                popt[2] *= inv_ds  # y0
-                popt[3] *= inv_ds  # sigma_x
-                popt[4] *= inv_ds  # sigma_y
+    def _fit_projections(
+        self, prof_x: np.ndarray, prof_y: np.ndarray
+    ) -> tuple[np.ndarray | list[Any], np.ndarray | list[Any]]:
+        """Fit both axis profiles, warm-starting from the previous frame."""
+        popt_x = self._fit_1d_gaussian(prof_x, self._last_popt_x)
+        popt_y = self._fit_1d_gaussian(prof_y, self._last_popt_y)
+        self._last_popt_x, self._last_popt_y = popt_x, popt_y
+        return popt_x, popt_y
 
-            self._last_popt_2d = popt
-            return popt
-        except (RuntimeError, ValueError) as e:
-            logger.debug("2D fit failed: %s, using initial guess", e)
-            # Scale p0 back if it was downsampled
-            if inv_ds != 1.0:
-                p0[1] *= inv_ds
-                p0[2] *= inv_ds
-                p0[3] *= inv_ds
-                p0[4] *= inv_ds
-            return p0
+    def _integrate(self, image: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Sum the image down each axis and cache the result for plotting."""
+        self._last_proj_x = np.sum(image, axis=0)
+        self._last_proj_y = np.sum(image, axis=1)
+        return self._last_proj_x, self._last_proj_y
 
-    def analyze(
-        self, image: np.ndarray
-    ) -> tuple[np.ndarray | list[Any] | None, np.ndarray | list[Any] | None]:
-        """Analyze beam image and extract parameters.
+    def analyze(self, image: np.ndarray) -> tuple[np.ndarray | list[Any], np.ndarray | list[Any]]:
+        """Measure the beam in *image* and update every reported parameter.
+
+        Two things decide what happens here, and they are independent:
+
+        * ``definition`` picks how the width is *measured*.  ``fwhm`` and
+          ``d4s`` are read straight off the integrated profile with no model,
+          so they also override ``fit_method`` — a shape-free measurement and
+          a Gaussian fit would disagree, and the definition wins.
+        * ``fit_method`` picks what the Gaussian fit is run against:
+          ``1d`` the integrated profiles, ``2d`` the whole frame (the only
+          mode that recovers a rotation angle), ``linecut`` a single row and
+          column through the brightest pixel.
+
+        Either way the axis fits are returned, because the GUI draws them
+        alongside the data even when they didn't set the reported width.
 
         Args:
-            image: 2D intensity array
+            image: 2D intensity array.
 
         Returns:
-            tuple of (x_fit_params, y_fit_params) for 1D projections
+            ``(x_fit_params, y_fit_params)`` for the two axis profiles.
 
         Raises:
             ValueError: If image is None, empty, or not 2D.
@@ -578,97 +428,60 @@ class BeamProfiler:
         self.peak_value = float(np.max(image))
         self._last_proj_x = None
         self._last_proj_y = None
+        self.angle_deg = 0.0
 
-        # Use direct measurement for FWHM and D4σ (no Gaussian assumption)
-        if self.definition in ["fwhm", "d4s"]:
-            proj_x = np.sum(image, axis=0)
-            proj_y = np.sum(image, axis=1)
-            self._last_proj_x = proj_x
-            self._last_proj_y = proj_y
+        # ── Model-free definitions: measure first, fit only for the plot ──
+        if self.definition in ("fwhm", "d4s"):
+            proj_x, proj_y = self._integrate(image)
 
             if self.definition == "fwhm":
                 center_x, width_x, _ = self._measure_fwhm(proj_x)
                 center_y, width_y, _ = self._measure_fwhm(proj_y)
-            else:  # d4s
+            else:
                 center_x, width_x = self._measure_d4s(proj_x)
                 center_y, width_y = self._measure_d4s(proj_y)
 
-            self.center_x = center_x
-            self.center_y = center_y
+            self.center_x, self.center_y = center_x, center_y
             self.width_x = width_x * self.pixel_size
             self.width_y = width_y * self.pixel_size
-            self.angle_deg = 0.0
+            return self._fit_projections(proj_x, proj_y)
 
-            # Still fit Gaussian for visualization
-            popt_x = self._fit_1d_gaussian(proj_x, self._last_popt_x)
-            popt_y = self._fit_1d_gaussian(proj_y, self._last_popt_y)
-            self._last_popt_x, self._last_popt_y = popt_x, popt_y
-
-            return popt_x, popt_y
-
-        # Gaussian-based fitting for 'gaussian' definition
+        # ── Gaussian definition: the fit sets the width ──
         if self.fit_method == "linecut":
-            peak_y, peak_x = np.unravel_index(np.argmax(image), image.shape)
-            linecut_x = image[peak_y, :]
-            linecut_y = image[:, peak_x]
-
-            # Store linecut positions for visualization
+            peak_y, peak_x = np.unravel_index(int(np.argmax(image)), image.shape)
+            # Remembered so the GUI can draw the crosshair it measured along.
             self._linecut_x = peak_x
             self._linecut_y = peak_y
 
-            popt_x = self._fit_1d_gaussian(linecut_x, self._last_popt_x)
-            popt_y = self._fit_1d_gaussian(linecut_y, self._last_popt_y)
-            self._last_popt_x, self._last_popt_y = popt_x, popt_y
-
+            popt_x, popt_y = self._fit_projections(image[peak_y, :], image[:, peak_x])
             self._update_widths(abs(popt_x[2]), abs(popt_y[2]))
             self.center_x, self.center_y = popt_x[1], popt_y[1]
-            self.angle_deg = 0.0
-
             return popt_x, popt_y
 
-        elif self.fit_method == "2d":
-            popt = self._fit_2d_gaussian(image)
-            _, x0, y0, sigma_x, sigma_y, theta, _ = popt
-
+        if self.fit_method == "2d":
+            _, x0, y0, sigma_x, sigma_y, theta, _ = self._fit_2d_gaussian(image)
             self._update_widths(abs(sigma_x), abs(sigma_y))
             self.center_x, self.center_y = x0, y0
+            # The fit can't tell a beam from the same beam turned 180°, so
+            # wrap into [0, 180) for a stable readout.
             self.angle_deg = np.degrees(theta) % 180
+            # The 2D fit owns the width; these are purely for the profile plots.
+            return self._fit_projections(*self._integrate(image))
 
-            proj_x = np.sum(image, axis=0)
-            proj_y = np.sum(image, axis=1)
-            self._last_proj_x = proj_x
-            self._last_proj_y = proj_y
-            popt_x = self._fit_1d_gaussian(proj_x, self._last_popt_x)
-            popt_y = self._fit_1d_gaussian(proj_y, self._last_popt_y)
-            self._last_popt_x, self._last_popt_y = popt_x, popt_y
-
-            return popt_x, popt_y
-
-        else:
-            proj_x = np.sum(image, axis=0)
-            proj_y = np.sum(image, axis=1)
-            self._last_proj_x = proj_x
-            self._last_proj_y = proj_y
-
-            popt_x = self._fit_1d_gaussian(proj_x, self._last_popt_x)
-            popt_y = self._fit_1d_gaussian(proj_y, self._last_popt_y)
-            self._last_popt_x, self._last_popt_y = popt_x, popt_y
-
-            self._update_widths(abs(popt_x[2]), abs(popt_y[2]))
-            self.center_x, self.center_y = popt_x[1], popt_y[1]
-            self.angle_deg = 0.0
-
-            return popt_x, popt_y
+        popt_x, popt_y = self._fit_projections(*self._integrate(image))
+        self._update_widths(abs(popt_x[2]), abs(popt_y[2]))
+        self.center_x, self.center_y = popt_x[1], popt_y[1]
+        return popt_x, popt_y
 
     def _update_widths(self, sigma_x: float, sigma_y: float) -> None:
-        """Update width parameters from Gaussian sigma values.
+        """Record widths from Gaussian sigmas, in the 1/e² (4σ) convention.
 
-        Only called from Gaussian-based fitting paths (definition='gaussian'),
-        where the reported width is 1/e² = 4*sigma.
+        Only the Gaussian-definition paths call this; the model-free paths
+        assign ``width_x`` / ``width_y`` from their own measurement.
 
         Args:
-            sigma_x: Gaussian sigma in x (pixels)
-            sigma_y: Gaussian sigma in y (pixels)
+            sigma_x: Gaussian sigma in x (pixels).
+            sigma_y: Gaussian sigma in y (pixels).
         """
         self.width_x = D4SIGMA_FACTOR * sigma_x * self.pixel_size
         self.width_y = D4SIGMA_FACTOR * sigma_y * self.pixel_size
@@ -711,23 +524,21 @@ class BeamProfiler:
 
     @staticmethod
     def _downsample_for_display(image: np.ndarray, max_dim: int = MAX_DISPLAY_DIM) -> np.ndarray:
-        """Downsample an image for browser display while preserving visual quality.
+        """Downsample an image for browser display — see :func:`fitting.downsample`."""
+        return fitting.downsample(image, max_dim)
 
-        Uses bilinear interpolation to reduce the largest dimension to *max_dim*.
-        Images already within the limit are returned unchanged (zero-copy).
-
-        Args:
-            image: 2-D intensity array (full camera resolution).
-            max_dim: Maximum pixels on the longest edge.
-
-        Returns:
-            Downsampled copy, or the original array if no reduction is needed.
-        """
-        h, w = image.shape
-        if max(h, w) <= max_dim:
-            return image
-        scale = max_dim / max(h, w)
-        return _ndimage_zoom(image, scale, order=1)
+    def _ellipse_points(self) -> tuple[np.ndarray, np.ndarray] | None:
+        """Sample the fitted 1/e² ellipse, in μm, ready to hand to Plotly."""
+        ellipse = self.beam_ellipse()
+        if ellipse is None:
+            return None
+        cx, cy, rx, ry, angle = ellipse
+        t = np.linspace(0, 2 * np.pi, 100)
+        cos_a, sin_a = np.cos(angle), np.sin(angle)
+        cos_t, sin_t = np.cos(t), np.sin(t)
+        xe = cx + rx * cos_t * cos_a - ry * sin_t * sin_a
+        ye = cy + rx * cos_t * sin_a + ry * sin_t * cos_a
+        return xe * self.pixel_size, ye * self.pixel_size
 
     def _camera_info_html(self) -> str:
         """Build an HTML snippet summarising the camera and current settings."""
@@ -836,29 +647,12 @@ class BeamProfiler:
                 )
             )
 
-        if popt_x is not None and popt_y is not None:
-            cx, cy = popt_x[1], popt_y[1]
-            rx, ry = 2 * abs(popt_x[2]), 2 * abs(popt_y[2])
-            theta_vals = np.linspace(0, 2 * np.pi, 100)
-
-            if self.fit_method == "2d" and hasattr(self, "angle_deg"):
-                angle_rad = np.radians(self.angle_deg)
-                cos_a, sin_a = np.cos(angle_rad), np.sin(angle_rad)
-                cos_t, sin_t = np.cos(theta_vals), np.sin(theta_vals)
-                x_ellipse = cx + rx * cos_t * cos_a - ry * sin_t * sin_a
-                y_ellipse = cy + rx * cos_t * sin_a + ry * sin_t * cos_a
-            else:
-                x_ellipse = cx + rx * np.cos(theta_vals)
-                y_ellipse = cy + ry * np.sin(theta_vals)
-
-            # Convert ellipse to physical dimensions
-            x_ellipse_um = x_ellipse * self.pixel_size
-            y_ellipse_um = y_ellipse * self.pixel_size
-
+        ellipse = self._ellipse_points()
+        if ellipse is not None:
             fig.add_trace(
                 go.Scatter(
-                    x=x_ellipse_um,
-                    y=y_ellipse_um,
+                    x=ellipse[0],
+                    y=ellipse[1],
                     mode="lines",
                     line=dict(color="red", width=2, dash="dash"),
                     name=f"{self.definition} Width",
@@ -1001,29 +795,12 @@ class BeamProfiler:
                 col=1,
             )
 
-        if popt_x is not None and popt_y is not None:
-            cx, cy = popt_x[1], popt_y[1]
-            rx, ry = 2 * abs(popt_x[2]), 2 * abs(popt_y[2])
-            theta_vals = np.linspace(0, 2 * np.pi, 100)
-
-            if self.fit_method == "2d" and hasattr(self, "angle_deg"):
-                angle_rad = np.radians(self.angle_deg)
-                cos_a, sin_a = np.cos(angle_rad), np.sin(angle_rad)
-                cos_t, sin_t = np.cos(theta_vals), np.sin(theta_vals)
-                x_ellipse = cx + rx * cos_t * cos_a - ry * sin_t * sin_a
-                y_ellipse = cy + rx * cos_t * sin_a + ry * sin_t * cos_a
-            else:
-                x_ellipse = cx + rx * np.cos(theta_vals)
-                y_ellipse = cy + ry * np.sin(theta_vals)
-
-            # Convert ellipse to physical dimensions
-            x_ellipse_um = x_ellipse * self.pixel_size
-            y_ellipse_um = y_ellipse * self.pixel_size
-
+        ellipse = self._ellipse_points()
+        if ellipse is not None:
             fig.add_trace(
                 go.Scatter(
-                    x=x_ellipse_um,
-                    y=y_ellipse_um,
+                    x=ellipse[0],
+                    y=ellipse[1],
                     mode="lines",
                     line=dict(color="#FF4444", width=3, dash="dash"),
                     name=f"{self.definition} Width",
@@ -1036,7 +813,8 @@ class BeamProfiler:
         # X Profile (Integrated) - Above beam image
         x = np.arange(len(image[0]))
         x_um = x * self.pixel_size  # Convert to physical dimensions
-        proj_x = np.sum(image, axis=0)
+        # analyze() already summed these for every mode except linecut.
+        proj_x = self._last_proj_x if self._last_proj_x is not None else np.sum(image, axis=0)
 
         fig.add_trace(
             go.Scatter(
@@ -1066,7 +844,7 @@ class BeamProfiler:
         # Y Profile (Integrated) - Right of beam image, rotated
         y = np.arange(len(image))
         y_um = y * self.pixel_size  # Convert to physical dimensions
-        proj_y = np.sum(image, axis=1)
+        proj_y = self._last_proj_y if self._last_proj_y is not None else np.sum(image, axis=1)
 
         fig.add_trace(
             go.Scatter(
@@ -1448,14 +1226,24 @@ class BeamProfiler:
                         pass
                 raise KeyboardInterrupt
 
-            prev_handler = signal.getsignal(signal.SIGINT)
-            signal.signal(signal.SIGINT, _sigint_handler)
+            # Signal handlers can only be installed from the main thread; when
+            # plot() is driven from a worker thread we just skip the tidy
+            # shutdown rather than failing outright.
+            prev_handler: Any = None
+            try:
+                prev_handler = signal.getsignal(signal.SIGINT)
+                signal.signal(signal.SIGINT, _sigint_handler)
+            except ValueError:
+                logger.debug("Not on the main thread; skipping SIGINT handler")
+                prev_handler = None
+
             try:
                 app.run(debug=False, port=DEFAULT_DASH_PORT, use_reloader=False)
             except KeyboardInterrupt:
                 logger.info("\nStopping Dash server...")
             finally:
-                signal.signal(signal.SIGINT, prev_handler)
+                if prev_handler is not None:
+                    signal.signal(signal.SIGINT, prev_handler)
 
 
 def main() -> None:
@@ -1471,8 +1259,8 @@ def main() -> None:
         # FLIR camera, single shot
         pybeamprofiler --camera flir --num-img 1
 
-        # Static image file
-        pybeamprofiler --file beam.png
+        # Static image file (pixel size is required — it isn't in the file)
+        pybeamprofiler --file beam.png --pixel-size 5.86
 
         # Basler camera with 2D fitting and FWHM definition
         pybeamprofiler --camera basler --fit 2d --definition fwhm
@@ -1494,6 +1282,16 @@ def main() -> None:
         type=str,
         default=None,
         help="Path to static image file (overrides --camera)",
+    )
+    parser.add_argument(
+        "--pixel-size",
+        type=float,
+        default=None,
+        help=(
+            "Sensor pixel pitch in micrometers. Required with --file, since an "
+            "image on disk carries no scale. Optional with a camera, where it "
+            "overrides the pitch the camera reports."
+        ),
     )
     parser.add_argument(
         "--fit",
@@ -1542,6 +1340,11 @@ def main() -> None:
     else:
         logging.basicConfig(level=logging.WARNING)
 
+    if args.file and args.pixel_size is None:
+        parser.error("--pixel-size is required with --file (e.g. --pixel-size 5.86)")
+    if args.pixel_size is not None and args.pixel_size <= 0:
+        parser.error("--pixel-size must be greater than zero")
+
     logger.info("Initializing pyBeamprofiler...")
     logger.info(f"   Camera: {args.file if args.file else args.camera}")
     logger.info(f"   Fitting: {args.fit} ({args.definition})")
@@ -1552,6 +1355,7 @@ def main() -> None:
         fit=args.fit,
         definition=args.definition,
         exposure_time=args.exposure_time,
+        pixel_size=args.pixel_size,
     )
 
     logger.info(f"   Sensor: {bp.width_pixels}×{bp.height_pixels} pixels")
