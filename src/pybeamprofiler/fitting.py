@@ -305,7 +305,12 @@ def fit_2d_gaussian(
                     method="lm",
                     maxfev=MAX_FIT_ITERATIONS,
                 )
-                if abs(popt[3]) < 0.1 or abs(popt[4]) < 0.1 or popt[3] > fw or popt[4] > fh:
+                if (
+                    abs(popt[3]) < 0.1
+                    or abs(popt[4]) < 0.1
+                    or abs(popt[3]) > fw
+                    or abs(popt[4]) > fh
+                ):
                     raise RuntimeError("LM diverged")
             except _FIT_ERRORS:
                 popt, _ = curve_fit(
