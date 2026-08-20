@@ -545,8 +545,12 @@ class HarvesterCamera(Camera):
     def set_exposure(self, exposure_time: float) -> None:
         """Set exposure time, restarting acquisition to flush stale buffers.
 
+        Without the stop/start the producer's buffer ring still holds frames
+        captured at the old exposure, so the display would show a couple of
+        wrongly-exposed frames after every change.
+
         Args:
-            exposure_time: Exposure time in seconds
+            exposure_time: Exposure time in seconds.
         """
         was_acquiring = self.is_acquiring
         if was_acquiring:
@@ -566,10 +570,11 @@ class HarvesterCamera(Camera):
             self.start_acquisition()
 
     def set_gain(self, gain: float) -> None:
-        """Set camera gain.
+        """Set camera gain, falling back to the legacy ``GainRaw`` feature.
 
         Args:
-            gain: Gain value
+            gain: Gain in the camera's own units — dB on most SFNC-compliant
+                devices, raw ADC steps on older ones.
         """
         if self.node_map:
             try:
@@ -583,20 +588,12 @@ class HarvesterCamera(Camera):
 
     @property
     def exposure_range(self) -> tuple[float, float]:
-        """Get exposure time range in seconds.
-
-        Returns:
-            Tuple of (min_exposure, max_exposure) in seconds
-        """
+        """Supported exposure time as ``(min, max)`` in seconds."""
         return (self._exposure_min, self._exposure_max)
 
     @property
     def gain_range(self) -> tuple[float, float]:
-        """Get gain range.
-
-        Returns:
-            Tuple of (min_gain, max_gain)
-        """
+        """Supported gain as ``(min, max)`` in the camera's own units."""
         return (self._gain_min, self._gain_max)
 
     def set_roi(
@@ -606,13 +603,18 @@ class HarvesterCamera(Camera):
         width: int | None = None,
         height: int | None = None,
     ) -> None:
-        """Set Region of Interest (ROI).
+        """Set the Region of Interest, clamping to what the sensor allows.
+
+        Out-of-range values are clamped rather than rejected, so a too-large
+        width simply yields the biggest ROI that fits at the given offset.
+        Cameras usually also quantise these to a granularity of their own
+        (often 4 or 8 px), so read :attr:`roi_info` back for the real values.
 
         Args:
-            offset_x: X offset in pixels (default: 0)
-            offset_y: Y offset in pixels (default: 0)
-            width: ROI width in pixels (default: full width)
-            height: ROI height in pixels (default: full height)
+            offset_x: X offset in pixels.
+            offset_y: Y offset in pixels.
+            width: ROI width in pixels (``None`` for full width).
+            height: ROI height in pixels (``None`` for full height).
         """
         if not self.node_map:
             logger.warning("Camera not opened, cannot set ROI")

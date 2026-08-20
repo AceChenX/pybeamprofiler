@@ -8,7 +8,7 @@ from .flir import FlirCamera
 from .simulated import SimulatedCamera
 from .utils import find_cti_files, list_cameras, print_camera_info
 
-__version__ = "0.2.1"
+__version__ = "0.3.0"
 
 __all__ = [
     "Camera",

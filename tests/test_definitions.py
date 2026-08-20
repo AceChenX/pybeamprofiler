@@ -399,8 +399,8 @@ class TestPropertiesWithDefinitions:
         assert bp.fwhm_y == pytest.approx(bp.width_y, rel=1e-10)
         # 1/e² width should be larger than FWHM
         assert bp.fw_1e2_x > bp.width_x
-        # Ordering still holds: 1/e < FWHM < 1/e²
-        assert bp.fw_1e_x < bp.fwhm_x < bp.fw_1e2_x
+        # Ordering still holds: FWHM < 1/e < 1/e²
+        assert bp.fwhm_x < bp.fw_1e_x < bp.fw_1e2_x
 
         bp.camera.close()
 

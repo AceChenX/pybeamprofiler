@@ -58,13 +58,18 @@ export GENICAM_GENTL64_PATH=/path/to/cti/files
 ### Command line
 
 ```bash
-pybeamprofiler --camera simulated      # simulated camera
-pybeamprofiler --camera flir           # FLIR / Spinnaker
-pybeamprofiler --camera basler         # Basler / Pylon
-pybeamprofiler --file beam.png         # static image
+pybeamprofiler --camera simulated               # simulated camera
+pybeamprofiler --camera flir                    # FLIR / Spinnaker
+pybeamprofiler --camera basler                  # Basler / Pylon
+pybeamprofiler --file beam.png --pixel-size 5.86  # static image
 pybeamprofiler --fit 2d --definition fwhm
-pybeamprofiler --help                  # all options
+pybeamprofiler --help                           # all options
 ```
+
+`--pixel-size` is required with `--file`: an image on disk carries no scale, so
+without it every width would be in pixels pretending to be micrometers. Cameras
+report their own pitch, but you can still pass `--pixel-size` to override it
+(useful with binning, or when the camera reports nothing).
 
 Press **Ctrl+C** in the terminal to stop streaming and exit.
 
@@ -90,6 +95,26 @@ bp.setting()
 ```
 
 See [the API docs](https://github.com/acechenx/pybeamprofiler) for fitting methods (`1d`, `2d`, `linecut`), width definitions (`gaussian`, `fwhm`, `d4s`), ROI control, and more.
+
+### Width definitions
+
+`width_x` / `width_y` are reported in whichever definition you select, and the
+derived properties convert between them from the fitted Gaussian sigma:
+
+| Property | Threshold | Multiple of σ |
+|----------|-----------|---------------|
+| `fwhm_x` / `fwhm_y` | 1/2 | 2·√(2·ln2) ≈ 2.3548 |
+| `fw_1e_x` / `fw_1e_y` | 1/e | 2·√2 ≈ 2.8284 |
+| `fw_1e2_x` / `fw_1e2_y` | 1/e² | 4 |
+
+A lower threshold is crossed further out on the flanks, so the widths always
+order as FWHM < FW@1/e < FW@1/e². `d4s` is the ISO 11146 second-moment width,
+which equals 4σ for a Gaussian but — unlike a fit — stays meaningful for
+flat-top and multi-lobed beams.
+
+Choosing `fwhm` or `d4s` measures directly off the integrated profile with no
+model, so it takes precedence over `fit`; the Gaussian fit still runs, but only
+to draw the overlay.
 
 ## Troubleshooting
 
@@ -127,18 +152,17 @@ uv run pytest --cov-report=html        # HTML coverage report
 uv run pytest tests/test_profiler.py   # single file
 ```
 
-Current suite: **588 tests, 97% coverage**.
-
 ### Architecture
 
-- `beamprofiler.py` — `BeamProfiler` class, fitting algorithms, CLI entry point
+- `fitting.py` — Gaussian models, direct width measurements, curve fits, decimation (pure functions over arrays; no camera or plotting state)
+- `beamprofiler.py` — `BeamProfiler` class, figure building, streaming, CLI entry point
 - `camera.py` — abstract `Camera` base class + Jupyter widget builder
 - `gen_camera.py` — `HarvesterCamera` for GenICam devices
 - `flir.py` / `basler.py` — vendor-specific subclasses
 - `simulated.py` — `SimulatedCamera` (no hardware)
 - `dash_app.py` — browser GUI with live updates, settings panel, pattern-matching callbacks
 - `utils.py` — camera discovery helpers
-- `constants.py` — shared constants
+- `constants.py` — shared constants and conversion factors
 
 ### Contributing
 
@@ -149,8 +173,11 @@ Current suite: **588 tests, 97% coverage**.
 
 ### Performance notes
 
-- 2D fits use adaptive downsampling + Levenberg-Marquardt warm starts
+- 2D fits downsample to 256 px on the longest edge and warm-start Levenberg-Marquardt from the previous frame; a failed fit is retried from a fresh estimate rather than left stuck on stale parameters
+- Display decimation is nearest-neighbour fancy indexing (~4× faster than interpolated zoom at 1024 px, and it shows real sensor counts rather than blended ones)
 - Projection profiles are cached between `analyze()` and figure rendering
+- GenICam feature discovery is memoised per node map — the `.value` probe it relies on is a register read per node, which costs hundreds of round trips on a GigE camera
+- The saturation check short-circuits on a `max()` reduction, so a clean frame skips the full-frame comparison
 - In the current Dash implementation, live updates perform `bp.camera.get_image(timeout=0.1)` and `bp.analyze(img)` synchronously while holding a `threading.Lock` to reduce segfault risk in the Harvesters C library
 
 ### Supported sensors

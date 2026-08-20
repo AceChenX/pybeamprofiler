@@ -228,6 +228,19 @@ class SimulatedCamera(Camera):
         self.image_buffer = image
         return image
 
+    def _refresh_amplitude(self) -> None:
+        """Recompute peak signal from the current exposure *and* gain.
+
+        Both scale the signal on a real sensor, so both have to be folded in
+        together — deriving the amplitude from only the setting that changed
+        last would quietly undo the other one.
+        """
+        self._amplitude = (
+            SIMULATED_AMPLITUDE
+            * (self.exposure_time / DEFAULT_EXPOSURE_TIME)
+            * (1 + self.gain / 10)
+        )
+
     def set_exposure(self, exposure_time: float | None) -> None:  # type: ignore[override]
         """Set exposure time and adjust simulated signal amplitude.
 
@@ -237,14 +250,14 @@ class SimulatedCamera(Camera):
         if exposure_time is None:
             exposure_time = DEFAULT_EXPOSURE_TIME
         self.exposure_time = exposure_time
-        self._amplitude = SIMULATED_AMPLITUDE * (exposure_time / DEFAULT_EXPOSURE_TIME)
+        self._refresh_amplitude()
         if self.node_map is not None:
             self.node_map.ExposureTime._value = exposure_time * 1_000_000
 
     def set_gain(self, gain: float) -> None:
         """Set gain and adjust simulated signal amplitude."""
         self.gain = gain
-        self._amplitude = SIMULATED_AMPLITUDE * (1 + gain / 10)
+        self._refresh_amplitude()
         if self.node_map is not None:
             self.node_map.Gain._value = gain
 
@@ -272,6 +285,10 @@ class SimulatedCamera(Camera):
 
         self.width = self._roi_width
         self.height = self._roi_height
+        # Keep the ``*_pixels`` aliases in step — the Dash Camera Info panel
+        # reads those first and would otherwise keep showing the full sensor.
+        self.width_pixels = self._roi_width
+        self.height_pixels = self._roi_height
 
         if self.node_map is not None:
             self.node_map.OffsetX._value = self._roi_offset_x

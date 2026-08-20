@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "pybeamprofiler"
-version = "0.2.1"
+version = "0.3.0"
 description = "Real-time laser beam profiler with Gaussian fitting for GenICam cameras"
 readme = "README.md"
 authors = [

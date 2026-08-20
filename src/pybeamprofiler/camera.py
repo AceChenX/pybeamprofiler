@@ -82,13 +82,20 @@ _CATEGORY_MAP: dict[str, str] = {
 }
 
 
+# Longest prefix first, so "GainAuto" lands in Analog Control via "Gain"
+# rather than matching some shorter, more generic prefix. Sorted once here
+# instead of on every _categorize_feature() call.
+_CATEGORY_PREFIXES: tuple[str, ...] = tuple(sorted(_CATEGORY_MAP, key=str.__len__, reverse=True))
+
+_LEADING_WORD_RE = re.compile(r"([A-Z][a-z]+)")
+
+
 def _categorize_feature(name: str) -> str:
     """Infer a UI group name from a GenICam feature name."""
-    prefixes = cast("list[str]", sorted(_CATEGORY_MAP.keys(), key=len, reverse=True))
-    for prefix in prefixes:
+    for prefix in _CATEGORY_PREFIXES:
         if name.startswith(prefix):
             return _CATEGORY_MAP[prefix]
-    match = re.match(r"([A-Z][a-z]+)", name)
+    match = _LEADING_WORD_RE.match(name)
     if match:
         return match.group(1)
     return "Other"
@@ -118,6 +125,12 @@ class Camera(ABC):
         self.height: int = 0
         self.pixel_size: float = 1.0
         self.image_buffer: np.ndarray | None = None
+        # Memoised _discover_features() result plus the node map it was built
+        # from (see that method for why). Keeping the object itself — rather
+        # than its id() — means a replaced node map can never be mistaken for
+        # the cached one via address reuse.
+        self._feature_cache: dict[str, list[str]] | None = None
+        self._feature_cache_source: Any = None
 
     @abstractmethod
     def open(self) -> None:
@@ -276,7 +289,6 @@ class Camera(ABC):
         analog_accordion.set_title(0, "Gain")
 
         genicam_controls = self._create_genicam_controls(style)
-        advanced_controls = self._create_advanced_controls(style)
 
         camera_info: list[Any] = []
         camera_info.append(widgets.HTML(f"<b>Camera Type:</b> {type(self).__name__}"))
@@ -385,24 +397,13 @@ class Camera(ABC):
         info_accordion.set_title(0, "Camera Information")
 
         tab = widgets.Tab()
-        tab_children = [
-            widgets.VBox(settings_children),
-            info_accordion,
-        ]
-
-        if advanced_controls:
-            advanced_tab = widgets.VBox(advanced_controls)
-            tab_children.append(advanced_tab)
-
-        tab.children = tab_children
+        tab.children = [widgets.VBox(settings_children), info_accordion]
         tab.set_title(0, "Camera Settings")
         tab.set_title(1, "Info")
-        if advanced_controls:
-            tab.set_title(2, "Advanced")
 
         display(tab)
 
-    def _discover_features(self) -> dict[str, list[str]]:
+    def _discover_features(self, *, refresh: bool = False) -> dict[str, list[str]]:
         """Discover available GenICam features from the ``node_map``.
 
         Uses ``node_map.nodes`` (the canonical GenICam enumeration API)
@@ -410,11 +411,29 @@ class Camera(ABC):
         Nodes are filtered by interface type and visibility so that only
         user-facing value nodes are returned.
 
+        The result is memoised, because the ``.value`` probe below is a real
+        register read on real hardware: a full sweep of a GigE camera's node
+        map costs hundreds of round trips and can take seconds.  Which
+        features *exist* is fixed for a given node map (only their values
+        change), so the cache is keyed on the node map's identity and
+        naturally re-discovers after a reconnect.
+
+        Args:
+            refresh: Rebuild the cache even if one is already populated.
+
         Returns:
             Mapping from category name to a sorted list of feature names.
+            Treat it as read-only; it is the cached object.
         """
         if not hasattr(self, "node_map") or not self.node_map:
             return {}
+
+        if (
+            not refresh
+            and self._feature_cache is not None
+            and self._feature_cache_source is self.node_map
+        ):
+            return self._feature_cache
 
         # ── GenICam helpers ───────────────────────────────────────────
         # Allowlist: only these interface types represent user-settable
@@ -517,21 +536,20 @@ class Camera(ABC):
             "_discover_features: %d features in %d categories: %s",
             sum(len(v) for v in groups.values()),
             len(groups),
-            {k: v for k, v in groups.items()},
+            groups,
         )
+        self._feature_cache = groups
+        self._feature_cache_source = self.node_map
         return groups
 
     def _create_genicam_controls(self, style: dict[str, str]) -> list[Any]:
-        """Create dynamic controls for all discovered GenICam features.
-
-        Uses :meth:`_discover_features` to introspect the ``node_map``
-        and automatically generate widgets for every available feature.
+        """Build one accordion per feature category from the ``node_map``.
 
         Args:
-            style: Widget style dict (e.g. ``{"description_width": "initial"}``)
+            style: Widget style dict (e.g. ``{"description_width": "initial"}``).
 
         Returns:
-            List of accordion widgets grouped by feature category
+            Accordion widgets, grouped and ordered by category.
         """
         import ipywidgets as widgets
 
@@ -552,78 +570,59 @@ class Camera(ABC):
 
         return accordions
 
-    def _create_advanced_controls(self, style: dict[str, str]) -> list[Any]:
-        """Create advanced/rarely-used controls from GenICam ``node_map``.
-
-        All features are now auto-discovered by
-        :meth:`_create_genicam_controls`, so this method returns an empty
-        list.  It is retained for backward compatibility.
-
-        Args:
-            style: Widget style dict
-
-        Returns:
-            Empty list
-        """
-        return []
-
     def _create_feature_controls(self, features: list[str], style: dict[str, str]) -> list[Any]:
-        """Create widgets for a list of GenICam features.
+        """Create a widget per feature, picking the shape from the node itself.
+
+        A node with ``min``/``max`` becomes a slider, one with ``symbolics`` a
+        dropdown, a boolean a checkbox.  Anything that can't be rendered is
+        skipped rather than reported — cameras expose plenty of features that
+        exist in the node map but error out the moment you touch them.
 
         Args:
-            features: Feature names to look up in the ``node_map``
-            style: Widget style dict
+            features: Feature names to look up in the ``node_map``.
+            style: Widget style dict.
 
         Returns:
-            List of widget controls
+            The widgets that could be built, in the order given.
         """
         controls = []
 
         for feature_name in features:
-            if not hasattr(self.node_map, feature_name):  # ty:ignore[unresolved-attribute]
-                continue
-
+            # Everything here stays inside the guard: getattr and hasattr only
+            # swallow AttributeError, and a camera node that has lost its
+            # connection tends to raise something else entirely.
             try:
-                node = getattr(self.node_map, feature_name)  # ty:ignore[unresolved-attribute]
-
-                if not hasattr(node, "value"):
+                node = getattr(self.node_map, feature_name, None)  # ty:ignore[unresolved-attribute]
+                if node is None or not hasattr(node, "value"):
                     continue
-
-                if feature_name.endswith("Enable") or feature_name.endswith("Auto"):
-                    try:
-                        current_val = node.value
-                        # Handle both boolean and string values
-                        if isinstance(current_val, str):
-                            dropdown = self._create_enum_dropdown(node, feature_name, style)
-                            if dropdown:
-                                controls.append(dropdown)
-                        else:
-                            checkbox = self._create_checkbox(node, feature_name, current_val)
-                            if checkbox:
-                                controls.append(checkbox)
-                    except Exception as e:
-                        logger.debug(f"Could not create checkbox for {feature_name}: {e}")
-
-                elif hasattr(node, "min") and hasattr(node, "max"):
-                    try:
-                        slider_box = self._create_slider(node, feature_name, style)
-                        if slider_box:
-                            controls.append(slider_box)
-                    except Exception as e:
-                        logger.debug(f"Could not create slider for {feature_name}: {e}")
-
-                else:
-                    try:
-                        dropdown = self._create_enum_dropdown(node, feature_name, style)
-                        if dropdown:
-                            controls.append(dropdown)
-                    except Exception as e:
-                        logger.debug(f"Could not create dropdown for {feature_name}: {e}")
-
-            except Exception:
-                pass
+                control = self._build_feature_control(node, feature_name, style)
+            except Exception as e:
+                logger.debug("Could not create a control for %s: %s", feature_name, e)
+                continue
+            if control is not None:
+                controls.append(control)
 
         return controls
+
+    def _build_feature_control(self, node: Any, feature_name: str, style: dict[str, str]) -> Any:
+        """Choose and build the widget that fits this node's shape."""
+        if feature_name.endswith(("Enable", "Auto")):
+            # These are boolean on some cameras and enumerated on others.
+            current_val = node.value
+            if isinstance(current_val, str):
+                return self._create_enum_dropdown(node, feature_name, style)
+            return self._create_checkbox(node, feature_name, current_val)
+
+        # Enumerations come before the numeric branch: a node that lists
+        # ``symbolics`` is an enum even if it also carries min/max, and handing
+        # it to the slider builder makes the control vanish from the panel.
+        if getattr(node, "symbolics", None):
+            return self._create_enum_dropdown(node, feature_name, style)
+
+        if hasattr(node, "min") and hasattr(node, "max"):
+            return self._create_slider(node, feature_name, style)
+
+        return self._create_enum_dropdown(node, feature_name, style)
 
     def _create_checkbox(self, node: Any, feature_name: str, current_val: bool) -> Any:
         """Create checkbox widget for a boolean GenICam feature."""
