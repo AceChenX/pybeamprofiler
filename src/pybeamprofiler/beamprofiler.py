@@ -350,7 +350,7 @@ class BeamProfiler:
         Returns:
             The ellipse parameters, or ``None`` if nothing has been fitted yet.
         """
-if self.definition == "gaussian" and self.fit_method == "2d" and self._last_popt_2d is not None:
+        if self.fit_method == "2d" and self._last_popt_2d is not None:
             _, x0, y0, sigma_x, sigma_y, theta, _ = self._last_popt_2d
             return (
                 float(x0),
