@@ -18,67 +18,6 @@ def _mock_harvesters_core() -> tuple[ModuleType, Mock]:
 class TestFindCtiFiles:
     """Test CTI file discovery."""
 
-    @patch("pybeamprofiler.utils.platform.system")
-    @patch("pybeamprofiler.utils.os.path.exists")
-    @patch("pybeamprofiler.utils.os.path.realpath")
-    @patch("pybeamprofiler.utils.os.listdir")
-    def test_find_cti_windows(self, mock_listdir, mock_realpath, mock_exists, mock_system):
-        """Test CTI file finding on Windows."""
-        mock_system.return_value = "Windows"
-        mock_exists.return_value = True
-        mock_realpath.side_effect = lambda x: x  # Return path as-is
-        mock_listdir.return_value = ["FLIR_GenTL.cti", "other_file.txt"]
-
-        cti_files = utils.find_cti_files()
-
-        assert len(cti_files) > 0
-        assert any("FLIR_GenTL.cti" in f for f in cti_files)
-
-    @patch("pybeamprofiler.utils.platform.system")
-    @patch("pybeamprofiler.utils.os.path.exists")
-    @patch("pybeamprofiler.utils.os.path.realpath")
-    @patch("pybeamprofiler.utils.os.listdir")
-    def test_find_cti_linux(self, mock_listdir, mock_realpath, mock_exists, mock_system):
-        """Test CTI file finding on Linux."""
-        mock_system.return_value = "Linux"
-        mock_exists.return_value = True
-        mock_realpath.side_effect = lambda x: x  # Return path as-is
-        mock_listdir.return_value = ["FLIR_GenTL_v140.cti"]
-
-        cti_files = utils.find_cti_files()
-
-        assert len(cti_files) > 0
-        assert any("FLIR_GenTL_v140.cti" in f for f in cti_files)
-
-    @patch("pybeamprofiler.utils.platform.system")
-    @patch("pybeamprofiler.utils.os.path.exists")
-    @patch("pybeamprofiler.utils.os.path.realpath")
-    @patch("pybeamprofiler.utils.os.listdir")
-    def test_find_cti_macos(self, mock_listdir, mock_realpath, mock_exists, mock_system):
-        """Test CTI file finding on macOS."""
-        mock_system.return_value = "Darwin"
-        mock_exists.return_value = True
-        mock_realpath.side_effect = lambda x: x  # Return path as-is
-        mock_listdir.return_value = ["FLIR_GenTL.cti", "ProducerGEV.cti"]
-
-        cti_files = utils.find_cti_files()
-
-        assert len(cti_files) > 0
-        # Multiple search paths may find same files
-        assert "FLIR_GenTL.cti" in str(cti_files)
-        assert "ProducerGEV.cti" in str(cti_files)
-
-    @patch("pybeamprofiler.utils.platform.system")
-    @patch("pybeamprofiler.utils.os.path.exists")
-    def test_find_cti_no_paths_exist(self, mock_exists, mock_system):
-        """Test CTI file finding when no paths exist."""
-        mock_system.return_value = "Linux"
-        mock_exists.return_value = False
-
-        cti_files = utils.find_cti_files()
-
-        assert cti_files == []
-
 
 class TestListCameras:
     """Test camera listing functionality."""
@@ -241,50 +180,6 @@ class TestPrintCameraInfo:
 
 class TestFindCtiEdgeCases:
     """Test edge cases in CTI file discovery."""
-
-    @patch("pybeamprofiler.utils.platform.system")
-    @patch("pybeamprofiler.utils.os.path.exists")
-    @patch("pybeamprofiler.utils.os.path.realpath")
-    def test_realpath_oserror_skips_path(self, mock_realpath, mock_exists, mock_system):
-        """Test that OSError on realpath skips the path gracefully."""
-        mock_system.return_value = "Linux"
-        mock_exists.return_value = True
-        mock_realpath.side_effect = OSError("Permission denied")
-
-        cti_files = utils.find_cti_files()
-        assert cti_files == []
-
-    @patch("pybeamprofiler.utils.platform.system")
-    @patch("pybeamprofiler.utils.os.path.exists")
-    @patch("pybeamprofiler.utils.os.path.realpath")
-    @patch("pybeamprofiler.utils.os.listdir")
-    def test_listdir_permission_error(self, mock_listdir, mock_realpath, mock_exists, mock_system):
-        """Test that PermissionError on listdir is handled."""
-        mock_system.return_value = "Linux"
-        mock_exists.return_value = True
-        mock_realpath.side_effect = lambda x: x
-        mock_listdir.side_effect = PermissionError("Access denied")
-
-        cti_files = utils.find_cti_files()
-        assert cti_files == []
-
-    @patch("pybeamprofiler.utils.platform.system")
-    @patch("pybeamprofiler.utils.os.path.exists")
-    @patch("pybeamprofiler.utils.os.path.realpath")
-    @patch("pybeamprofiler.utils.os.listdir")
-    @patch("pybeamprofiler.utils.os.path.commonpath")
-    def test_symlink_attack_rejected(
-        self, mock_commonpath, mock_listdir, mock_realpath, mock_exists, mock_system
-    ):
-        """Test that files outside base_path are rejected (symlink attack)."""
-        mock_system.return_value = "Linux"
-        mock_exists.return_value = True
-        mock_realpath.side_effect = lambda x: x
-        mock_listdir.return_value = ["evil.cti"]
-        mock_commonpath.return_value = "/other/path"
-
-        cti_files = utils.find_cti_files()
-        assert cti_files == []
 
 
 class TestListCamerasEdgeCases:

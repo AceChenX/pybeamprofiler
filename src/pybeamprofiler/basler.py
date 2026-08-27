@@ -2,12 +2,14 @@
 
 import logging
 import os
-import platform
 
+from .cti import PYLON, cti_files_for
 from .gen_camera import HarvesterCamera
 
 logger = logging.getLogger(__name__)
 
+# The producers Pylon ships today. Kept for reference and for callers that
+# want to name one explicitly; discovery scans directories instead.
 PYLON_PRODUCERS = ("ProducerGEV.cti", "ProducerU3V.cti")
 
 
@@ -55,54 +57,15 @@ class BaslerCamera(HarvesterCamera):
 
     @staticmethod
     def _find_basler_cti() -> list[str] | None:
-        """Search for Basler Pylon CTI files in platform-specific SDK installation paths.
+        """Return every Pylon GenTL producer found, if any.
 
-        Basler cameras require multiple CTI producers for different interfaces
-        (GigE, USB3). This method finds all available producers.
+        Basler splits its producers by transport layer (``ProducerGEV.cti``
+        for GigE, ``ProducerU3V.cti`` for USB3) and which one a given camera
+        speaks isn't known until it is opened, so all of them are loaded.
+        Discovery scans the whole directory rather than matching a fixed name
+        list, so a future SDK that adds a producer works without a code change.
 
         Returns:
-            List of CTI file paths if found, None otherwise
+            List of ``.cti`` paths, or ``None`` when Pylon isn't installed.
         """
-        system = platform.system()
-
-        if system == "Windows":
-            for version in ["7", "6", "5"]:
-                base = rf"C:\Program Files\Basler\pylon {version}\Runtime\x64"
-                if os.path.isdir(base):
-                    found = []
-                    for producer in PYLON_PRODUCERS:
-                        path = os.path.join(base, producer)
-                        if os.path.exists(path):
-                            found.append(path)
-
-                    if found:
-                        return found
-
-        elif system == "Linux":
-            # Check standard pylon (symlink to latest)
-            bases = [
-                "/opt/pylon/lib/gentlproducer/gtl",
-                "/opt/pylon5/lib/gentlproducer/gtl",
-            ]
-            for base in bases:
-                if os.path.isdir(base):
-                    found = []
-                    for producer in PYLON_PRODUCERS:
-                        path = os.path.join(base, producer)
-                        if os.path.exists(path):
-                            found.append(path)
-                    if found:
-                        return found
-
-        elif system == "Darwin":
-            base = "/Library/Frameworks/pylon.framework/Libraries/gentlproducer/gtl"
-            if os.path.isdir(base):
-                found = []
-                for producer in PYLON_PRODUCERS:
-                    path = os.path.join(base, producer)
-                    if os.path.exists(path):
-                        found.append(path)
-                if found:
-                    return found
-
-        return None
+        return cti_files_for(PYLON) or None

@@ -18,6 +18,7 @@ except ImportError:
     _HarvestersTimeout = None  # ty:ignore[invalid-assignment]
 
 from .camera import Camera
+from .cti import parse_gentl_path
 
 logger = logging.getLogger(__name__)
 
@@ -132,38 +133,24 @@ class HarvesterCamera(Camera):
 
     @staticmethod
     def _parse_gentl_path(gentl_path: str) -> str | list[str] | None:
-        """Parse GENICAM_GENTL64_PATH environment variable.
+        """Parse a ``GENICAM_GENTL64_PATH`` value into CTI path(s).
 
-        Handles both directory paths (searches for .cti files) and direct
-        .cti file paths. Supports multiple paths separated by platform-specific
-        separator (';' on Windows, ':' on Unix).
+        Delegates the actual expansion to
+        :func:`pybeamprofiler.cti.parse_gentl_path` and collapses a single
+        result to a bare string, which is what :meth:`__init__` and the
+        vendor subclasses expect.
 
         Args:
-            gentl_path: Value of GENICAM_GENTL64_PATH environment variable
+            gentl_path: Value of the ``GENICAM_GENTL64_PATH`` environment
+                variable.
 
         Returns:
-            Single CTI path (str), multiple paths (list[str]), or None if not found
+            One path, several paths, or ``None`` if nothing resolved.
         """
-        separator = ";" if os.name == "nt" else ":"
-        cti_files = []
-
-        for path in gentl_path.split(separator):
-            path = path.strip()
-            if not path or not os.path.exists(path):
-                continue
-
-            if os.path.isdir(path):
-                # Directory: find all .cti files
-                for file in os.listdir(path):
-                    if file.endswith(".cti"):
-                        cti_files.append(os.path.join(path, file))
-            elif path.endswith(".cti"):
-                # Direct .cti file
-                cti_files.append(path)
-
-        if not cti_files:
+        found = parse_gentl_path(gentl_path)
+        if not found:
             return None
-        return cti_files if len(cti_files) > 1 else cti_files[0]
+        return found if len(found) > 1 else found[0]
 
     def open(self) -> None:
         """Open camera connection and retrieve camera properties."""

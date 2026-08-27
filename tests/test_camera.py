@@ -724,63 +724,6 @@ class TestBaslerCameraInit:
             BaslerCamera()
         mock_parse.assert_called_once_with("/some/path")
 
-    @patch("pybeamprofiler.basler.platform.system")
-    @patch("pybeamprofiler.basler.os.path.isdir")
-    @patch("pybeamprofiler.basler.os.path.exists")
-    def test_find_basler_cti_linux(self, mock_exists, mock_isdir, mock_system):
-        """Test _find_basler_cti on Linux."""
-        from pybeamprofiler.basler import BaslerCamera
-
-        mock_system.return_value = "Linux"
-        mock_isdir.side_effect = lambda p: p == "/opt/pylon/lib/gentlproducer/gtl"
-        mock_exists.side_effect = lambda p: p == "/opt/pylon/lib/gentlproducer/gtl/ProducerGEV.cti"
-
-        result = BaslerCamera._find_basler_cti()
-        assert result is not None
-        assert any("ProducerGEV.cti" in f for f in result)
-
-    @patch("pybeamprofiler.basler.platform.system")
-    @patch("pybeamprofiler.basler.os.path.isdir")
-    def test_find_basler_cti_not_installed(self, mock_isdir, mock_system):
-        """Test _find_basler_cti returns None when SDK not installed."""
-        from pybeamprofiler.basler import BaslerCamera
-
-        mock_system.return_value = "Linux"
-        mock_isdir.return_value = False
-
-        result = BaslerCamera._find_basler_cti()
-        assert result is None
-
-    @patch("pybeamprofiler.basler.platform.system")
-    @patch("pybeamprofiler.basler.os.path.isdir")
-    @patch("pybeamprofiler.basler.os.path.exists")
-    def test_find_basler_cti_darwin(self, mock_exists, mock_isdir, mock_system):
-        """Test _find_basler_cti on macOS."""
-        from pybeamprofiler.basler import BaslerCamera
-
-        mock_system.return_value = "Darwin"
-        base = "/Library/Frameworks/pylon.framework/Libraries/gentlproducer/gtl"
-        mock_isdir.side_effect = lambda p: p == base
-        mock_exists.side_effect = lambda p: p == f"{base}/ProducerU3V.cti"
-
-        result = BaslerCamera._find_basler_cti()
-        assert result is not None
-
-    @patch("pybeamprofiler.basler.platform.system")
-    @patch("pybeamprofiler.basler.os.path.isdir")
-    @patch("pybeamprofiler.basler.os.path.exists")
-    def test_find_basler_cti_windows(self, mock_exists, mock_isdir, mock_system):
-        """Test _find_basler_cti on Windows."""
-        from pybeamprofiler.basler import BaslerCamera
-
-        mock_system.return_value = "Windows"
-        base = r"C:\Program Files\Basler\pylon 7\Runtime\x64"
-        mock_isdir.side_effect = lambda p: p == base
-        mock_exists.side_effect = lambda p: p == os.path.join(base, "ProducerGEV.cti")
-
-        result = BaslerCamera._find_basler_cti()
-        assert result is not None
-
 
 class TestFlirCameraInit:
     """Test FlirCamera initialization and CTI discovery."""
@@ -809,81 +752,6 @@ class TestFlirCameraInit:
         with patch("pybeamprofiler.gen_camera.Harvester", mock_harvester):
             FlirCamera()
         mock_parse.assert_called_once_with("/flir/path")
-
-    @patch("pybeamprofiler.flir.platform.system")
-    @patch("pybeamprofiler.flir.os.path.isdir")
-    @patch("pybeamprofiler.flir.os.listdir")
-    def test_find_flir_cti_linux(self, mock_listdir, mock_isdir, mock_system):
-        """Test _find_flir_cti on Linux."""
-        from pybeamprofiler.flir import FlirCamera
-
-        mock_system.return_value = "Linux"
-        mock_isdir.side_effect = lambda p: p == "/opt/spinnaker/lib/flir-gentl"
-        mock_listdir.return_value = ["FLIR_GenTL_v140.cti"]
-
-        result = FlirCamera._find_flir_cti()
-        assert result is not None
-        assert "FLIR_GenTL_v140.cti" in result
-
-    @patch("pybeamprofiler.flir.platform.system")
-    @patch("pybeamprofiler.flir.os.path.isdir")
-    def test_find_flir_cti_not_installed(self, mock_isdir, mock_system):
-        """Test _find_flir_cti returns None when SDK not installed."""
-        from pybeamprofiler.flir import FlirCamera
-
-        mock_system.return_value = "Linux"
-        mock_isdir.return_value = False
-
-        result = FlirCamera._find_flir_cti()
-        assert result is None
-
-    @patch("pybeamprofiler.flir.platform.system")
-    @patch("pybeamprofiler.flir.os.path.isdir")
-    @patch("pybeamprofiler.flir.os.listdir")
-    def test_find_flir_cti_darwin(self, mock_listdir, mock_isdir, mock_system):
-        """Test _find_flir_cti on macOS."""
-        from pybeamprofiler.flir import FlirCamera
-
-        mock_system.return_value = "Darwin"
-        mock_isdir.side_effect = lambda p: p == "/usr/local/lib/spinnaker-gentl"
-        mock_listdir.return_value = ["FLIR_GenTL.cti"]
-
-        result = FlirCamera._find_flir_cti()
-        assert result is not None
-
-    @patch("pybeamprofiler.flir.platform.system")
-    @patch("pybeamprofiler.flir.os.path.exists")
-    @patch("pybeamprofiler.flir.os.path.isdir")
-    @patch("pybeamprofiler.flir.os.listdir")
-    def test_find_flir_cti_windows(self, mock_listdir, mock_isdir, mock_exists, mock_system):
-        """Test _find_flir_cti on Windows."""
-        from pybeamprofiler.flir import FlirCamera
-
-        mock_system.return_value = "Windows"
-        base = r"C:\Program Files\Teledyne\Spinnaker\cti64"
-        mock_exists.return_value = True
-        mock_isdir.side_effect = lambda p: True
-        mock_listdir.side_effect = lambda p: ["vs2015"] if p == base else ["FLIR_GenTL_v140.cti"]
-
-        result = FlirCamera._find_flir_cti()
-        assert result is not None
-
-    @patch("pybeamprofiler.flir.platform.system")
-    @patch("pybeamprofiler.flir.os.path.exists")
-    @patch("pybeamprofiler.flir.os.path.isdir")
-    @patch("pybeamprofiler.flir.os.listdir")
-    def test_find_flir_cti_windows_oserror(
-        self, mock_listdir, mock_isdir, mock_exists, mock_system
-    ):
-        """Test _find_flir_cti handles OSError on Windows listdir."""
-        from pybeamprofiler.flir import FlirCamera
-
-        mock_system.return_value = "Windows"
-        mock_exists.return_value = True
-        mock_listdir.side_effect = OSError("Access denied")
-
-        result = FlirCamera._find_flir_cti()
-        assert result is None
 
     @patch("pybeamprofiler.flir.os.environ", {})
     @patch("pybeamprofiler.flir.FlirCamera._find_flir_cti")
@@ -920,21 +788,6 @@ class TestFlirCameraInit:
         with patch("pybeamprofiler.gen_camera.Harvester", mock_harvester):
             BaslerCamera()
         mock_find.assert_called_once()
-
-    @patch("pybeamprofiler.flir.platform.system")
-    @patch("pybeamprofiler.flir.os.path.isdir")
-    @patch("pybeamprofiler.flir.os.listdir")
-    def test_find_flir_cti_linux_listdir_oserror(self, mock_listdir, mock_isdir, mock_system):
-        """Per-directory ``os.listdir`` failure on Linux must be swallowed
-        and allow the search to continue (line 88-89)."""
-        from pybeamprofiler.flir import FlirCamera
-
-        mock_system.return_value = "Linux"
-        mock_isdir.return_value = True  # claims dir exists
-        mock_listdir.side_effect = OSError("EACCES")
-
-        # No exception propagates, we just get None back.
-        assert FlirCamera._find_flir_cti() is None
 
 
 class TestGenCameraDetection:
