@@ -76,7 +76,10 @@ def list_cameras(cti_file: str | None = None) -> list[dict[str, str | int]]:
         else:
             cti_files = find_cti_files()
             if not cti_files:
-                logger.warning("No GenTL producers (.cti files) found")
+                # Expected on any machine using only the simulator, and the
+                # GUI calls this every time the camera list is refreshed --
+                # so this is information, not a problem worth warning about.
+                logger.info("No GenTL producers (.cti files) found")
                 return []
 
             for cti in cti_files:

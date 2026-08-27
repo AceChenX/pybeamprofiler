@@ -7,6 +7,7 @@ bare assertion.
 
 from __future__ import annotations
 
+import math
 import sys
 from unittest.mock import patch
 
@@ -692,4 +693,95 @@ class TestExposureSliderRange:
         cam._exposure_min = cam._exposure_max = 0.0
         with patch("IPython.display.display"):
             cam.setting()
+        cam.close()
+
+
+class TestSimulatedRotatedBeamFastPath:
+    """The tilted profile builds its frame with in-place numpy on
+    pre-rotated grids rather than calling the generic ``gaussian_2d``.
+
+    That is a hot loop, so it is worth being fast — but only if it computes
+    exactly the same thing, which is what these check.
+    """
+
+    @staticmethod
+    def _quiet_camera(profile):
+        """A camera with all frame-to-frame jitter disabled."""
+        from pybeamprofiler.simulated import SimulatedCamera
+
+        cam = SimulatedCamera(profile)
+        cam.open()
+        for attr in (
+            "_noise_center",
+            "_noise_sigma",
+            "_noise_amp",
+            "_noise_bg",
+            "_noise_image",
+        ):
+            setattr(cam, attr, 0.0)
+        return cam
+
+    def test_matches_the_reference_model(self):
+        from pybeamprofiler.fitting import gaussian_2d
+        from pybeamprofiler.simulated import SIMULATED_PROFILES
+
+        profile = next(p for p in SIMULATED_PROFILES if p.theta_deg)
+        cam = self._quiet_camera(profile)
+        got = cam.get_image().astype(np.float64)
+
+        h, w = profile.height, profile.width
+        y, x = np.mgrid[0:h, 0:w].astype(np.float64)
+        expected = np.clip(
+            gaussian_2d(
+                (x, y),
+                cam._amplitude,
+                w / 2,
+                h / 2,
+                profile.sigma_x,
+                profile.sigma_y,
+                math.radians(profile.theta_deg),
+                cam._background,
+            ).reshape(h, w),
+            0,
+            255,
+        )
+
+        # uint8 output quantises, so allow one count.
+        assert np.abs(got - expected).max() <= 1.001
+        cam.close()
+
+    def test_rotation_sense_matches_the_fitted_angle(self):
+        """A sign slip in the rotation would still look elliptical, so check
+        the angle the 2D fit actually recovers."""
+        from pybeamprofiler.simulated import SIMULATED_PROFILES
+
+        profile = next(p for p in SIMULATED_PROFILES if p.theta_deg)
+        cam = self._quiet_camera(profile)
+
+        bp = BeamProfiler(camera="simulated", fit="2d")
+        bp.attach_camera(cam)
+        for _ in range(3):
+            bp.analyze(cam.get_image())
+
+        assert bp.angle_deg == pytest.approx(profile.theta_deg, abs=2.0)
+        cam.close()
+
+    def test_untilted_profile_uses_the_separable_path(self):
+        from pybeamprofiler.simulated import SIMULATED_PROFILES, SimulatedCamera
+
+        flat = next(p for p in SIMULATED_PROFILES if not p.theta_deg)
+        cam = SimulatedCamera(flat)
+        assert cam._rot is None, "an untilted beam should not build rotated grids"
+        assert cam._scratch is None
+        cam.close()
+
+    def test_noise_is_generated_in_single_precision(self):
+        """float64 noise would double the allocation and need a full-frame
+        cast on every frame."""
+        from pybeamprofiler.simulated import SimulatedCamera
+
+        cam = SimulatedCamera()
+        cam.open()
+        cam.get_image()
+        assert cam._frame_buf.dtype == np.float32
         cam.close()

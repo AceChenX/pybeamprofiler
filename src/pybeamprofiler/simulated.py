@@ -31,7 +31,6 @@ from .constants import (
     SIMULATED_SIGMA_Y,
     SIMULATED_WIDTH,
 )
-from .fitting import gaussian_2d
 
 logger = logging.getLogger(__name__)
 
@@ -272,13 +271,24 @@ class SimulatedCamera(Camera):
         self._x_axis = np.arange(self._sensor_w, dtype=np.float32)
         self._y_axis = np.arange(self._sensor_h, dtype=np.float32)
         self._frame_buf = np.empty((self._sensor_h, self._sensor_w), dtype=np.float32)
-        # The rotated path needs real 2D coordinate grids. Built only when a
-        # profile actually asks for a tilt, and kept as one tuple because the
-        # two are meaningless apart.
-        self._grid: tuple[np.ndarray, np.ndarray] | None = None
+        # The rotated path needs 2D coordinate fields. Rotation is linear, so
+        # the grids can be rotated once here and the (jittering) beam centre
+        # subtracted as a scalar each frame -- rather than rebuilding a
+        # rotated grid, or calling the generic gaussian_2d and paying for its
+        # temporaries, every time. Built only for a profile that asks for tilt.
+        self._rot: tuple[np.ndarray, np.ndarray] | None = None
         if self._theta:
             grid_y, grid_x = np.mgrid[0 : self._sensor_h, 0 : self._sensor_w].astype(np.float32)
-            self._grid = (grid_x, grid_y)
+            cos_t, sin_t = math.cos(self._theta), math.sin(self._theta)
+            self._rot = (
+                grid_x * cos_t - grid_y * sin_t,
+                grid_x * sin_t + grid_y * cos_t,
+            )
+        # Scratch buffer for the rotated path, so the per-frame maths runs
+        # in place instead of allocating a full frame per operation.
+        self._scratch = (
+            np.empty((self._sensor_h, self._sensor_w), dtype=np.float32) if self._theta else None
+        )
         self._rng = np.random.default_rng()
 
     def open(self) -> None:
@@ -321,28 +331,49 @@ class SimulatedCamera(Camera):
         amp = max(1.0, self._amplitude + rng.normal(0, self._noise_amp))
         bg = max(0.0, self._background + rng.normal(0, self._noise_bg))
 
-        if self._grid is None:
+        buf = self._frame_buf
+        if self._rot is None:
             # Separable Gaussian: G(x,y) = amp * Gx(x) * Gy(y). Two 1D
             # exponentials over W and H elements are ~30x cheaper than one 2D
             # exponential over W*H, and avoid meshgrid allocations.
             gx = np.exp(-((self._x_axis - cx) ** 2) / (2 * sx * sx))
             gy = np.exp(-((self._y_axis - cy) ** 2) / (2 * sy * sy))
-            np.outer(gy, gx, out=self._frame_buf)
+            np.outer(gy, gx, out=buf)
         else:
-            # A tilted beam has a cross term, so it does not factorise and the
-            # full 2D exponential is unavoidable. Only tilted profiles pay it.
-            flat = gaussian_2d(self._grid, 1.0, cx, cy, sx, sy, self._theta, 0.0)
-            self._frame_buf[:] = flat.reshape(self._sensor_h, self._sensor_w)
+            # A tilted beam has a cross term and does not factorise, so one 2D
+            # exponential is unavoidable. Everything around it, though, runs
+            # in place on two preallocated buffers: rotate the centre into the
+            # same frame as the pre-rotated grids and it is a subtract, a
+            # square and an add per axis.
+            rot_x, rot_y = self._rot
+            scratch = self._scratch
+            assert scratch is not None  # built together with _rot
+            cos_t, sin_t = math.cos(self._theta), math.sin(self._theta)
+            u_c = cx * cos_t - cy * sin_t
+            v_c = cx * sin_t + cy * cos_t
 
-        self._frame_buf *= amp
-        self._frame_buf += bg
-        self._frame_buf += rng.normal(
-            0, self._noise_image, (self._sensor_h, self._sensor_w)
-        ).astype(np.float32, copy=False)
+            np.subtract(rot_x, u_c, out=buf)
+            np.multiply(buf, buf, out=buf)
+            buf *= -0.5 / (sx * sx)
+
+            np.subtract(rot_y, v_c, out=scratch)
+            np.multiply(scratch, scratch, out=scratch)
+            scratch *= -0.5 / (sy * sy)
+
+            buf += scratch
+            np.exp(buf, out=buf)
+
+        buf *= amp
+        buf += bg
+        # standard_normal can emit float32 directly; rng.normal always builds
+        # float64 and would then need a full-frame cast.
+        noise = rng.standard_normal((self._sensor_h, self._sensor_w), dtype=np.float32)
+        noise *= self._noise_image
+        buf += noise
 
         ox, oy = self._roi_offset_x, self._roi_offset_y
         rw, rh = self._roi_width, self._roi_height
-        cropped = self._frame_buf[oy : oy + rh, ox : ox + rw]
+        cropped = buf[oy : oy + rh, ox : ox + rw]
         image = np.clip(cropped, 0, 255).astype(np.uint8)
 
         self.image_buffer = image
