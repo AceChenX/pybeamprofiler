@@ -1849,6 +1849,7 @@ dev = [
     { name = "pre-commit" },
     { name = "pytest" },
     { name = "pytest-cov" },
+    { name = "requests" },
     { name = "ruff" },
     { name = "ty" },
 ]
@@ -1859,6 +1860,7 @@ matplotlib = [
 test = [
     { name = "pytest" },
     { name = "pytest-cov" },
+    { name = "requests" },
 ]
 
 [package.metadata]
@@ -1875,6 +1877,7 @@ requires-dist = [
     { name = "pybeamprofiler", extras = ["test"], marker = "extra == 'dev'" },
     { name = "pytest", marker = "extra == 'test'", specifier = ">=9.1" },
     { name = "pytest-cov", marker = "extra == 'test'", specifier = ">=7.1" },
+    { name = "requests", marker = "extra == 'test'", specifier = ">=2.32" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.16" },
     { name = "scipy" },
     { name = "ty", marker = "extra == 'dev'", specifier = ">=0.0.75" },

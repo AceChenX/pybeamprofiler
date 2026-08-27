@@ -342,7 +342,10 @@ class BeamProfiler:
     _MAX_FIT_2D_DIM = MAX_FIT_2D_DIM
 
     def _fit_2d_gaussian(
-        self, image: np.ndarray, sigma_hint: float | None = None
+        self,
+        image: np.ndarray,
+        sigma_hint: float | None = None,
+        center_hint: tuple[float, float] | None = None,
     ) -> np.ndarray | list[Any]:
         """Fit a rotated 2D Gaussian, warm-starting from the previous frame.
 
@@ -352,14 +355,20 @@ class BeamProfiler:
 
         Args:
             image: 2D intensity array.
-            sigma_hint: Rough beam sigma in pixels, used to keep a small beam
-                from being decimated below the fit's resolution.
+            sigma_hint: Rough beam sigma in pixels.
+            center_hint: Rough beam centre in pixels. With *sigma_hint*, lets
+                a small beam be cropped out of a large sensor rather than
+                decimated below the fit's resolution.
 
         Returns:
             ``[amplitude, x0, y0, sigma_x, sigma_y, theta, offset]``.
         """
         popt, converged = fitting.fit_2d_gaussian(
-            image, self._last_popt_2d, max_dim=self._MAX_FIT_2D_DIM, sigma_hint=sigma_hint
+            image,
+            self._last_popt_2d,
+            max_dim=self._MAX_FIT_2D_DIM,
+            sigma_hint=sigma_hint,
+            center_hint=center_hint,
         )
         if converged:
             self._last_popt_2d = popt
@@ -492,8 +501,13 @@ class BeamProfiler:
             # what decides whether the default (decimated) fit grid can still
             # resolve it.
             proj_x, proj_y = self._integrate(image)
-            _, width_hint = fitting.measure_d4s(proj_y)
-            popt = self._fit_2d_gaussian(image, sigma_hint=width_hint / D4SIGMA_FACTOR)
+            cx_hint, width_x_hint = fitting.measure_d4s(proj_x)
+            cy_hint, width_y_hint = fitting.measure_d4s(proj_y)
+            popt = self._fit_2d_gaussian(
+                image,
+                sigma_hint=min(width_x_hint, width_y_hint) / D4SIGMA_FACTOR,
+                center_hint=(cx_hint, cy_hint),
+            )
             _, x0, y0, sigma_x, sigma_y, theta, _ = popt
 
             # Report widths along the *image* axes, as 1D mode does. The

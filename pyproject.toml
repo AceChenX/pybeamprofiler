@@ -71,6 +71,10 @@ override-dependencies = [
 test = [
     "pytest>=9.1",
     "pytest-cov>=7.1",
+    # Used by tests/test_headless_app.py to drive a real Dash server over
+    # HTTP. It arrives transitively today, but relying on that would leave
+    # the end-to-end tests at the mercy of an unrelated resolution change.
+    "requests>=2.32",
 ]
 dev = [
     "pybeamprofiler[test]",

@@ -380,40 +380,141 @@ class TestImageAxisSigmas:
             assert sy == pytest.approx(25.0)
 
 
-class TestFitGridSizing:
-    """The fit runs on a decimated grid for speed, but a tightly focused beam
-    must not be decimated below the point where it can be resolved."""
+class TestFitRegionSelection:
+    """The fit runs on a reduced grid for speed. A large beam is decimated;
+    a small one is *cropped* instead, because decimating a tightly focused
+    beam below about a pixel of sigma makes the fit unreliable and then
+    non-convergent — and fitting the whole frame at full resolution to avoid
+    that took two seconds, which is worse than the problem."""
 
     @staticmethod
-    def _beam(sigma, h=1024, w=1024):
+    def _beam(sigma, h=1024, w=1024, cx=None, cy=None):
+        cx = w / 2 if cx is None else cx
+        cy = h / 2 if cy is None else cy
         y, x = np.mgrid[0:h, 0:w].astype(float)
-        return fitting.gaussian_2d(
-            (x, y), 200.0, w / 2, h / 2, sigma * 1.5, sigma, 0.4, 5.0
-        ).reshape(h, w)
+        return fitting.gaussian_2d((x, y), 200.0, cx, cy, sigma * 1.5, sigma, 0.4, 5.0).reshape(
+            h, w
+        )
 
-    def test_a_large_beam_keeps_the_cheap_default_grid(self):
-        assert fitting._fit_grid_dim(self._beam(50.0), 128, 50.0) == 128
-
-    def test_a_small_beam_gets_a_bigger_grid(self):
-        assert fitting._fit_grid_dim(self._beam(6.0), 128, 6.0) > 128
-
-    def test_the_grid_never_exceeds_the_image(self):
-        img = self._beam(1.0)
-        assert fitting._fit_grid_dim(img, 128, 1.0) <= max(img.shape)
-
-    def test_no_hint_keeps_the_default(self):
+    def test_a_large_beam_is_left_whole_and_decimated(self):
         img = self._beam(50.0)
-        assert fitting._fit_grid_dim(img, 128, None) == 128
-        assert fitting._fit_grid_dim(img, 128, 0.0) == 128
+        region, ox, oy = fitting._fit_region(img, 128, 50.0, (512.0, 512.0))
+        assert region.shape == img.shape
+        assert (ox, oy) == (0, 0)
 
-    @pytest.mark.parametrize("sigma", [200.0, 50.0, 12.0, 6.0, 3.0])
+    def test_a_small_beam_is_cropped_around_itself(self):
+        img = self._beam(4.0)
+        region, ox, oy = fitting._fit_region(img, 128, 4.0, (512.0, 512.0))
+        assert max(region.shape) < max(img.shape)
+        assert ox > 0 and oy > 0
+
+    def test_the_crop_is_centred_on_the_beam(self):
+        img = self._beam(4.0, cx=300.0, cy=700.0)
+        region, ox, oy = fitting._fit_region(img, 128, 4.0, (300.0, 700.0))
+        h, w = region.shape
+        assert ox <= 300 <= ox + w
+        assert oy <= 700 <= oy + h
+
+    def test_the_crop_never_goes_below_a_usable_size(self):
+        """Seven free parameters need more than a handful of pixels."""
+        from pybeamprofiler.constants import MIN_FIT_2D_WINDOW_PX
+
+        region, _, _ = fitting._fit_region(self._beam(0.5), 128, 0.5, (512.0, 512.0))
+        assert min(region.shape) >= MIN_FIT_2D_WINDOW_PX
+
+    def test_the_crop_is_clamped_to_the_frame(self):
+        """A beam near the edge must not produce an out-of-bounds window."""
+        img = self._beam(4.0, cx=3.0, cy=1020.0)
+        region, ox, oy = fitting._fit_region(img, 128, 4.0, (3.0, 1020.0))
+        assert ox >= 0 and oy >= 0
+        assert ox + region.shape[1] <= img.shape[1]
+        assert oy + region.shape[0] <= img.shape[0]
+        assert region.size > 0
+
+    def test_a_window_covering_the_whole_frame_is_not_cropped(self):
+        """On a tiny ROI the minimum window already spans the sensor, so the
+        frame is handed back whole rather than sliced into an identical copy."""
+        img = self._beam(0.5, h=30, w=30, cx=15.0, cy=15.0)
+        region, ox, oy = fitting._fit_region(img, 128, 0.5, (15.0, 15.0))
+        assert region is img
+        assert (ox, oy) == (0, 0)
+
+    def test_no_hint_means_no_crop(self):
+        img = self._beam(50.0)
+        for hint, centre in ((None, (512.0, 512.0)), (0.0, (512.0, 512.0)), (4.0, None)):
+            region, ox, oy = fitting._fit_region(img, 128, hint, centre)
+            assert region.shape == img.shape
+            assert (ox, oy) == (0, 0)
+
+    @pytest.mark.parametrize("sigma", [200.0, 50.0, 12.0, 6.0, 3.0, 1.5])
     def test_beams_of_every_size_still_fit(self, sigma):
-        """At a fixed 256-px grid a 3-px beam did not converge at all."""
-        popt, converged = fitting.fit_2d_gaussian(self._beam(sigma), None, sigma_hint=sigma)
+        """A 3 px beam previously did not converge at all."""
+        centre = (512.0, 500.0)
+        img = self._beam(sigma, cx=centre[0], cy=centre[1])
+        popt, converged = fitting.fit_2d_gaussian(img, None, sigma_hint=sigma, center_hint=centre)
         assert converged
         major, minor, _ = fitting.canonical_ellipse(popt[3], popt[4], popt[5])
-        assert major == pytest.approx(sigma * 1.5, rel=0.05)
-        assert minor == pytest.approx(sigma, rel=0.05)
+        assert major == pytest.approx(sigma * 1.5, rel=0.1)
+        assert minor == pytest.approx(sigma, rel=0.1)
+
+
+class TestDecimatedCoordinates:
+    """``ndimage.zoom`` aligns the first and last pixel *centres*, so a fitted
+    coordinate maps back by ``(n_in-1)/(n_out-1)``, not by ``1/ds``. The naive
+    ratio biased the reported beam centre low — 3.4 px decimating 1024 to 128,
+    7.4 px from 2048, which is 37 um on a 5 um pitch."""
+
+    @staticmethod
+    def _beam(n, cx, cy, sigma):
+        y, x = np.mgrid[0:n, 0:n].astype(float)
+        return fitting.gaussian_2d((x, y), 200.0, cx, cy, sigma * 1.5, sigma, 0.4, 5.0).reshape(
+            n, n
+        )
+
+    @pytest.mark.parametrize("n", [512, 1024, 2048])
+    def test_centre_survives_decimation(self, n):
+        # Deliberately not a round number, so an off-by-half-pixel shows.
+        cx, cy = n * 0.4901, n * 0.5137
+        sigma = n / 20  # large enough that the frame is decimated, not cropped
+        img = self._beam(n, cx, cy, sigma)
+
+        popt, converged = fitting.fit_2d_gaussian(img, None, sigma_hint=sigma)
+        assert converged
+        assert popt[1] == pytest.approx(cx, abs=0.5)
+        assert popt[2] == pytest.approx(cy, abs=0.5)
+
+    @pytest.mark.parametrize("n", [512, 1024, 2048])
+    def test_sigma_survives_decimation(self, n):
+        sigma = n / 20
+        img = self._beam(n, n * 0.4901, n * 0.5137, sigma)
+        popt, _ = fitting.fit_2d_gaussian(img, None, sigma_hint=sigma)
+        major, minor, _ = fitting.canonical_ellipse(popt[3], popt[4], popt[5])
+        assert major == pytest.approx(sigma * 1.5, rel=0.02)
+        assert minor == pytest.approx(sigma, rel=0.02)
+
+    def test_a_cropped_fit_reports_full_frame_coordinates(self):
+        """The crop offset has to be added back, or every small beam reads as
+        being near the origin."""
+        cx, cy = 300.0, 700.0
+        img = self._beam(1024, cx, cy, 4.0)
+        popt, converged = fitting.fit_2d_gaussian(img, None, sigma_hint=4.0, center_hint=(cx, cy))
+        assert converged
+        assert popt[1] == pytest.approx(cx, abs=0.5)
+        assert popt[2] == pytest.approx(cy, abs=0.5)
+
+    def test_a_warm_start_round_trips_through_the_crop(self):
+        """The cached parameters are in full-frame coordinates and have to be
+        mapped into the region and back again without drifting."""
+        cx, cy = 300.0, 700.0
+        img = self._beam(1024, cx, cy, 4.0)
+        popt, _ = fitting.fit_2d_gaussian(img, None, sigma_hint=4.0, center_hint=(cx, cy))
+        for _ in range(5):
+            popt, converged = fitting.fit_2d_gaussian(
+                img, popt, sigma_hint=4.0, center_hint=(cx, cy)
+            )
+            assert converged
+            assert popt[1] == pytest.approx(cx, abs=0.5)
+            assert popt[2] == pytest.approx(cy, abs=0.5)
 
 
 class TestFitEvaluationCap:

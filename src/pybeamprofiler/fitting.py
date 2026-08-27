@@ -23,10 +23,12 @@ from scipy.ndimage import zoom as _ndimage_zoom
 from scipy.optimize import curve_fit
 
 from .constants import (
+    FIT_2D_WINDOW_SIGMAS,
     MAX_FIT_2D_DIM,
     MAX_FIT_2D_EVALS,
     MAX_FIT_ITERATIONS,
     MIN_FIT_2D_SIGMA_PX,
+    MIN_FIT_2D_WINDOW_PX,
 )
 
 logger = logging.getLogger(__name__)
@@ -293,18 +295,53 @@ def image_axis_sigmas(sigma_x: float, sigma_y: float, theta: float) -> tuple[flo
     return float(np.sqrt(vx * cos2 + vy * sin2)), float(np.sqrt(vx * sin2 + vy * cos2))
 
 
-def _fit_grid_dim(image: np.ndarray, max_dim: int, sigma_hint: float | None) -> int:
-    """Longest edge to fit on, raised if the beam would be under-resolved.
+def _fit_region(
+    image: np.ndarray,
+    max_dim: int,
+    sigma_hint: float | None,
+    center_hint: tuple[float, float] | None,
+) -> tuple[np.ndarray, int, int]:
+    """Pick the part of the frame to fit, and where it sits in the original.
 
     Decimating a tightly focused beam below about a pixel of sigma makes the
-    fit unreliable and then non-convergent, so a small beam gets a bigger
-    grid rather than a blind fit. Everything else keeps the cheap default.
+    fit unreliable and then non-convergent. The tempting fix — fitting the
+    whole frame at full resolution — is far worse: a 3 px beam on a 1 MPix
+    sensor took two seconds, which would wedge the live view harder than the
+    problem it solved.
+
+    Cropping is the right lever. A small beam only occupies a small part of
+    the sensor, so a window around it is both faster *and* better resolved
+    than decimating everything. Large beams are left alone and decimated by
+    the caller as usual.
+
+    Args:
+        image: Full-resolution frame.
+        max_dim: Longest edge the fit grid may have after decimation.
+        sigma_hint: Rough smaller beam sigma in pixels, if known.
+        center_hint: Rough beam centre ``(x, y)`` in pixels, if known.
+
+    Returns:
+        ``(region, x_offset, y_offset)`` — the sub-image to fit and its origin
+        in the original frame, so fitted coordinates can be shifted back.
     """
-    longest = max(image.shape)
-    if not sigma_hint or sigma_hint <= 0:
-        return max_dim
-    needed = MIN_FIT_2D_SIGMA_PX / sigma_hint * longest
-    return int(min(longest, max(max_dim, np.ceil(needed))))
+    h, w = image.shape
+    if not sigma_hint or sigma_hint <= 0 or center_hint is None:
+        return image, 0, 0
+
+    # Only worth cropping if decimation would smear the beam out.
+    if sigma_hint * max_dim / max(h, w) >= MIN_FIT_2D_SIGMA_PX:
+        return image, 0, 0
+
+    half = max(FIT_2D_WINDOW_SIGMAS * sigma_hint, MIN_FIT_2D_WINDOW_PX / 2)
+    cx, cy = center_hint
+    x0 = int(max(0, min(w - 1, round(cx - half))))
+    x1 = int(max(x0 + 1, min(w, round(cx + half))))
+    y0 = int(max(0, min(h - 1, round(cy - half))))
+    y1 = int(max(y0 + 1, min(h, round(cy + half))))
+
+    if (x1 - x0) >= w and (y1 - y0) >= h:
+        return image, 0, 0
+    return image[y0:y1, x0:x1], x0, y0
 
 
 def fit_2d_gaussian(
@@ -312,6 +349,7 @@ def fit_2d_gaussian(
     last_popt: np.ndarray | list[Any] | None = None,
     max_dim: int = MAX_FIT_2D_DIM,
     sigma_hint: float | None = None,
+    center_hint: tuple[float, float] | None = None,
 ) -> tuple[np.ndarray | list[Any], bool]:
     """Fit a rotated 2D Gaussian to *image*.
 
@@ -324,8 +362,10 @@ def fit_2d_gaussian(
         last_popt: Previous fit parameters (full-resolution coordinates) to
             warm-start from, or ``None`` for a cold start.
         max_dim: Longest edge the fit is allowed to see.
-        sigma_hint: Rough smaller beam sigma in pixels, if known. Used only to
-            raise the grid for a beam too small to survive decimation.
+        sigma_hint: Rough smaller beam sigma in pixels, if known.
+        center_hint: Rough beam centre ``(x, y)`` in pixels, if known. With
+            *sigma_hint* this lets a small beam be cropped out of a large
+            sensor instead of decimated into illegibility.
 
     Returns:
         ``([amplitude, x0, y0, sigma_x, sigma_y, theta, offset], converged)``,
@@ -334,27 +374,47 @@ def fit_2d_gaussian(
         are the initial guess and the caller should not cache them as a warm
         start.
     """
-    h, w = image.shape
-    max_dim = _fit_grid_dim(image, max_dim, sigma_hint)
+    # A small beam is cropped out of the sensor; everything else is decimated.
+    region, off_x, off_y = _fit_region(image, max_dim, sigma_hint, center_hint)
+    h, w = region.shape
 
     if max(h, w) > max_dim:
         ds = max_dim / max(h, w)
-        fit_img = _ndimage_zoom(image.astype(float), ds, order=1)
-        inv_ds = 1.0 / ds
+        fit_img = _ndimage_zoom(region.astype(float), ds, order=1)
     else:
-        fit_img = image
-        inv_ds = 1.0
+        fit_img = region
 
     fh, fw = fit_img.shape
 
-    def _rescale(p: list[Any], factor: float) -> None:
-        """Scale centers and sigmas between fit and full resolution, in place."""
-        for i in (1, 2, 3, 4):
-            p[i] *= factor
+    # ndimage.zoom lines up the *first and last pixel centres* of input and
+    # output, so index j in the decimated image sits at j*(n_in-1)/(n_out-1)
+    # in the original -- not at j/ds. Using the naive ratio biases the fitted
+    # centre low by (1/ds - 1)/2 px: 3.4 px decimating 1024 to 128, and 7.4 px
+    # from 2048, which on a 5 um pitch is 37 um of position error.
+    scale_x = (w - 1) / (fw - 1) if fw > 1 else 1.0
+    scale_y = (h - 1) / (fh - 1) if fh > 1 else 1.0
+    # The two differ only by rounding, and sigma_x/sigma_y lie along the
+    # *principal* axes rather than the image axes, so a single factor is both
+    # correct in spirit and accurate to well under a tenth of a percent.
+    scale_sigma = (scale_x + scale_y) / 2.0
+
+    def _to_fit_coords(p: list[Any]) -> None:
+        """Full-frame parameters → the decimated region's coordinates."""
+        p[1] = (p[1] - off_x) / scale_x
+        p[2] = (p[2] - off_y) / scale_y
+        p[3] /= scale_sigma
+        p[4] /= scale_sigma
+
+    def _to_image_coords(p: Any) -> None:
+        """Decimated-region parameters → full-frame coordinates."""
+        p[1] = p[1] * scale_x + off_x
+        p[2] = p[2] * scale_y + off_y
+        p[3] *= scale_sigma
+        p[4] *= scale_sigma
 
     if last_popt is not None:
         p0 = list(last_popt)
-        _rescale(p0, 1.0 / inv_ds)  # full-res → downsampled coordinates
+        _to_fit_coords(p0)
     else:
         pmax, pmin = float(np.max(fit_img)), float(np.min(fit_img))
         y0, x0 = np.unravel_index(int(np.argmax(fit_img)), fit_img.shape)
@@ -417,14 +477,13 @@ def fit_2d_gaussian(
             )
 
         popt = np.asarray(popt, dtype=float)
-        if inv_ds != 1.0:
-            popt[1:5] *= inv_ds
+        _to_image_coords(popt)
         popt[3], popt[4], popt[5] = canonical_ellipse(popt[3], popt[4], popt[5])
         return popt, True
 
     except _FIT_ERRORS as e:
         logger.debug("2D fit failed: %s, using initial guess", e)
-        _rescale(p0, inv_ds)  # back to full-resolution coordinates
+        _to_image_coords(p0)
         return p0, False
 
 

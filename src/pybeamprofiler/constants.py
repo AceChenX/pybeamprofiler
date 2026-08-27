@@ -25,11 +25,20 @@ MAX_FIT_ITERATIONS = 100
 # the 50 ms render tick and the GUI could not keep up.
 MAX_FIT_2D_DIM = 128
 
-# Smallest beam sigma, in pixels, that the decimated fit grid must still
-# resolve. Below roughly one pixel the fit degrades badly (7% error) and then
-# stops converging, so a small beam raises the grid size rather than being
-# fitted blind.
+# Smallest beam sigma, in pixels, that the fit grid must still resolve.
+# Below roughly one pixel the fit degrades badly (7% error) and then stops
+# converging, so a beam that would decimate below this is cropped to a window
+# around itself instead of being fitted blind.
 MIN_FIT_2D_SIGMA_PX = 3.0
+
+# Half-width of that crop window, in beam sigmas. Four sigma already contains
+# 99.99% of the beam; five leaves a ring of baseline for the offset term to
+# key on without dragging in the whole sensor.
+FIT_2D_WINDOW_SIGMAS = 5.0
+
+# Never crop below this, or there is too little data behind seven free
+# parameters for the fit to be meaningful.
+MIN_FIT_2D_WINDOW_PX = 32
 
 # Hard cap on model evaluations per 2D fit. This bounds the worst case a
 # single render tick can cost; scipy's own default for the bounded solver is
