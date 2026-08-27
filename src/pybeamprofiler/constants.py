@@ -19,9 +19,22 @@ SIMULATED_BACKGROUND = 10  # baseline intensity
 # Fitting parameters
 MAX_FIT_ITERATIONS = 100
 # Longest edge a 2D fit is allowed to see. curve_fit over a megapixel grid
-# takes hundreds of ms; 256² keeps it interactive with no measurable loss of
-# accuracy for beams that span more than a handful of pixels.
-MAX_FIT_2D_DIM = 256
+# takes hundreds of ms. Sweeping grid size against known beams showed the
+# recovered widths flat from 256 down to 128 (0.3% -> 0.7% error) while the
+# fit got 3.5x faster, so 128 it is -- at 256 a single frame cost more than
+# the 50 ms render tick and the GUI could not keep up.
+MAX_FIT_2D_DIM = 128
+
+# Smallest beam sigma, in pixels, that the decimated fit grid must still
+# resolve. Below roughly one pixel the fit degrades badly (7% error) and then
+# stops converging, so a small beam raises the grid size rather than being
+# fitted blind.
+MIN_FIT_2D_SIGMA_PX = 3.0
+
+# Hard cap on model evaluations per 2D fit. This bounds the worst case a
+# single render tick can cost; scipy's own default for the bounded solver is
+# 100x the parameter count, which is 700 here.
+MAX_FIT_2D_EVALS = 200
 
 # Width conversion factors, all relative to the Gaussian sigma of an
 # *intensity* profile I(x) = A·exp(-(x-x₀)²/2σ²).  Solving for the full

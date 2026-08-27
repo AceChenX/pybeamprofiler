@@ -304,3 +304,127 @@ class TestDownsample:
         out = fitting.downsample(np.zeros((4000, 4), dtype=np.uint8), 8)
         assert out.shape[0] == 8
         assert out.shape[1] >= 1
+
+
+class TestCanonicalEllipse:
+    """The rotated 2D Gaussian is degenerate: ``(sx, sy, th)`` and
+    ``(sy, sx, th + 90deg)`` are the same ellipse. Left alone the solver picks
+    between them arbitrarily, which made a near-round beam's reported X and Y
+    widths swap from frame to frame."""
+
+    def test_major_axis_comes_first(self):
+        major, minor, _ = fitting.canonical_ellipse(10.0, 40.0, 0.0)
+        assert (major, minor) == (40.0, 10.0)
+
+    def test_already_ordered_is_untouched(self):
+        major, minor, theta = fitting.canonical_ellipse(40.0, 10.0, 0.3)
+        assert (major, minor) == (40.0, 10.0)
+        assert theta == pytest.approx(0.3)
+
+    def test_swapping_rotates_by_a_quarter_turn(self):
+        _, _, theta = fitting.canonical_ellipse(10.0, 40.0, 0.0)
+        assert theta == pytest.approx(np.pi / 2)
+
+    def test_theta_is_wrapped_into_half_a_turn(self):
+        for theta in (-3.0, 0.0, 3.5, 7.0, 100.0):
+            _, _, out = fitting.canonical_ellipse(5.0, 3.0, theta)
+            assert 0.0 <= out < np.pi
+
+    def test_negative_sigmas_are_normalised(self):
+        """The model is even in sigma, so the solver may return either sign."""
+        major, minor, _ = fitting.canonical_ellipse(-30.0, -12.0, 0.2)
+        assert (major, minor) == (30.0, 12.0)
+
+    def test_both_parameterisations_land_on_the_same_answer(self):
+        a = fitting.canonical_ellipse(40.0, 10.0, 0.4)
+        b = fitting.canonical_ellipse(10.0, 40.0, 0.4 + np.pi / 2)
+        assert a[0] == pytest.approx(b[0])
+        assert a[1] == pytest.approx(b[1])
+        assert a[2] == pytest.approx(b[2])
+
+
+class TestImageAxisSigmas:
+    """Widths projected onto the sensor's own axes — what 1D mode reports."""
+
+    def test_unrotated_beam_passes_through(self):
+        sx, sy = fitting.image_axis_sigmas(30.0, 10.0, 0.0)
+        assert (sx, sy) == pytest.approx((30.0, 10.0))
+
+    def test_quarter_turn_swaps_them(self):
+        sx, sy = fitting.image_axis_sigmas(30.0, 10.0, np.pi / 2)
+        assert (sx, sy) == pytest.approx((10.0, 30.0))
+
+    def test_invariant_under_the_axis_swap(self):
+        """This is the property that makes the reported widths stable."""
+        a = fitting.image_axis_sigmas(90.0, 30.0, np.radians(35))
+        b = fitting.image_axis_sigmas(30.0, 90.0, np.radians(125))
+        assert a == pytest.approx(b)
+
+    def test_matches_what_the_1d_projection_fits_measure(self):
+        h = w = 512
+        y, x = np.mgrid[0:h, 0:w].astype(float)
+        sx, sy, theta = 60.0, 20.0, np.radians(35)
+        img = fitting.gaussian_2d((x, y), 200.0, 256.0, 256.0, sx, sy, theta, 0.0).reshape(h, w)
+
+        expected = fitting.image_axis_sigmas(sx, sy, theta)
+        measured = (
+            abs(fitting.fit_1d_gaussian(img.sum(axis=0))[2]),
+            abs(fitting.fit_1d_gaussian(img.sum(axis=1))[2]),
+        )
+        assert measured == pytest.approx(expected, rel=1e-3)
+
+    def test_a_round_beam_is_round_from_every_angle(self):
+        for theta in (0.0, 0.7, 1.9, 3.0):
+            sx, sy = fitting.image_axis_sigmas(25.0, 25.0, theta)
+            assert sx == pytest.approx(25.0)
+            assert sy == pytest.approx(25.0)
+
+
+class TestFitGridSizing:
+    """The fit runs on a decimated grid for speed, but a tightly focused beam
+    must not be decimated below the point where it can be resolved."""
+
+    @staticmethod
+    def _beam(sigma, h=1024, w=1024):
+        y, x = np.mgrid[0:h, 0:w].astype(float)
+        return fitting.gaussian_2d(
+            (x, y), 200.0, w / 2, h / 2, sigma * 1.5, sigma, 0.4, 5.0
+        ).reshape(h, w)
+
+    def test_a_large_beam_keeps_the_cheap_default_grid(self):
+        assert fitting._fit_grid_dim(self._beam(50.0), 128, 50.0) == 128
+
+    def test_a_small_beam_gets_a_bigger_grid(self):
+        assert fitting._fit_grid_dim(self._beam(6.0), 128, 6.0) > 128
+
+    def test_the_grid_never_exceeds_the_image(self):
+        img = self._beam(1.0)
+        assert fitting._fit_grid_dim(img, 128, 1.0) <= max(img.shape)
+
+    def test_no_hint_keeps_the_default(self):
+        img = self._beam(50.0)
+        assert fitting._fit_grid_dim(img, 128, None) == 128
+        assert fitting._fit_grid_dim(img, 128, 0.0) == 128
+
+    @pytest.mark.parametrize("sigma", [200.0, 50.0, 12.0, 6.0, 3.0])
+    def test_beams_of_every_size_still_fit(self, sigma):
+        """At a fixed 256-px grid a 3-px beam did not converge at all."""
+        popt, converged = fitting.fit_2d_gaussian(self._beam(sigma), None, sigma_hint=sigma)
+        assert converged
+        major, minor, _ = fitting.canonical_ellipse(popt[3], popt[4], popt[5])
+        assert major == pytest.approx(sigma * 1.5, rel=0.05)
+        assert minor == pytest.approx(sigma, rel=0.05)
+
+
+class TestFitEvaluationCap:
+    def test_the_bounded_solver_gets_a_real_cap(self):
+        """``maxfev`` is an lm-only name; the bounded path needs ``max_nfev``
+        or scipy silently falls back to its own 700-evaluation default."""
+        import inspect
+
+        from pybeamprofiler.constants import MAX_FIT_2D_EVALS
+
+        source = inspect.getsource(fitting.fit_2d_gaussian)
+        assert "max_nfev=MAX_FIT_2D_EVALS" in source
+        assert "maxfev" not in source.split("bounds=bounds")[1]
+        assert MAX_FIT_2D_EVALS > 0

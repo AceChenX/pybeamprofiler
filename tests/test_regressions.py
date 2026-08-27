@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import math
 import sys
+import time
 from unittest.mock import patch
 
 import numpy as np
@@ -578,7 +579,14 @@ class TestSimulatedProfiles:
             bp.analyze(cam.get_image())
 
         assert bp.angle_deg == pytest.approx(tilted.theta_deg, abs=5.0)
-        assert max(bp.width_x, bp.width_y) / min(bp.width_x, bp.width_y) > 2.0
+
+        # Elongation is a property of the *principal* axes. width_x/width_y
+        # are the widths projected onto the image axes, which for a 35-degree
+        # tilt are much closer together than the underlying 3:1 beam.
+        ellipse = bp.beam_ellipse()
+        assert ellipse is not None
+        _, _, rx, ry, _ = ellipse
+        assert max(rx, ry) / min(rx, ry) > 2.0
         cam.close()
 
     def test_node_map_reports_this_profile(self):
@@ -787,4 +795,101 @@ class TestSimulatedRotatedBeamFastPath:
         cam.open()
         cam.get_image()
         assert cam._frame_buf.dtype == np.float32
+        cam.close()
+
+
+class TestTwoDFittingStability:
+    """Switching the GUI to 2D Gaussian froze the display and made the
+    reported X/Y widths swap between frames. Two separate defects."""
+
+    @staticmethod
+    def _profiler(profile_index=0, seed=11):
+        from pybeamprofiler.simulated import SIMULATED_PROFILES, SimulatedCamera
+
+        cam = SimulatedCamera(SIMULATED_PROFILES[profile_index], seed=seed)
+        cam.open()
+        bp = BeamProfiler(camera="simulated", fit="2d")
+        bp.attach_camera(cam)
+        return bp, cam
+
+    def test_reported_widths_no_longer_swap(self):
+        """A near-round beam is the worst case: the two principal axes are
+        barely distinguishable, so the solver used to flip between the two
+        equivalent parameterisations and the X and Y widths exchanged
+        meaning. Projected widths are invariant to that flip.
+        """
+        bp, cam = self._profiler()
+        widths = []
+        for _ in range(12):
+            bp.analyze(cam.get_image())
+            widths.append((bp.width_x, bp.width_y))
+
+        # The simulated beam is 50x45, so X is genuinely the wider axis. With
+        # the swap present this was near a coin flip.
+        wider = sum(1 for wx, wy in widths if wx > wy)
+        assert wider >= 8, f"X was wider in only {wider}/12 frames"
+        cam.close()
+
+    @pytest.mark.parametrize("profile_index", [0, 1])
+    def test_2d_widths_agree_with_1d_on_the_same_frame(self, profile_index):
+        """Both modes report widths along the image axes, so they must agree.
+
+        2D used to report the *principal* axis sigmas, which for the tilted
+        profile differ from the projected widths by about 30%.
+        """
+        bp2, cam = self._profiler(profile_index, seed=4)
+        for _ in range(3):
+            cam.get_image()
+        img = cam.get_image()
+        for _ in range(3):  # let the warm-started fit settle
+            bp2.analyze(img)
+
+        bp1 = BeamProfiler(camera="simulated", fit="1d")
+        bp1.pixel_size = bp2.pixel_size
+        bp1.analyze(img)
+
+        assert bp2.width_x == pytest.approx(bp1.width_x, rel=0.05)
+        assert bp2.width_y == pytest.approx(bp1.width_y, rel=0.05)
+        cam.close()
+        assert bp1.camera is not None
+        bp1.camera.close()
+
+    def test_the_fit_grid_is_small_enough_to_keep_the_tick_in_budget(self):
+        """At the old 256-px grid a single 2D fit cost more than the 50 ms
+        render interval, so the GUI could not keep up and appeared to hang.
+        """
+        from pybeamprofiler.constants import DEFAULT_UPDATE_INTERVAL_MS, MAX_FIT_2D_DIM
+
+        assert MAX_FIT_2D_DIM <= 128
+
+        bp, cam = self._profiler(seed=2)
+        img = cam.get_image()
+        for _ in range(3):
+            bp.analyze(img)
+
+        start = time.perf_counter()
+        for _ in range(10):
+            bp.analyze(img)
+        per_frame_ms = (time.perf_counter() - start) / 10 * 1000
+
+        # Generous headroom over the measured ~4 ms so this is a guard against
+        # a return to tens of milliseconds, not a benchmark.
+        assert per_frame_ms < DEFAULT_UPDATE_INTERVAL_MS / 2
+        cam.close()
+
+    def test_the_ellipse_still_uses_the_principal_axes(self):
+        """Widths are projected, but the drawn ellipse must not be."""
+        from pybeamprofiler.simulated import SIMULATED_PROFILES
+
+        tilted_index = next(i for i, p in enumerate(SIMULATED_PROFILES) if p.theta_deg)
+        bp, cam = self._profiler(tilted_index, seed=5)
+        for _ in range(4):
+            bp.analyze(cam.get_image())
+
+        ellipse = bp.beam_ellipse()
+        assert ellipse is not None
+        _, _, rx, ry, _ = ellipse
+        # 3:1 principal axes, versus a projected ratio nearer 1.3.
+        assert max(rx, ry) / min(rx, ry) > 2.0
+        assert max(bp.width_x, bp.width_y) / min(bp.width_x, bp.width_y) < 2.0
         cam.close()

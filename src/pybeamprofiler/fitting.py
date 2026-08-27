@@ -22,7 +22,12 @@ import numpy as np
 from scipy.ndimage import zoom as _ndimage_zoom
 from scipy.optimize import curve_fit
 
-from .constants import MAX_FIT_2D_DIM, MAX_FIT_ITERATIONS
+from .constants import (
+    MAX_FIT_2D_DIM,
+    MAX_FIT_2D_EVALS,
+    MAX_FIT_ITERATIONS,
+    MIN_FIT_2D_SIGMA_PX,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -235,10 +240,78 @@ def fit_1d_gaussian(
     return np.asarray(p0, dtype=float)  # pragma: no cover - loop always returns
 
 
+def canonical_ellipse(sigma_x: float, sigma_y: float, theta: float) -> tuple[float, float, float]:
+    """Put a fitted ellipse into a single, stable parameterisation.
+
+    The rotated 2D Gaussian is degenerate: ``(sx, sy, theta)`` and
+    ``(sy, sx, theta + 90 deg)`` describe exactly the same ellipse, and the
+    solver picks between them arbitrarily. Left alone, that makes consecutive
+    frames of a near-circular beam flip between the two -- the reported X and
+    Y widths swap, the angle jumps by 90 degrees, and the warm start for the
+    next frame is half a rotation away from where the last one landed.
+
+    Args:
+        sigma_x: First principal-axis sigma (may be negative; the model is
+            even in sigma).
+        sigma_y: Second principal-axis sigma.
+        theta: Rotation in radians.
+
+    Returns:
+        ``(major, minor, theta)`` with ``major >= minor >= 0`` and *theta*
+        wrapped into ``[0, pi)``, so *theta* is always the orientation of the
+        major axis.
+    """
+    sigma_x, sigma_y = abs(float(sigma_x)), abs(float(sigma_y))
+    if sigma_y > sigma_x:
+        sigma_x, sigma_y = sigma_y, sigma_x
+        theta += np.pi / 2
+    return sigma_x, sigma_y, float(theta % np.pi)
+
+
+def image_axis_sigmas(sigma_x: float, sigma_y: float, theta: float) -> tuple[float, float]:
+    """Project a tilted ellipse onto the image axes.
+
+    Returns the sigmas an observer measures along the sensor's own x and y —
+    the same quantities the 1D projection fits report, so ``fit='2d'`` and
+    ``fit='1d'`` describe widths in the same terms.
+
+    These are also invariant under the axis-swap degeneracy that
+    :func:`canonical_ellipse` resolves, which is what makes them stable to
+    display frame to frame.
+
+    Args:
+        sigma_x: Principal-axis sigma along *theta*.
+        sigma_y: Principal-axis sigma across it.
+        theta: Rotation in radians.
+
+    Returns:
+        ``(sigma_along_image_x, sigma_along_image_y)``.
+    """
+    cos2 = np.cos(theta) ** 2
+    sin2 = np.sin(theta) ** 2
+    vx, vy = sigma_x * sigma_x, sigma_y * sigma_y
+    return float(np.sqrt(vx * cos2 + vy * sin2)), float(np.sqrt(vx * sin2 + vy * cos2))
+
+
+def _fit_grid_dim(image: np.ndarray, max_dim: int, sigma_hint: float | None) -> int:
+    """Longest edge to fit on, raised if the beam would be under-resolved.
+
+    Decimating a tightly focused beam below about a pixel of sigma makes the
+    fit unreliable and then non-convergent, so a small beam gets a bigger
+    grid rather than a blind fit. Everything else keeps the cheap default.
+    """
+    longest = max(image.shape)
+    if not sigma_hint or sigma_hint <= 0:
+        return max_dim
+    needed = MIN_FIT_2D_SIGMA_PX / sigma_hint * longest
+    return int(min(longest, max(max_dim, np.ceil(needed))))
+
+
 def fit_2d_gaussian(
     image: np.ndarray,
     last_popt: np.ndarray | list[Any] | None = None,
     max_dim: int = MAX_FIT_2D_DIM,
+    sigma_hint: float | None = None,
 ) -> tuple[np.ndarray | list[Any], bool]:
     """Fit a rotated 2D Gaussian to *image*.
 
@@ -251,13 +324,18 @@ def fit_2d_gaussian(
         last_popt: Previous fit parameters (full-resolution coordinates) to
             warm-start from, or ``None`` for a cold start.
         max_dim: Longest edge the fit is allowed to see.
+        sigma_hint: Rough smaller beam sigma in pixels, if known. Used only to
+            raise the grid for a beam too small to survive decimation.
 
     Returns:
-        ``([amplitude, x0, y0, sigma_x, sigma_y, theta, offset], converged)``.
-        When *converged* is ``False`` the parameters are the initial guess and
-        the caller should not cache them as a warm start.
+        ``([amplitude, x0, y0, sigma_x, sigma_y, theta, offset], converged)``,
+        in the canonical form of :func:`canonical_ellipse` so that consecutive
+        frames stay comparable. When *converged* is ``False`` the parameters
+        are the initial guess and the caller should not cache them as a warm
+        start.
     """
     h, w = image.shape
+    max_dim = _fit_grid_dim(image, max_dim, sigma_hint)
 
     if max(h, w) > max_dim:
         ds = max_dim / max(h, w)
@@ -286,6 +364,9 @@ def fit_2d_gaussian(
     xv, yv = np.meshgrid(x, y)
     xy_flat = (xv.ravel(), yv.ravel())
     data_flat = fit_img.ravel()
+    # NB: the bounded solver is least_squares, which takes ``max_nfev``.
+    # ``maxfev`` is an lm-only name, silently ignored once bounds are given,
+    # which left scipy's own 100-per-parameter (700) default in place.
     lower = [0, 0, 0, 0.1, 0.1, -np.pi, -np.inf]
     upper = [np.inf, fw, fh, fw, fh, np.pi, np.inf]
     bounds = (lower, upper)
@@ -323,7 +404,7 @@ def fit_2d_gaussian(
                     data_flat,
                     p0=p0_bounded,
                     bounds=bounds,
-                    maxfev=MAX_FIT_ITERATIONS,
+                    max_nfev=MAX_FIT_2D_EVALS,
                 )
         else:
             popt, _ = curve_fit(
@@ -332,12 +413,13 @@ def fit_2d_gaussian(
                 data_flat,
                 p0=p0,
                 bounds=bounds,
-                maxfev=MAX_FIT_ITERATIONS,
+                max_nfev=MAX_FIT_2D_EVALS,
             )
 
+        popt = np.asarray(popt, dtype=float)
         if inv_ds != 1.0:
-            popt = np.asarray(popt, dtype=float)
             popt[1:5] *= inv_ds
+        popt[3], popt[4], popt[5] = canonical_ellipse(popt[3], popt[4], popt[5])
         return popt, True
 
     except _FIT_ERRORS as e:

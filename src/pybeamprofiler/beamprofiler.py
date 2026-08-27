@@ -341,7 +341,9 @@ class BeamProfiler:
 
     _MAX_FIT_2D_DIM = MAX_FIT_2D_DIM
 
-    def _fit_2d_gaussian(self, image: np.ndarray) -> np.ndarray | list[Any]:
+    def _fit_2d_gaussian(
+        self, image: np.ndarray, sigma_hint: float | None = None
+    ) -> np.ndarray | list[Any]:
         """Fit a rotated 2D Gaussian, warm-starting from the previous frame.
 
         Only converged parameters are cached as the next warm start — a failed
@@ -350,12 +352,14 @@ class BeamProfiler:
 
         Args:
             image: 2D intensity array.
+            sigma_hint: Rough beam sigma in pixels, used to keep a small beam
+                from being decimated below the fit's resolution.
 
         Returns:
             ``[amplitude, x0, y0, sigma_x, sigma_y, theta, offset]``.
         """
         popt, converged = fitting.fit_2d_gaussian(
-            image, self._last_popt_2d, max_dim=self._MAX_FIT_2D_DIM
+            image, self._last_popt_2d, max_dim=self._MAX_FIT_2D_DIM, sigma_hint=sigma_hint
         )
         if converged:
             self._last_popt_2d = popt
@@ -483,14 +487,26 @@ class BeamProfiler:
             return popt_x, popt_y
 
         if self.fit_method == "2d":
-            _, x0, y0, sigma_x, sigma_y, theta, _ = self._fit_2d_gaussian(image)
-            self._update_widths(abs(sigma_x), abs(sigma_y))
+            # Integrate first: the projections both feed the profile plots and
+            # give the fit a cheap estimate of how big the beam is, which is
+            # what decides whether the default (decimated) fit grid can still
+            # resolve it.
+            proj_x, proj_y = self._integrate(image)
+            _, width_hint = fitting.measure_d4s(proj_y)
+            popt = self._fit_2d_gaussian(image, sigma_hint=width_hint / D4SIGMA_FACTOR)
+            _, x0, y0, sigma_x, sigma_y, theta, _ = popt
+
+            # Report widths along the *image* axes, as 1D mode does. The
+            # principal-axis sigmas cannot be used directly: (sx, sy, theta)
+            # and (sy, sx, theta+90) are the same ellipse, so on a near-round
+            # beam the solver flips between them and the reported X and Y
+            # widths would swap from frame to frame. The projected widths are
+            # invariant to that.
+            self._update_widths(*fitting.image_axis_sigmas(sigma_x, sigma_y, theta))
             self.center_x, self.center_y = x0, y0
-            # The fit can't tell a beam from the same beam turned 180°, so
-            # wrap into [0, 180) for a stable readout.
-            self.angle_deg = np.degrees(theta) % 180
-            # The 2D fit owns the width; these are purely for the profile plots.
-            return self._fit_projections(*self._integrate(image))
+            # theta is canonicalised to the major axis in [0, pi).
+            self.angle_deg = float(np.degrees(theta) % 180)
+            return self._fit_projections(proj_x, proj_y)
 
         popt_x, popt_y = self._fit_projections(*self._integrate(image))
         self._update_widths(abs(popt_x[2]), abs(popt_y[2]))
