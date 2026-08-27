@@ -7,7 +7,9 @@ bare assertion.
 
 from __future__ import annotations
 
+import math
 import sys
+import time
 from unittest.mock import patch
 
 import numpy as np
@@ -499,3 +501,395 @@ class TestFeatureDiscoveryCache:
         a._discover_features()
         assert b._feature_cache is None
         a.close()
+
+
+class TestSimulatedProfiles:
+    """Multiple simulated cameras exist so the selector can be exercised
+    without hardware. Each must behave like its own device."""
+
+    def test_default_matches_the_historical_constants(self):
+        """``SimulatedCamera()`` with no argument must not have changed."""
+        from pybeamprofiler import constants
+        from pybeamprofiler.simulated import SimulatedCamera
+
+        cam = SimulatedCamera()
+        assert (cam.width, cam.height) == (constants.SIMULATED_WIDTH, constants.SIMULATED_HEIGHT)
+        assert cam.pixel_size == constants.SIMULATED_PIXEL_SIZE
+        assert cam._sigma_x == constants.SIMULATED_SIGMA_X
+        assert cam._sigma_y == constants.SIMULATED_SIGMA_Y
+        cam.close()
+
+    @pytest.mark.parametrize("profile_index", [0, 1])
+    def test_frame_shape_follows_the_profile(self, profile_index):
+        from pybeamprofiler.simulated import SIMULATED_PROFILES, SimulatedCamera
+
+        profile = SIMULATED_PROFILES[profile_index]
+        cam = SimulatedCamera(profile)
+        cam.open()
+        assert cam.get_image().shape == (profile.height, profile.width)
+        cam.close()
+
+    @pytest.mark.parametrize("profile_index", [0, 1])
+    def test_roi_still_crops_correctly(self, profile_index):
+        """The frame is rendered at full sensor size and then cropped.
+
+        ``width``/``height`` track the ROI while the render buffer stays at
+        sensor size — mixing the two up broadcasts a full-sensor noise array
+        against an ROI-sized buffer and raises.
+        """
+        from pybeamprofiler.simulated import SIMULATED_PROFILES, SimulatedCamera
+
+        cam = SimulatedCamera(SIMULATED_PROFILES[profile_index])
+        cam.open()
+        cam.set_roi(offset_x=10, offset_y=20, width=64, height=48)
+
+        img = cam.get_image()
+        assert img.shape == (48, 64)
+        assert img.shape == (cam.height_pixels, cam.width_pixels)
+        cam.close()
+
+    @pytest.mark.parametrize("profile_index", [0, 1])
+    def test_roi_clamps_to_this_profile_sensor(self, profile_index):
+        from pybeamprofiler.simulated import SIMULATED_PROFILES, SimulatedCamera
+
+        profile = SIMULATED_PROFILES[profile_index]
+        cam = SimulatedCamera(profile)
+        cam.open()
+        cam.set_roi(offset_x=0, offset_y=0, width=99_999, height=99_999)
+
+        assert cam.roi_info["max_width"] == profile.width
+        assert cam.roi_info["max_height"] == profile.height
+        assert cam.get_image().shape == (profile.height, profile.width)
+        cam.close()
+
+    def test_tilted_profile_produces_a_rotated_beam(self):
+        """The 2D fit must recover the tilt the profile asked for."""
+        from pybeamprofiler.simulated import SIMULATED_PROFILES, SimulatedCamera
+
+        tilted = next(p for p in SIMULATED_PROFILES if p.theta_deg)
+        # Seeded: the simulator jitters sigma by +/-7 px, which on the 30 px
+        # axis is enough to round the ellipse out and throw the fitted angle
+        # off often enough to make an unseeded assertion flaky.
+        cam = SimulatedCamera(tilted, seed=20260827)
+        cam.open()
+
+        bp = BeamProfiler(camera="simulated", fit="2d")
+        bp.attach_camera(cam)
+        for _ in range(4):  # let the warm-started fit settle
+            bp.analyze(cam.get_image())
+
+        assert bp.angle_deg == pytest.approx(tilted.theta_deg, abs=5.0)
+
+        # Elongation is a property of the *principal* axes. width_x/width_y
+        # are the widths projected onto the image axes, which for a 35-degree
+        # tilt are much closer together than the underlying 3:1 beam.
+        ellipse = bp.beam_ellipse()
+        assert ellipse is not None
+        _, _, rx, ry, _ = ellipse
+        assert max(rx, ry) / min(rx, ry) > 2.0
+        cam.close()
+
+    def test_node_map_reports_this_profile(self):
+        from pybeamprofiler.simulated import SIMULATED_PROFILES, SimulatedCamera
+
+        profile = SIMULATED_PROFILES[1]
+        cam = SimulatedCamera(profile)
+        cam.open()
+        nm = cam.node_map
+        assert nm is not None
+        assert nm.DeviceModelName.value == profile.name
+        assert nm.DeviceSerialNumber.value == profile.serial_number
+        assert nm.WidthMax.value == profile.width
+        assert nm.HeightMax.value == profile.height
+        cam.close()
+
+    def test_profiles_have_unique_keys_and_serials(self):
+        from pybeamprofiler.simulated import SIMULATED_PROFILES
+
+        assert len({p.key for p in SIMULATED_PROFILES}) == len(SIMULATED_PROFILES)
+        assert len({p.serial_number for p in SIMULATED_PROFILES}) == len(SIMULATED_PROFILES)
+
+
+class TestNonMonoPayloads:
+    """A camera left in a colour pixel format used to raise "cannot reshape
+    array of size N" out of get_image()."""
+
+    @staticmethod
+    def _component(height, width, channels=1, fmt="Mono8"):
+        from unittest.mock import MagicMock
+
+        c = MagicMock()
+        c.height, c.width = height, width
+        c.data = np.arange(height * width * channels, dtype=np.uint8)
+        c.data_format = fmt
+        return c
+
+    def test_mono_is_reshaped(self):
+        from pybeamprofiler.gen_camera import _to_mono
+
+        img = _to_mono(self._component(3, 5))
+        assert img.shape == (3, 5)
+        assert img.dtype == np.uint8
+
+    def test_mono_result_is_a_copy(self):
+        """The producer reuses the payload buffer once fetch() exits."""
+        from pybeamprofiler.gen_camera import _to_mono
+
+        component = self._component(2, 2)
+        img = _to_mono(component)
+        component.data[:] = 99
+        assert not np.array_equal(img, component.data.reshape(2, 2))
+
+    @pytest.mark.parametrize(("channels", "fmt"), [(3, "RGB8"), (4, "BGRa8")])
+    def test_colour_is_collapsed_to_one_plane(self, channels, fmt):
+        from pybeamprofiler.gen_camera import _to_mono
+
+        img = _to_mono(self._component(4, 6, channels, fmt))
+        assert img.shape == (4, 6)
+
+    def test_rgb_uses_luminance_weights(self):
+        from unittest.mock import MagicMock
+
+        from pybeamprofiler.gen_camera import _to_mono
+
+        component = MagicMock()
+        component.height, component.width = 1, 1
+        component.data_format = "RGB8"
+        component.data = np.array([10, 200, 30], dtype=np.uint8)
+        expected = int(0.299 * 10 + 0.587 * 200 + 0.114 * 30)
+        assert int(_to_mono(component)[0, 0]) == expected
+
+    def test_packed_format_is_rejected_with_a_useful_message(self):
+        from unittest.mock import MagicMock
+
+        from pybeamprofiler.gen_camera import _to_mono
+
+        component = MagicMock()
+        component.height, component.width = 2, 4
+        component.data_format = "Mono12p"
+        component.data = np.zeros(12, dtype=np.uint8)  # 1.5 bytes/px
+        with pytest.raises(ValueError, match="Mono10p/Mono12p"):
+            _to_mono(component)
+
+    def test_zero_sized_frame_is_rejected(self):
+        from pybeamprofiler.gen_camera import _to_mono
+
+        with pytest.raises(ValueError, match="zero-sized"):
+            _to_mono(self._component(0, 0))
+
+
+class TestExposureSliderRange:
+    """A producer reporting a zero minimum exposure crashed the Jupyter panel
+    with "math domain error" from log10(0)."""
+
+    def test_zero_minimum_does_not_raise(self):
+        from unittest.mock import patch
+
+        from pybeamprofiler.simulated import SimulatedCamera
+
+        cam = SimulatedCamera()
+        cam.open()
+        cam._exposure_min = 0.0
+        with patch("IPython.display.display"):
+            cam.setting()  # must not raise
+        cam.close()
+
+    def test_degenerate_range_does_not_raise(self):
+        from unittest.mock import patch
+
+        from pybeamprofiler.simulated import SimulatedCamera
+
+        cam = SimulatedCamera()
+        cam.open()
+        cam._exposure_min = cam._exposure_max = 0.0
+        with patch("IPython.display.display"):
+            cam.setting()
+        cam.close()
+
+
+class TestSimulatedRotatedBeamFastPath:
+    """The tilted profile builds its frame with in-place numpy on
+    pre-rotated grids rather than calling the generic ``gaussian_2d``.
+
+    That is a hot loop, so it is worth being fast — but only if it computes
+    exactly the same thing, which is what these check.
+    """
+
+    @staticmethod
+    def _quiet_camera(profile):
+        """A camera with all frame-to-frame jitter disabled."""
+        from pybeamprofiler.simulated import SimulatedCamera
+
+        cam = SimulatedCamera(profile)
+        cam.open()
+        for attr in (
+            "_noise_center",
+            "_noise_sigma_frac",
+            "_noise_amp",
+            "_noise_bg",
+            "_noise_image",
+        ):
+            setattr(cam, attr, 0.0)
+        return cam
+
+    def test_matches_the_reference_model(self):
+        from pybeamprofiler.fitting import gaussian_2d
+        from pybeamprofiler.simulated import SIMULATED_PROFILES
+
+        profile = next(p for p in SIMULATED_PROFILES if p.theta_deg)
+        cam = self._quiet_camera(profile)
+        got = cam.get_image().astype(np.float64)
+
+        h, w = profile.height, profile.width
+        y, x = np.mgrid[0:h, 0:w].astype(np.float64)
+        expected = np.clip(
+            gaussian_2d(
+                (x, y),
+                cam._amplitude,
+                w / 2,
+                h / 2,
+                profile.sigma_x,
+                profile.sigma_y,
+                math.radians(profile.theta_deg),
+                cam._background,
+            ).reshape(h, w),
+            0,
+            255,
+        )
+
+        # uint8 output quantises, so allow one count.
+        assert np.abs(got - expected).max() <= 1.001
+        cam.close()
+
+    def test_rotation_sense_matches_the_fitted_angle(self):
+        """A sign slip in the rotation would still look elliptical, so check
+        the angle the 2D fit actually recovers."""
+        from pybeamprofiler.simulated import SIMULATED_PROFILES
+
+        profile = next(p for p in SIMULATED_PROFILES if p.theta_deg)
+        cam = self._quiet_camera(profile)
+
+        bp = BeamProfiler(camera="simulated", fit="2d")
+        bp.attach_camera(cam)
+        for _ in range(3):
+            bp.analyze(cam.get_image())
+
+        assert bp.angle_deg == pytest.approx(profile.theta_deg, abs=2.0)
+        cam.close()
+
+    def test_untilted_profile_uses_the_separable_path(self):
+        from pybeamprofiler.simulated import SIMULATED_PROFILES, SimulatedCamera
+
+        flat = next(p for p in SIMULATED_PROFILES if not p.theta_deg)
+        cam = SimulatedCamera(flat)
+        assert cam._rot is None, "an untilted beam should not build rotated grids"
+        assert cam._scratch is None
+        cam.close()
+
+    def test_noise_is_generated_in_single_precision(self):
+        """float64 noise would double the allocation and need a full-frame
+        cast on every frame."""
+        from pybeamprofiler.simulated import SimulatedCamera
+
+        cam = SimulatedCamera()
+        cam.open()
+        cam.get_image()
+        assert cam._frame_buf.dtype == np.float32
+        cam.close()
+
+
+class TestTwoDFittingStability:
+    """Switching the GUI to 2D Gaussian froze the display and made the
+    reported X/Y widths swap between frames. Two separate defects."""
+
+    @staticmethod
+    def _profiler(profile_index=0, seed=11):
+        from pybeamprofiler.simulated import SIMULATED_PROFILES, SimulatedCamera
+
+        cam = SimulatedCamera(SIMULATED_PROFILES[profile_index], seed=seed)
+        cam.open()
+        bp = BeamProfiler(camera="simulated", fit="2d")
+        bp.attach_camera(cam)
+        return bp, cam
+
+    def test_reported_widths_no_longer_swap(self):
+        """A near-round beam is the worst case: the two principal axes are
+        barely distinguishable, so the solver used to flip between the two
+        equivalent parameterisations and the X and Y widths exchanged
+        meaning. Projected widths are invariant to that flip.
+        """
+        bp, cam = self._profiler()
+        widths = []
+        for _ in range(12):
+            bp.analyze(cam.get_image())
+            widths.append((bp.width_x, bp.width_y))
+
+        # The simulated beam is 50x45, so X is genuinely the wider axis. With
+        # the swap present this was near a coin flip.
+        wider = sum(1 for wx, wy in widths if wx > wy)
+        assert wider >= 8, f"X was wider in only {wider}/12 frames"
+        cam.close()
+
+    @pytest.mark.parametrize("profile_index", [0, 1])
+    def test_2d_widths_agree_with_1d_on_the_same_frame(self, profile_index):
+        """Both modes report widths along the image axes, so they must agree.
+
+        2D used to report the *principal* axis sigmas, which for the tilted
+        profile differ from the projected widths by about 30%.
+        """
+        bp2, cam = self._profiler(profile_index, seed=4)
+        for _ in range(3):
+            cam.get_image()
+        img = cam.get_image()
+        for _ in range(3):  # let the warm-started fit settle
+            bp2.analyze(img)
+
+        bp1 = BeamProfiler(camera="simulated", fit="1d")
+        bp1.pixel_size = bp2.pixel_size
+        bp1.analyze(img)
+
+        assert bp2.width_x == pytest.approx(bp1.width_x, rel=0.05)
+        assert bp2.width_y == pytest.approx(bp1.width_y, rel=0.05)
+        cam.close()
+        assert bp1.camera is not None
+        bp1.camera.close()
+
+    def test_the_fit_grid_is_small_enough_to_keep_the_tick_in_budget(self):
+        """At the old 256-px grid a single 2D fit cost more than the 50 ms
+        render interval, so the GUI could not keep up and appeared to hang.
+        """
+        from pybeamprofiler.constants import DEFAULT_UPDATE_INTERVAL_MS, MAX_FIT_2D_DIM
+
+        assert MAX_FIT_2D_DIM <= 128
+
+        bp, cam = self._profiler(seed=2)
+        img = cam.get_image()
+        for _ in range(3):
+            bp.analyze(img)
+
+        start = time.perf_counter()
+        for _ in range(10):
+            bp.analyze(img)
+        per_frame_ms = (time.perf_counter() - start) / 10 * 1000
+
+        # Generous headroom over the measured ~4 ms so this is a guard against
+        # a return to tens of milliseconds, not a benchmark.
+        assert per_frame_ms < DEFAULT_UPDATE_INTERVAL_MS / 2
+        cam.close()
+
+    def test_the_ellipse_still_uses_the_principal_axes(self):
+        """Widths are projected, but the drawn ellipse must not be."""
+        from pybeamprofiler.simulated import SIMULATED_PROFILES
+
+        tilted_index = next(i for i, p in enumerate(SIMULATED_PROFILES) if p.theta_deg)
+        bp, cam = self._profiler(tilted_index, seed=5)
+        for _ in range(4):
+            bp.analyze(cam.get_image())
+
+        ellipse = bp.beam_ellipse()
+        assert ellipse is not None
+        _, _, rx, ry, _ = ellipse
+        # 3:1 principal axes, versus a projected ratio nearer 1.3.
+        assert max(rx, ry) / min(rx, ry) > 2.0
+        assert max(bp.width_x, bp.width_y) / min(bp.width_x, bp.width_y) < 2.0
+        cam.close()

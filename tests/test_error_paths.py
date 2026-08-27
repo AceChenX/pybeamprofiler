@@ -78,7 +78,9 @@ class TestStaticImageEdgeCases:
 class TestInitGuards:
     def test_no_camera_and_no_file_is_an_error(self):
         """If camera setup silently yields nothing, say so rather than limp on."""
-        with patch.object(BeamProfiler, "_initialize_camera", lambda self, camera: None):
+        with patch.object(
+            BeamProfiler, "_initialize_camera", lambda self, camera, serial=None: None
+        ):
             with pytest.raises(ValueError, match="Either camera or file"):
                 BeamProfiler(camera="simulated")
 

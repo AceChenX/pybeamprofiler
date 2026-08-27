@@ -4,6 +4,7 @@ from unittest.mock import MagicMock, Mock, patch
 
 import numpy as np
 import pytest
+from conftest import requires_harvesters
 
 
 class TestHarvesterCamera:
@@ -199,7 +200,7 @@ class TestCameraUtils:
 
         # Mock harvesters module for testing without hardware dependency
         with patch.dict(sys.modules, {"harvesters": mock_harvesters, "harvesters.core": mock_core}):
-            with patch("pybeamprofiler.utils.find_cti_files", return_value=["/fake/path.cti"]):
+            with patch("pybeamprofiler.discovery.find_cti_files", return_value=["/fake/path.cti"]):
                 cameras = list_cameras()
 
                 assert len(cameras) == 1
@@ -292,6 +293,7 @@ class TestHarvesterCameraErrors:
             assert "not found" in str(e)
 
 
+@requires_harvesters
 class TestHarvesterCameraGetImage:
     """Test get_image auto-start and timeout wrapping."""
 

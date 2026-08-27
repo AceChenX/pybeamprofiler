@@ -4,9 +4,16 @@ from .basler import BaslerCamera
 from .beamprofiler import BeamProfiler
 from .camera import Camera
 from .dash_app import create_app
+from .discovery import (
+    CameraOption,
+    discover_cameras,
+    find_cti_files,
+    list_cameras,
+    open_camera,
+    print_camera_info,
+)
 from .flir import FlirCamera
 from .simulated import SimulatedCamera
-from .utils import find_cti_files, list_cameras, print_camera_info
 
 __version__ = "0.3.0"
 
@@ -20,5 +27,8 @@ __all__ = [
     "list_cameras",
     "print_camera_info",
     "find_cti_files",
+    "discover_cameras",
+    "open_camera",
+    "CameraOption",
     "__version__",
 ]

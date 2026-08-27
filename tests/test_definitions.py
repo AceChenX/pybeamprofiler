@@ -41,7 +41,7 @@ class TestFWHMDefinition:
         assert bp.camera is not None
         # Remove simulation noise for tight bounds
         setattr(bp.camera, "_noise_center", 0.0)
-        setattr(bp.camera, "_noise_sigma", 0.0)
+        setattr(bp.camera, "_noise_sigma_frac", 0.0)
         setattr(bp.camera, "_noise_amp", 0.0)
         setattr(bp.camera, "_noise_bg", 0.0)
         setattr(bp.camera, "_noise_image", 0.0)
@@ -71,7 +71,7 @@ class TestD4SigmaDefinition:
         assert bp.camera is not None
         # Remove simulation noise for tight bounds
         setattr(bp.camera, "_noise_center", 0.0)
-        setattr(bp.camera, "_noise_sigma", 0.0)
+        setattr(bp.camera, "_noise_sigma_frac", 0.0)
         setattr(bp.camera, "_noise_amp", 0.0)
         setattr(bp.camera, "_noise_bg", 0.0)
         setattr(bp.camera, "_noise_image", 0.0)
@@ -226,7 +226,7 @@ class TestWidthDefinitions:
         bp = BeamProfiler(camera="simulated", fit="1d", definition="fwhm")
         assert bp.camera is not None
         setattr(bp.camera, "_noise_center", 0.0)
-        setattr(bp.camera, "_noise_sigma", 0.0)
+        setattr(bp.camera, "_noise_sigma_frac", 0.0)
         setattr(bp.camera, "_noise_amp", 0.0)
         setattr(bp.camera, "_noise_bg", 0.0)
         setattr(bp.camera, "_noise_image", 0.0)
@@ -255,7 +255,7 @@ class TestWidthDefinitions:
         for bp_inst in [bp_gaussian, bp_fwhm, bp_d4s]:
             for attr in [
                 "_noise_center",
-                "_noise_sigma",
+                "_noise_sigma_frac",
                 "_noise_amp",
                 "_noise_bg",
                 "_noise_image",

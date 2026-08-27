@@ -69,14 +69,18 @@ override-dependencies = [
 
 [project.optional-dependencies]
 test = [
-    "pytest>=9.0",
-    "pytest-cov>=7.0",
+    "pytest>=9.1",
+    "pytest-cov>=7.1",
+    # Used by tests/test_headless_app.py to drive a real Dash server over
+    # HTTP. It arrives transitively today, but relying on that would leave
+    # the end-to-end tests at the mercy of an unrelated resolution change.
+    "requests>=2.32",
 ]
 dev = [
     "pybeamprofiler[test]",
-    "ruff>=0.15",
-    "ty>=0.0.30",
-    "pre-commit>=4.5",
+    "ruff>=0.16",
+    "ty>=0.0.75",
+    "pre-commit>=4.6",
 ]
 matplotlib = [
     "matplotlib>=3.10",  # Optional fallback for command-line streaming
@@ -88,6 +92,9 @@ python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
 addopts = "-v --cov=pybeamprofiler --cov-report=term-missing"
+markers = [
+    "real_cti: exercise the real GenTL search tables instead of the hermetic blank ones",
+]
 
 [tool.ruff]
 target-version = "py310"

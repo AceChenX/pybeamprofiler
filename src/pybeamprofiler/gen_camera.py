@@ -1,4 +1,16 @@
-"""GenICam camera wrapper using Harvesters library."""
+"""GenICam cameras, driven through Harvesters.
+
+:class:`HarvesterCamera` is the workhorse behind every real device: FLIR and
+Basler differ only in where their GenTL producer lives, which
+:mod:`pybeamprofiler.cti` already handles, so both vendor classes are thin
+subclasses.
+
+Two things here exist because of how the underlying C library behaves rather
+than because the GenICam standard asks for them: acquisition is restarted
+after an exposure change so the producer's buffer ring cannot deliver
+stale-exposure frames, and a silent producer is given one stop/start
+recovery attempt before the caller is left waiting forever.
+"""
 
 from __future__ import annotations
 
@@ -18,6 +30,7 @@ except ImportError:
     _HarvestersTimeout = None  # ty:ignore[invalid-assignment]
 
 from .camera import Camera
+from .cti import parse_gentl_path
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +69,56 @@ SENSOR_PIXEL_SIZES: dict[str, float] = {
     "acA2440-75um": 3.45,
     "acA3800-14um": 1.85,
 }
+
+
+def _to_mono(component: Any) -> np.ndarray:
+    """Reshape one payload component into a 2D intensity array.
+
+    Mono formats arrive as exactly ``height * width`` samples and only need a
+    reshape. Colour formats (RGB8, BGR8, YUV...) carry several samples per
+    pixel; a beam profiler wants one intensity per pixel, so those are
+    collapsed with the usual luminance weights for three channels and a plain
+    mean otherwise. Blindly reshaping them — which is what this used to do —
+    raises "cannot reshape array of size N" the moment a camera is left in a
+    colour pixel format.
+
+    Packed mono formats (Mono10p, Mono12p) do not have a whole number of
+    samples per pixel and are rejected with a message that says so, rather
+    than producing a silently corrupt image.
+
+    Args:
+        component: A Harvesters ``Component2DImage``.
+
+    Returns:
+        A fresh 2D array; the payload buffer is reused by the producer as soon
+        as the ``fetch`` context exits, so the copy is not optional.
+
+    Raises:
+        ValueError: If the payload size is not a whole multiple of the frame.
+    """
+    height, width = component.height, component.width
+    data = component.data
+    pixels = height * width
+    if pixels == 0:
+        raise ValueError("Camera reported a zero-sized frame")
+
+    if data.size == pixels:
+        return data.reshape(height, width).copy()
+
+    channels, remainder = divmod(data.size, pixels)
+    if remainder or channels < 1:
+        fmt = getattr(component, "data_format", "unknown")
+        raise ValueError(
+            f"Cannot interpret a {data.size}-sample payload as a "
+            f"{width}x{height} frame (pixel format {fmt!r}). Packed formats "
+            "such as Mono10p/Mono12p are not supported; select Mono8, Mono12 "
+            "or Mono16 on the camera."
+        )
+
+    planes = data.reshape(height, width, channels)
+    if channels == 3:
+        return (planes.astype(np.float64) @ [0.299, 0.587, 0.114]).astype(data.dtype)
+    return planes.mean(axis=2).astype(data.dtype)
 
 
 class HarvesterCamera(Camera):
@@ -132,38 +195,24 @@ class HarvesterCamera(Camera):
 
     @staticmethod
     def _parse_gentl_path(gentl_path: str) -> str | list[str] | None:
-        """Parse GENICAM_GENTL64_PATH environment variable.
+        """Parse a ``GENICAM_GENTL64_PATH`` value into CTI path(s).
 
-        Handles both directory paths (searches for .cti files) and direct
-        .cti file paths. Supports multiple paths separated by platform-specific
-        separator (';' on Windows, ':' on Unix).
+        Delegates the actual expansion to
+        :func:`pybeamprofiler.cti.parse_gentl_path` and collapses a single
+        result to a bare string, which is what :meth:`__init__` and the
+        vendor subclasses expect.
 
         Args:
-            gentl_path: Value of GENICAM_GENTL64_PATH environment variable
+            gentl_path: Value of the ``GENICAM_GENTL64_PATH`` environment
+                variable.
 
         Returns:
-            Single CTI path (str), multiple paths (list[str]), or None if not found
+            One path, several paths, or ``None`` if nothing resolved.
         """
-        separator = ";" if os.name == "nt" else ":"
-        cti_files = []
-
-        for path in gentl_path.split(separator):
-            path = path.strip()
-            if not path or not os.path.exists(path):
-                continue
-
-            if os.path.isdir(path):
-                # Directory: find all .cti files
-                for file in os.listdir(path):
-                    if file.endswith(".cti"):
-                        cti_files.append(os.path.join(path, file))
-            elif path.endswith(".cti"):
-                # Direct .cti file
-                cti_files.append(path)
-
-        if not cti_files:
+        found = parse_gentl_path(gentl_path)
+        if not found:
             return None
-        return cti_files if len(cti_files) > 1 else cti_files[0]
+        return found if len(found) > 1 else found[0]
 
     def open(self) -> None:
         """Open camera connection and retrieve camera properties."""
@@ -517,7 +566,7 @@ class HarvesterCamera(Camera):
                 component = buffer.payload.components[0]
                 self.width_pixels = component.width
                 self.height_pixels = component.height
-                img = component.data.reshape(component.height, component.width).copy()
+                img = _to_mono(component)
             self._last_successful_fetch = time.monotonic()
             self._stall_recovery_attempted = False
             return img

@@ -28,9 +28,9 @@ def test_plot_stream_jupyter_task():
     mock_img = np.ones((10, 10))
 
     assert bp.camera is not None
-    bp.camera.get_image = MagicMock(return_value=mock_img)  # type: ignore
-    bp.analyze = MagicMock(return_value=([0, 0, 1, 0], [0, 0, 1, 0]))  # type: ignore
-    bp._create_fast_figure = MagicMock(return_value=MagicMock())  # type: ignore
+    bp.camera.get_image = MagicMock(return_value=mock_img)
+    bp.analyze = MagicMock(return_value=([0, 0, 1, 0], [0, 0, 1, 0]))
+    bp._create_fast_figure = MagicMock(return_value=MagicMock())
 
     async def run_test():
         # Setup mock IPython environment
@@ -83,9 +83,9 @@ def test_plot_stream_jupyter_cancellation():
 
     # Always return an image to run indefinitely
     assert bp.camera is not None
-    bp.camera.get_image = MagicMock(return_value=np.ones((10, 10)))  # type: ignore
-    bp.analyze = MagicMock(return_value=([0, 0, 1, 0], [0, 0, 1, 0]))  # type: ignore
-    bp._create_fast_figure = MagicMock(return_value=MagicMock())  # type: ignore
+    bp.camera.get_image = MagicMock(return_value=np.ones((10, 10)))
+    bp.analyze = MagicMock(return_value=([0, 0, 1, 0], [0, 0, 1, 0]))
+    bp._create_fast_figure = MagicMock(return_value=MagicMock())
 
     async def run_cancel_test():
         mock_get_ipython = MagicMock(return_value=MagicMock())
@@ -149,10 +149,10 @@ def test_plot_stream_jupyter_robustness():
             raise val
         return val
 
-    bp.camera.get_image = MagicMock(side_effect=mock_get_image)  # type: ignore
+    bp.camera.get_image = MagicMock(side_effect=mock_get_image)
     bp.camera.is_acquiring = True  # Ensure it doesn't gracefully exit on None
-    bp.analyze = MagicMock(return_value=([0, 0, 1, 0], [0, 0, 1, 0]))  # type: ignore
-    bp._create_fast_figure = MagicMock(return_value=MagicMock())  # type: ignore
+    bp.analyze = MagicMock(return_value=([0, 0, 1, 0], [0, 0, 1, 0]))
+    bp._create_fast_figure = MagicMock(return_value=MagicMock())
 
     async def run_robustness_test():
         mock_get_ipython = MagicMock(return_value=MagicMock())
@@ -541,9 +541,9 @@ def test_plot_stream_jupyter_non_heatmap():
     assert bp.camera is not None
 
     mock_img = np.ones((10, 10))
-    bp.camera.get_image = MagicMock(return_value=mock_img)  # type: ignore
-    bp.analyze = MagicMock(return_value=([0, 0, 1, 0], [0, 0, 1, 0]))  # type: ignore
-    bp._create_figure = MagicMock(return_value=MagicMock())  # type: ignore
+    bp.camera.get_image = MagicMock(return_value=mock_img)
+    bp.analyze = MagicMock(return_value=([0, 0, 1, 0], [0, 0, 1, 0]))
+    bp._create_figure = MagicMock(return_value=MagicMock())
 
     async def run_test():
         mock_get_ipython = MagicMock(return_value=MagicMock())
@@ -733,10 +733,10 @@ def test_jupyter_loop_exits_when_acquisition_stops():
     spinning forever on a device that will never deliver again."""
     bp = BeamProfiler(camera="simulated")
     assert bp.camera is not None
-    bp.camera.get_image = MagicMock(return_value=None)  # type: ignore
+    bp.camera.get_image = MagicMock(return_value=None)
     # _plot_stream starts acquisition on entry; keep it a no-op so the camera
     # stays "stopped" for the duration of the test.
-    bp.camera.start_acquisition = MagicMock()  # type: ignore
+    bp.camera.start_acquisition = MagicMock()
     bp.camera.is_acquiring = False
 
     async def run_test():
@@ -760,7 +760,7 @@ def test_jupyter_loop_waits_out_a_dropped_frame():
     bp.camera.get_image = MagicMock(  # ty: ignore[invalid-assignment]
         side_effect=lambda *a, **k: frames.pop(0) if frames else np.ones((10, 10))
     )
-    bp._create_fast_figure = MagicMock(return_value=MagicMock())  # type: ignore
+    bp._create_fast_figure = MagicMock(return_value=MagicMock())
 
     async def run_test():
         modules = _jupyter_modules()
@@ -787,8 +787,8 @@ def test_plot_stream_runs_the_loop_when_there_is_no_event_loop():
     """Outside a running loop, ``_plot_stream`` drives it with asyncio.run."""
     bp = BeamProfiler(camera="simulated")
     assert bp.camera is not None
-    bp.camera.get_image = MagicMock(return_value=None)  # type: ignore
-    bp.camera.start_acquisition = MagicMock()  # type: ignore
+    bp.camera.get_image = MagicMock(return_value=None)
+    bp.camera.start_acquisition = MagicMock()
     bp.camera.is_acquiring = False
 
     with patch.dict("sys.modules", _jupyter_modules()):
@@ -844,7 +844,7 @@ def test_matplotlib_frame_update_renders_2d_angle():
         assert info_text is not None
 
         # A dropped frame returns early without touching the axes.
-        bp.camera.get_image = MagicMock(return_value=None)  # type: ignore
+        bp.camera.get_image = MagicMock(return_value=None)
         assert update(2) is None
 
     bp.camera.close()
