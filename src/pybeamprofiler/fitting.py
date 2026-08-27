@@ -88,7 +88,8 @@ def gaussian_2d(
         y0: Center y position.
         sigma_x: Standard deviation along the first principal axis.
         sigma_y: Standard deviation along the second principal axis.
-        theta: Rotation of the principal axes, in radians.
+        theta: Counter-clockwise rotation of the *sigma_x* axis, in
+            radians, measured in the array's own (x, y) coordinates.
         offset: Baseline offset.
 
     Returns:
@@ -104,7 +105,13 @@ def gaussian_2d(
     sy2_inv = 0.5 / (sigma_y * sigma_y)
 
     a = cos2 * sx2_inv + sin2 * sy2_inv
-    b = 0.5 * sin2t * (sy2_inv - sx2_inv)
+    # Note the sign: the textbook form of this expression is written for an
+    # image drawn with y pointing *down*, and puts the sigma_x axis at -theta
+    # in array coordinates. Flipping it makes theta the plain
+    # counter-clockwise angle of the sigma_x axis in (x, y), so every consumer
+    # -- the ellipse overlay, the reported angle, the simulator -- can use it
+    # directly instead of remembering to negate.
+    b = 0.5 * sin2t * (sx2_inv - sy2_inv)
     c = sin2 * sx2_inv + cos2 * sy2_inv
 
     dx = x - float(x0)
@@ -344,6 +351,69 @@ def _fit_region(
     return image[y0:y1, x0:x1], x0, y0
 
 
+def _moment_seed(image: np.ndarray) -> list[float] | None:
+    """Initial 2D fit parameters estimated from the image's own moments.
+
+    The obvious cold start — peak position, a tenth of the frame for each
+    sigma, and theta = 0 — is a bad seed for a tilted beam: the solver can
+    settle into an axis-aligned compromise that is rounder than the real
+    ellipse and report convergence. A 3:1 beam at 34 degrees came back as
+    14 x 11 at 0 degrees that way.
+
+    Second moments give the centre, both widths *and* the orientation in one
+    pass over the (already decimated) grid, which costs almost nothing and
+    starts the solver next to the answer instead of across a ridge from it.
+
+    Args:
+        image: The grid the fit will actually run on.
+
+    Returns:
+        ``[amplitude, x0, y0, sigma_major, sigma_minor, theta, offset]``, or
+        ``None`` if the image carries no usable signal.
+    """
+    data = image.astype(float)
+    base = float(data.min())
+    weights = data - base
+    total = float(weights.sum())
+    if not np.isfinite(total) or total <= 0:
+        return None
+
+    h, w = weights.shape
+    col = weights.sum(axis=0)
+    row = weights.sum(axis=1)
+    xs = np.arange(w, dtype=float)
+    ys = np.arange(h, dtype=float)
+    cx = float((col * xs).sum() / total)
+    cy = float((row * ys).sum() / total)
+
+    dx = xs - cx
+    dy = ys - cy
+    vxx = float((col * dx * dx).sum() / total)
+    vyy = float((row * dy * dy).sum() / total)
+    # The cross term is the only part that needs the full 2D array.
+    vxy = float((weights * np.outer(dy, dx)).sum() / total)
+
+    trace = vxx + vyy
+    det = vxx * vyy - vxy * vxy
+    disc = max(trace * trace / 4.0 - det, 0.0)
+    root = np.sqrt(disc)
+    var_major = trace / 2.0 + root
+    var_minor = trace / 2.0 - root
+    if var_major <= 0:
+        return None
+
+    theta = 0.5 * np.arctan2(2.0 * vxy, vxx - vyy)
+    return [
+        float(data.max() - base),
+        cx,
+        cy,
+        float(np.sqrt(var_major)),
+        float(np.sqrt(max(var_minor, 0.25))),
+        float(theta),
+        base,
+    ]
+
+
 def fit_2d_gaussian(
     image: np.ndarray,
     last_popt: np.ndarray | list[Any] | None = None,
@@ -416,9 +486,11 @@ def fit_2d_gaussian(
         p0 = list(last_popt)
         _to_fit_coords(p0)
     else:
-        pmax, pmin = float(np.max(fit_img)), float(np.min(fit_img))
-        y0, x0 = np.unravel_index(int(np.argmax(fit_img)), fit_img.shape)
-        p0 = [pmax - pmin, float(x0), float(y0), fw / 10.0, fh / 10.0, 0.0, pmin]
+        p0 = _moment_seed(fit_img)
+        if p0 is None:
+            pmax, pmin = float(np.max(fit_img)), float(np.min(fit_img))
+            y0, x0 = np.unravel_index(int(np.argmax(fit_img)), fit_img.shape)
+            p0 = [pmax - pmin, float(x0), float(y0), fw / 10.0, fh / 10.0, 0.0, pmin]
 
     x, y = np.arange(fw), np.arange(fh)
     xv, yv = np.meshgrid(x, y)

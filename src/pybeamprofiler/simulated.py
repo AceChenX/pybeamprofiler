@@ -289,9 +289,11 @@ class SimulatedCamera(Camera):
         if self._theta:
             grid_y, grid_x = np.mgrid[0 : self._sensor_h, 0 : self._sensor_w].astype(np.float32)
             cos_t, sin_t = math.cos(self._theta), math.sin(self._theta)
+            # Matches fitting.gaussian_2d: theta is the counter-clockwise
+            # angle of the major (sigma_x) axis in array coordinates.
             self._rot = (
-                grid_x * cos_t - grid_y * sin_t,
-                grid_x * sin_t + grid_y * cos_t,
+                grid_x * cos_t + grid_y * sin_t,
+                -grid_x * sin_t + grid_y * cos_t,
             )
         # Scratch buffer for the rotated path, so the per-frame maths runs
         # in place instead of allocating a full frame per operation.
@@ -361,8 +363,8 @@ class SimulatedCamera(Camera):
             scratch = self._scratch
             assert scratch is not None  # built together with _rot
             cos_t, sin_t = math.cos(self._theta), math.sin(self._theta)
-            u_c = cx * cos_t - cy * sin_t
-            v_c = cx * sin_t + cy * cos_t
+            u_c = cx * cos_t + cy * sin_t
+            v_c = -cx * sin_t + cy * cos_t
 
             np.subtract(rot_x, u_c, out=buf)
             np.multiply(buf, buf, out=buf)

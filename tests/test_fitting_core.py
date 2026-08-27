@@ -529,3 +529,158 @@ class TestFitEvaluationCap:
         assert "max_nfev=MAX_FIT_2D_EVALS" in source
         assert "maxfev" not in source.split("bounds=bounds")[1]
         assert MAX_FIT_2D_EVALS > 0
+
+
+def _image_major_axis(img):
+    """Major/minor sigma and orientation straight from image moments.
+
+    Deliberately independent of anything in ``fitting`` — this is the
+    reference the fit is checked against.
+    """
+    a = img.astype(float) - img.min()
+    h, w = a.shape
+    y, x = np.mgrid[0:h, 0:w].astype(float)
+    total = a.sum()
+    cx, cy = (a * x).sum() / total, (a * y).sum() / total
+    vxx = (a * (x - cx) ** 2).sum() / total
+    vyy = (a * (y - cy) ** 2).sum() / total
+    vxy = (a * (x - cx) * (y - cy)).sum() / total
+    vals, vecs = np.linalg.eigh(np.array([[vxx, vxy], [vxy, vyy]]))
+    i = int(np.argmax(vals))
+    angle = np.degrees(np.arctan2(vecs[1, i], vecs[0, i])) % 180
+    return np.sqrt(vals[i]), np.sqrt(vals[1 - i]), angle
+
+
+def _angle_error(a: float, b: float) -> float:
+    """Difference between two orientations, accounting for the 180 wrap."""
+    return abs(((a - b + 90) % 180) - 90)
+
+
+class TestRotationConvention:
+    """``theta`` is the counter-clockwise angle of the sigma_x axis in the
+    array's own (x, y) coordinates.
+
+    The textbook form of the rotated-Gaussian exponent is written for an
+    image drawn with y pointing *down* and puts sigma_x at *minus* theta in
+    array coordinates. Using it as-is left the drawn ellipse mirrored about
+    the x-axis: for any tilted beam it crossed the beam instead of tracing
+    it, and the reported angle had the wrong sign.
+    """
+
+    @staticmethod
+    def _beam(theta_deg, n=400, sx=60.0, sy=20.0):
+        y, x = np.mgrid[0:n, 0:n].astype(float)
+        return fitting.gaussian_2d(
+            (x, y), 200.0, n / 2, n / 2 - 10, sx, sy, np.radians(theta_deg), 0.0
+        ).reshape(n, n)
+
+    @pytest.mark.parametrize("theta_deg", [0, 20, 45, 70, 90, 120, 155])
+    def test_the_model_puts_the_major_axis_where_theta_says(self, theta_deg):
+        _, _, angle = _image_major_axis(self._beam(theta_deg))
+        assert _angle_error(angle, theta_deg) < 0.5
+
+    @pytest.mark.parametrize("theta_deg", [20, 45, 70, 120, 155])
+    def test_the_fit_recovers_that_same_angle(self, theta_deg):
+        img = self._beam(theta_deg)
+        popt, converged = fitting.fit_2d_gaussian(img, None, sigma_hint=20.0)
+        assert converged
+        _, _, theta = fitting.canonical_ellipse(popt[3], popt[4], popt[5])
+        assert _angle_error(np.degrees(theta), theta_deg) < 1.5
+
+    def test_a_positive_angle_tilts_towards_increasing_y(self):
+        """Pins the *sign*, which is the part that was wrong. A mirrored
+        convention would still satisfy every magnitude check above."""
+        img = self._beam(30.0)
+        h, w = img.shape
+        # Sample along the major axis in both directions from the centre.
+        cy, cx = h / 2 - 10, w / 2
+        r = 40.0
+        col = int(cx + r * np.cos(np.radians(30)))
+        along = img[int(cy + r * np.sin(np.radians(30))), col]
+        mirrored = img[int(cy - r * np.sin(np.radians(30))), col]
+        # ~3.7x on this beam; a mirrored convention would invert the ratio.
+        assert along > mirrored * 2, "a +30 deg beam must extend towards larger y as x grows"
+
+
+class TestMomentSeed:
+    """The cold fit is seeded from image moments.
+
+    Guessing theta = 0 and a tenth of the frame for each sigma left the solver
+    across a ridge from the answer on a tilted beam: a 3:1 beam at 34 degrees
+    came back as 14 x 11 at 0 degrees, reporting convergence.
+    """
+
+    @staticmethod
+    def _beam(n=120, cx=60.0, cy=55.0, sx=18.0, sy=9.0, theta=0.6, offset=5.0):
+        y, x = np.mgrid[0:n, 0:n].astype(float)
+        return fitting.gaussian_2d((x, y), 200.0, cx, cy, sx, sy, theta, offset).reshape(n, n)
+
+    def test_the_seed_is_already_close(self):
+        seed = fitting._moment_seed(self._beam())
+        assert seed is not None
+        assert seed[1] == pytest.approx(60.0, abs=0.5)
+        assert seed[2] == pytest.approx(55.0, abs=0.5)
+        assert seed[3] == pytest.approx(18.0, rel=0.02)
+        assert seed[4] == pytest.approx(9.0, rel=0.02)
+        assert _angle_error(np.degrees(seed[5]), np.degrees(0.6)) < 1.0
+
+    def test_the_seed_recovers_the_offset(self):
+        seed = fitting._moment_seed(self._beam(offset=42.0))
+        assert seed is not None
+        assert seed[6] == pytest.approx(42.0, abs=1.0)
+
+    def test_a_tilted_beam_no_longer_fits_to_an_axis_aligned_compromise(self):
+        img = self._beam()
+        popt, converged = fitting.fit_2d_gaussian(img, None)
+        assert converged
+        major, minor, theta = fitting.canonical_ellipse(popt[3], popt[4], popt[5])
+        assert major == pytest.approx(18.0, rel=0.02)
+        assert minor == pytest.approx(9.0, rel=0.02)
+        assert _angle_error(np.degrees(theta), np.degrees(0.6)) < 1.5
+
+    def test_a_blank_image_has_no_seed(self):
+        assert fitting._moment_seed(np.zeros((32, 32))) is None
+
+    def test_a_non_finite_image_has_no_seed(self):
+        img = np.zeros((32, 32))
+        img[4, 4] = np.inf
+        assert fitting._moment_seed(img) is None
+
+    def test_a_blank_image_still_fits_without_raising(self):
+        """Falls back to the old peak-based guess."""
+        popt, converged = fitting.fit_2d_gaussian(np.zeros((32, 32)), None)
+        assert len(popt) == 7
+        del converged
+
+
+class TestEllipseTracesTheBeam:
+    """The strongest end-to-end check available: sample the image where the
+    overlay is drawn. On the 1/e^2 contour every sample must be at 13.5% of
+    peak. A mirrored ellipse crosses the beam instead, swinging from the core
+    to the background."""
+
+    @pytest.mark.parametrize("theta_deg", [0, 20, 45, 70, 120, 155])
+    def test_the_overlay_sits_on_the_contour(self, theta_deg):
+        from pybeamprofiler.beamprofiler import BeamProfiler
+
+        n = 400
+        y, x = np.mgrid[0:n, 0:n].astype(float)
+        img = fitting.gaussian_2d(
+            (x, y), 200.0, 200.0, 190.0, 60.0, 20.0, np.radians(theta_deg), 0.0
+        ).reshape(n, n)
+
+        bp = BeamProfiler(camera="simulated", fit="2d")
+        bp.pixel_size = 1.0
+        bp.analyze(img)
+        points = bp._ellipse_points()
+        assert points is not None
+        xs, ys = points
+
+        xi = np.clip(np.round(xs).astype(int), 0, n - 1)
+        yi = np.clip(np.round(ys).astype(int), 0, n - 1)
+        sampled = img[yi, xi] / img.max()
+
+        assert sampled.min() > 0.11, "part of the overlay is off the beam"
+        assert sampled.max() < 0.17, "part of the overlay cuts through the core"
+        assert bp.camera is not None
+        bp.camera.close()
