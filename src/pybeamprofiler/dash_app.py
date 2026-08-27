@@ -146,6 +146,8 @@ def _camera_options(bp: BeamProfiler) -> tuple[list[CameraOption], str]:
     Returns:
         ``(options, current_key)``.
     """
+    global _known_options  # noqa: PLW0603
+
     options = discover_cameras()
     current = ""
     if bp.camera is not None:
@@ -153,6 +155,7 @@ def _camera_options(bp: BeamProfiler) -> tuple[list[CameraOption], str]:
         current = open_option.key
         if not any(o.key == current for o in options):
             options.insert(0, open_option)
+    _known_options = options
     return options, current
 
 
@@ -1378,6 +1381,13 @@ _avg_buffer: collections.deque[np.ndarray] = collections.deque(maxlen=1)
 _avg_buffer_shape: tuple[int, ...] | None = None
 _avg_running_sum: np.ndarray | None = None
 
+# The camera list currently shown in the dropdown. Populated when the
+# selector is built and refreshed by the rescan button, so switching cameras
+# does not have to re-enumerate: a GenTL scan opens every producer and walks
+# the network, which takes seconds on a GigE setup and would block the render
+# loop for the whole switch.
+_known_options: list[CameraOption] = []
+
 # Authoritative zoom state, mutated by Auto-fit / Reset under
 # ``_callback_lock`` and read by ``update_live``. Using a module
 # variable (rather than a Dash ``State``) avoids a 50–100 ms
@@ -1498,9 +1508,10 @@ def _averaged_image(image: np.ndarray, n: int) -> np.ndarray:
 
 def _register_callbacks(app: dash.Dash, bp: BeamProfiler) -> None:
     """Wire up all Dash callbacks."""
-    global _server_paused, _zoom_range  # noqa: PLW0603
+    global _known_options, _server_paused, _zoom_range  # noqa: PLW0603
     _server_paused = False
     _zoom_range = None
+    _known_options = []
 
     # -- Camera selection -----------------------------------------------------
     # Rescanning and switching both take ``_callback_lock``: swapping the
@@ -1570,8 +1581,12 @@ def _register_callbacks(app: dash.Dash, bp: BeamProfiler) -> None:
             if bp.camera is not None and describe_open_camera(bp.camera).key == key:
                 return (dash.no_update,) * 6
 
-            options, _ = _camera_options(bp)
-            option = find_option(key, options)
+            # Resolve against what the dropdown last offered. Re-running
+            # discovery here would put a multi-second GenTL enumeration on the
+            # critical path of every switch, with _callback_lock held.
+            option = find_option(key, _known_options)
+            if option is None:
+                option = find_option(key, _camera_options(bp)[0])
             if option is None:
                 return (f"Unknown camera: {key}",) + (dash.no_update,) * 5
 
@@ -1836,8 +1851,13 @@ def _register_callbacks(app: dash.Dash, bp: BeamProfiler) -> None:
         prevent_initial_call=True,
     )
     def set_pixel_scale(_n_submit: int | None, _n_blur: int | None, val: float | None) -> float:
+        """Override the pixel pitch used to convert pixels to micrometers."""
         if val is not None and val > 0:
-            bp.pixel_size = val
+            # build_figure reads pixel_size several times per frame (heatmap
+            # extent, ellipse, axis ranges). Changing it mid-render would
+            # leave those disagreeing for one frame.
+            with _callback_lock:
+                bp.pixel_size = val
         return round(bp.pixel_size, 4)
 
     # -- Exposure slider + input (kept in sync) -------------------------------

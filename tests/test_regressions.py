@@ -596,3 +596,100 @@ class TestSimulatedProfiles:
 
         assert len({p.key for p in SIMULATED_PROFILES}) == len(SIMULATED_PROFILES)
         assert len({p.serial_number for p in SIMULATED_PROFILES}) == len(SIMULATED_PROFILES)
+
+
+class TestNonMonoPayloads:
+    """A camera left in a colour pixel format used to raise "cannot reshape
+    array of size N" out of get_image()."""
+
+    @staticmethod
+    def _component(height, width, channels=1, fmt="Mono8"):
+        from unittest.mock import MagicMock
+
+        c = MagicMock()
+        c.height, c.width = height, width
+        c.data = np.arange(height * width * channels, dtype=np.uint8)
+        c.data_format = fmt
+        return c
+
+    def test_mono_is_reshaped(self):
+        from pybeamprofiler.gen_camera import _to_mono
+
+        img = _to_mono(self._component(3, 5))
+        assert img.shape == (3, 5)
+        assert img.dtype == np.uint8
+
+    def test_mono_result_is_a_copy(self):
+        """The producer reuses the payload buffer once fetch() exits."""
+        from pybeamprofiler.gen_camera import _to_mono
+
+        component = self._component(2, 2)
+        img = _to_mono(component)
+        component.data[:] = 99
+        assert not np.array_equal(img, component.data.reshape(2, 2))
+
+    @pytest.mark.parametrize(("channels", "fmt"), [(3, "RGB8"), (4, "BGRa8")])
+    def test_colour_is_collapsed_to_one_plane(self, channels, fmt):
+        from pybeamprofiler.gen_camera import _to_mono
+
+        img = _to_mono(self._component(4, 6, channels, fmt))
+        assert img.shape == (4, 6)
+
+    def test_rgb_uses_luminance_weights(self):
+        from unittest.mock import MagicMock
+
+        from pybeamprofiler.gen_camera import _to_mono
+
+        component = MagicMock()
+        component.height, component.width = 1, 1
+        component.data_format = "RGB8"
+        component.data = np.array([10, 200, 30], dtype=np.uint8)
+        expected = int(0.299 * 10 + 0.587 * 200 + 0.114 * 30)
+        assert int(_to_mono(component)[0, 0]) == expected
+
+    def test_packed_format_is_rejected_with_a_useful_message(self):
+        from unittest.mock import MagicMock
+
+        from pybeamprofiler.gen_camera import _to_mono
+
+        component = MagicMock()
+        component.height, component.width = 2, 4
+        component.data_format = "Mono12p"
+        component.data = np.zeros(12, dtype=np.uint8)  # 1.5 bytes/px
+        with pytest.raises(ValueError, match="Mono10p/Mono12p"):
+            _to_mono(component)
+
+    def test_zero_sized_frame_is_rejected(self):
+        from pybeamprofiler.gen_camera import _to_mono
+
+        with pytest.raises(ValueError, match="zero-sized"):
+            _to_mono(self._component(0, 0))
+
+
+class TestExposureSliderRange:
+    """A producer reporting a zero minimum exposure crashed the Jupyter panel
+    with "math domain error" from log10(0)."""
+
+    def test_zero_minimum_does_not_raise(self):
+        from unittest.mock import patch
+
+        from pybeamprofiler.simulated import SimulatedCamera
+
+        cam = SimulatedCamera()
+        cam.open()
+        cam._exposure_min = 0.0
+        with patch("IPython.display.display"):
+            cam.setting()  # must not raise
+        cam.close()
+
+    def test_degenerate_range_does_not_raise(self):
+        from unittest.mock import patch
+
+        from pybeamprofiler.simulated import SimulatedCamera
+
+        cam = SimulatedCamera()
+        cam.open()
+        cam._exposure_min = cam._exposure_max = 0.0
+        with patch("IPython.display.display"):
+            cam.setting()
+        cam.close()

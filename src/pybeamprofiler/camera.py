@@ -200,6 +200,11 @@ class Camera(ABC):
         if hasattr(self, "gain_range"):
             gain_min, gain_max = cast(tuple[float, float], self.gain_range)
 
+        # A log slider cannot represent zero, and some producers report a
+        # minimum of 0 for exposure. Clamp to a microsecond, which is below
+        # anything a real sensor supports anyway.
+        exposure_min = max(exposure_min, 1e-6)
+        exposure_max = max(exposure_max, exposure_min * 10)
         exp_min_log = math.floor(math.log10(exposure_min))
         exp_max_log = math.ceil(math.log10(exposure_max))
 

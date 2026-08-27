@@ -59,6 +59,56 @@ SENSOR_PIXEL_SIZES: dict[str, float] = {
 }
 
 
+def _to_mono(component: Any) -> np.ndarray:
+    """Reshape one payload component into a 2D intensity array.
+
+    Mono formats arrive as exactly ``height * width`` samples and only need a
+    reshape. Colour formats (RGB8, BGR8, YUV...) carry several samples per
+    pixel; a beam profiler wants one intensity per pixel, so those are
+    collapsed with the usual luminance weights for three channels and a plain
+    mean otherwise. Blindly reshaping them — which is what this used to do —
+    raises "cannot reshape array of size N" the moment a camera is left in a
+    colour pixel format.
+
+    Packed mono formats (Mono10p, Mono12p) do not have a whole number of
+    samples per pixel and are rejected with a message that says so, rather
+    than producing a silently corrupt image.
+
+    Args:
+        component: A Harvesters ``Component2DImage``.
+
+    Returns:
+        A fresh 2D array; the payload buffer is reused by the producer as soon
+        as the ``fetch`` context exits, so the copy is not optional.
+
+    Raises:
+        ValueError: If the payload size is not a whole multiple of the frame.
+    """
+    height, width = component.height, component.width
+    data = component.data
+    pixels = height * width
+    if pixels == 0:
+        raise ValueError("Camera reported a zero-sized frame")
+
+    if data.size == pixels:
+        return data.reshape(height, width).copy()
+
+    channels, remainder = divmod(data.size, pixels)
+    if remainder or channels < 1:
+        fmt = getattr(component, "data_format", "unknown")
+        raise ValueError(
+            f"Cannot interpret a {data.size}-sample payload as a "
+            f"{width}x{height} frame (pixel format {fmt!r}). Packed formats "
+            "such as Mono10p/Mono12p are not supported; select Mono8, Mono12 "
+            "or Mono16 on the camera."
+        )
+
+    planes = data.reshape(height, width, channels)
+    if channels == 3:
+        return (planes.astype(np.float64) @ [0.299, 0.587, 0.114]).astype(data.dtype)
+    return planes.mean(axis=2).astype(data.dtype)
+
+
 class HarvesterCamera(Camera):
     """GenICam camera interface using Harvesters library.
 
@@ -504,7 +554,7 @@ class HarvesterCamera(Camera):
                 component = buffer.payload.components[0]
                 self.width_pixels = component.width
                 self.height_pixels = component.height
-                img = component.data.reshape(component.height, component.width).copy()
+                img = _to_mono(component)
             self._last_successful_fetch = time.monotonic()
             self._stall_recovery_attempted = False
             return img

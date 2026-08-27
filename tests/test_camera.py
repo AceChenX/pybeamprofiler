@@ -1127,7 +1127,9 @@ class TestGenCameraDetection:
         cam.ia = mock_ia
 
         mock_component = MagicMock()
-        mock_component.data.reshape.return_value.copy.return_value = np.zeros((480, 640))
+        # A real array, not a mock of one: the payload is reshaped by size, so
+        # mocking .reshape() away would hide whether that maths is right.
+        mock_component.data = np.zeros(640 * 480, dtype=np.uint8)
         mock_component.width = 640
         mock_component.height = 480
 
