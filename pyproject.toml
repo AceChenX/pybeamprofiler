@@ -88,6 +88,9 @@ python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
 addopts = "-v --cov=pybeamprofiler --cov-report=term-missing"
+markers = [
+    "real_cti: exercise the real GenTL search tables instead of the hermetic blank ones",
+]
 
 [tool.ruff]
 target-version = "py310"

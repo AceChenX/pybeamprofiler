@@ -54,6 +54,7 @@ def fake_sdk(tmp_path, monkeypatch):
     return install, spin, pylon
 
 
+@pytest.mark.real_cti
 class TestVendorPathTables:
     """The tables are the whole point of the module — pin down their shape.
 

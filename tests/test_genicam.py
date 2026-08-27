@@ -199,7 +199,7 @@ class TestCameraUtils:
 
         # Mock harvesters module for testing without hardware dependency
         with patch.dict(sys.modules, {"harvesters": mock_harvesters, "harvesters.core": mock_core}):
-            with patch("pybeamprofiler.utils.find_cti_files", return_value=["/fake/path.cti"]):
+            with patch("pybeamprofiler.discovery.find_cti_files", return_value=["/fake/path.cti"]):
                 cameras = list_cameras()
 
                 assert len(cameras) == 1
