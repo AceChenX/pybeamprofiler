@@ -214,9 +214,13 @@ class SimulatedCamera(Camera):
 
     Args:
         profile: Which fake camera to be. Defaults to :data:`DEFAULT_PROFILE`.
+        seed: Seed for the frame-to-frame jitter. Leave as ``None`` for fresh
+            randomness; set it when you need the same sequence of frames every
+            run, which is what keeps tests that measure the simulated beam from
+            failing once in a few hundred runs.
     """
 
-    def __init__(self, profile: SimulatedProfile | None = None) -> None:
+    def __init__(self, profile: SimulatedProfile | None = None, seed: int | None = None) -> None:
         super().__init__()
         self.profile = profile or DEFAULT_PROFILE
         self.width = self.profile.width
@@ -241,7 +245,12 @@ class SimulatedCamera(Camera):
         self._background = self.profile.background
 
         self._noise_center = 17.0
-        self._noise_sigma = 7.0
+        # Width jitter is a *fraction* of each axis, not an absolute pixel
+        # count. A fixed 7 px was tuned for the ~50 px axes of the default
+        # profile; on a 30 px minor axis it is 23%, which swung the apparent
+        # axis ratio anywhere from 1.6 to 8.6 and made a real beam look like
+        # it was breathing. Real beams fluctuate proportionally.
+        self._noise_sigma_frac = 0.14
         self._noise_amp = 25.0
         self._noise_bg = 10.0
         self._noise_image = 10.0
@@ -289,7 +298,7 @@ class SimulatedCamera(Camera):
         self._scratch = (
             np.empty((self._sensor_h, self._sensor_w), dtype=np.float32) if self._theta else None
         )
-        self._rng = np.random.default_rng()
+        self._rng = np.random.default_rng(seed)
 
     def open(self) -> None:
         """Open the simulated camera and initialize the node map."""
@@ -326,8 +335,11 @@ class SimulatedCamera(Camera):
         rng = self._rng
         cx = self._center_x + rng.normal(0, self._noise_center)
         cy = self._center_y + rng.normal(0, self._noise_center)
-        sx = self._sigma_x + rng.normal(0, self._noise_sigma)
-        sy = self._sigma_y + rng.normal(0, self._noise_sigma)
+        sx = self._sigma_x * (1.0 + rng.normal(0, self._noise_sigma_frac))
+        sy = self._sigma_y * (1.0 + rng.normal(0, self._noise_sigma_frac))
+        # Keep the beam from inverting or collapsing on an extreme draw.
+        sx = max(sx, 1.0)
+        sy = max(sy, 1.0)
         amp = max(1.0, self._amplitude + rng.normal(0, self._noise_amp))
         bg = max(0.0, self._background + rng.normal(0, self._noise_bg))
 

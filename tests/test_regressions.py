@@ -566,7 +566,10 @@ class TestSimulatedProfiles:
         from pybeamprofiler.simulated import SIMULATED_PROFILES, SimulatedCamera
 
         tilted = next(p for p in SIMULATED_PROFILES if p.theta_deg)
-        cam = SimulatedCamera(tilted)
+        # Seeded: the simulator jitters sigma by +/-7 px, which on the 30 px
+        # axis is enough to round the ellipse out and throw the fitted angle
+        # off often enough to make an unseeded assertion flaky.
+        cam = SimulatedCamera(tilted, seed=20260827)
         cam.open()
 
         bp = BeamProfiler(camera="simulated", fit="2d")
@@ -713,7 +716,7 @@ class TestSimulatedRotatedBeamFastPath:
         cam.open()
         for attr in (
             "_noise_center",
-            "_noise_sigma",
+            "_noise_sigma_frac",
             "_noise_amp",
             "_noise_bg",
             "_noise_image",
