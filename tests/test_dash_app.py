@@ -500,29 +500,14 @@ class TestPauseStopsAcquisition:
 
     @staticmethod
     def _get_toggle_fn(bp: BeamProfiler):
-        """Extract the toggle_pause function from registered callbacks."""
-        from pybeamprofiler.dash_app import _register_callbacks
+        """Extract the toggle_pause callback.
 
-        app = dash.Dash(__name__)
-        app.layout = html.Div()
-        callback_map: dict = {}
-        original_callback = app.callback
-
-        def tracking_callback(*args, **kwargs):
-            def decorator(f):
-                key = str(args)
-                callback_map[key] = f
-                return original_callback(*args, **kwargs)(f)
-
-            return decorator
-
-        app.callback = tracking_callback  # ty: ignore[invalid-assignment]
-        _register_callbacks(app, bp)
-
-        for key, func in callback_map.items():
-            if "store-paused" in key and "btn-play-pause" in key:
-                return func
-        return None
+        ``store-paused`` has two writers now — the camera selector also
+        pauses the stream after a switch — so this relies on
+        :func:`_extract_callback` preferring the callback that declares the
+        output first, which is toggle_pause.
+        """
+        return _extract_callback(bp, "store-paused")
 
     def test_pause_stops_acquisition(self):
         bp = BeamProfiler(camera="simulated")
@@ -1035,7 +1020,8 @@ def _extract_callback(bp: BeamProfiler, output_id: str) -> Any:
     For ``live-graph`` (which has multiple writers — the live update loop,
     plus Auto-fit / Reset that emit a ``Patch``), this returns the
     ``update_live`` callback specifically, identified by its ``interval``
-    Input which no other callback uses.
+    Input which no other callback uses. For every other id, the callback that
+    declares the output *first* wins, since that is the one that owns it.
     """
     from pybeamprofiler.dash_app import _register_callbacks
 
@@ -1062,6 +1048,21 @@ def _extract_callback(bp: BeamProfiler, output_id: str) -> Any:
             if output_id in key and "interval" in key:
                 return func
         return None
+
+    # Several outputs now have more than one writer — the camera selector
+    # also drives store-paused, the Play/Pause button, the settings panel and
+    # the pixel-scale box. Prefer the callback that *owns* the output, i.e.
+    # declares it first, and only then fall back to any writer.
+    def _first_output(key: str) -> str:
+        """The id.prop of the first Output, from its ``<Output `x.y`>`` repr."""
+        marker = "<Output `"
+        if marker not in key:
+            return ""
+        return key.split(marker, 1)[1].split("`", 1)[0]
+
+    for key, func in captured.items():
+        if output_id in _first_output(key):
+            return func
     for key, func in captured.items():
         if output_id in key:
             return func

@@ -303,3 +303,44 @@ def open_camera(option: CameraOption) -> Camera:
             logger.debug("Cleanup after failed open also failed", exc_info=True)
         raise RuntimeError(f"Could not open {option.label}: {e}") from e
     return camera
+
+
+def describe_open_camera(camera: Camera) -> CameraOption:
+    """Build the option that represents an already-open *camera*.
+
+    The GUI needs this at start-up: the camera is opened before the dropdown
+    exists (by the CLI, or by a caller constructing :class:`BeamProfiler`
+    directly), and the selector has to show it as the current choice. It may
+    not appear in :func:`discover_cameras` at all — a camera opened from an
+    explicit ``.cti`` path on a machine where the standard search finds
+    nothing — so the option is derived from the live object rather than
+    looked up.
+
+    Args:
+        camera: An open camera.
+
+    Returns:
+        A matching :class:`CameraOption`.
+    """
+    from .simulated import SimulatedCamera
+
+    if isinstance(camera, SimulatedCamera):
+        profile = camera.profile
+        return CameraOption(
+            key=f"{SIMULATED_PREFIX}{profile.key}",
+            label=f"{profile.name} ({profile.serial_number})",
+            kind=SIMULATED_KEY,
+            vendor="pybeamprofiler",
+            model=profile.name,
+            serial_number=profile.serial_number,
+        )
+
+    return _describe(
+        {
+            "vendor": getattr(camera, "device_vendor", "") or "",
+            "model": getattr(camera, "device_model", "") or "",
+            "serial_number": getattr(camera, "serial_number", "") or "",
+            "id": "",
+            "index": 0,
+        }
+    )

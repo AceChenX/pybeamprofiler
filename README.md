@@ -10,6 +10,7 @@ Real-time laser beam profiler with Gaussian fitting for GenICam cameras.
 
 - **Real-time Gaussian fitting** — 1D projections (230+ fps), 2D with rotation (50+ fps), linecut (300+ fps)
 - **Browser-based GUI** — Dash web interface with live heatmap, fits, dark/light theme, 30+ color scales, and camera controls
+- **Multi-camera** — discover attached cameras, pick one from the dropdown, press Play; switch devices without restarting
 - **Multiple width definitions** — Gaussian (1/e²), FWHM, D4σ (ISO 11146)
 - **GenICam hardware support** — FLIR (Spinnaker) and Basler (Pylon) via [Harvesters](https://github.com/genicam/harvesters); auto-discovered features grouped by SFNC category
 - **Jupyter support** — Live streaming with `bp.setting()` interactive widgets
@@ -31,6 +32,21 @@ pybeamprofiler --camera basler     # Basler / Pylon
 
 The browser opens automatically at http://127.0.0.1:8050. Press **Ctrl+C** in
 the terminal to stop the server and exit.
+
+### Switching cameras
+
+The **Camera** dropdown at the top of the Fitting tab lists every camera found
+on the machine, plus the built-in simulators. Press ⟳ to rescan after plugging
+something in. Selecting a camera opens it and leaves the stream stopped — press
+**Play** (or the spacebar) to start acquiring.
+
+Switching releases the previous device, so nothing stays claimed. If the camera
+you pick cannot be opened — unplugged, or held by Spinnaker/pylon Viewer — the
+current stream keeps running and the reason is shown under the dropdown.
+
+Two simulated cameras are always offered. They have different sensor sizes,
+pixel pitches and beam shapes (the second is tilted 35°), so the selector and
+the 2D fit can both be exercised with no hardware attached.
 
 ## Installation
 
@@ -76,11 +92,13 @@ Press **Ctrl+C** in the terminal to stop streaming and exit.
 ### Python API
 
 ```python
-from pybeamprofiler import BeamProfiler, print_camera_info
+from pybeamprofiler import BeamProfiler, discover_cameras, print_camera_info
 
 print_camera_info()                    # list connected cameras
+discover_cameras()                     # the same list the GUI dropdown shows
 
 bp = BeamProfiler(camera="simulated")
+bp = BeamProfiler(camera="flir", serial_number="12345678")   # pick a device
 bp.plot()                              # open browser GUI
 bp.plot(num_img=1)                     # single shot
 
@@ -152,16 +170,21 @@ uv run pytest --cov-report=html        # HTML coverage report
 uv run pytest tests/test_profiler.py   # single file
 ```
 
+Current suite: **815 tests, 99% coverage**. The suite is hermetic — an
+autouse fixture hides any camera SDK installed on the machine, so results
+do not depend on what happens to be plugged in.
+
 ### Architecture
 
 - `fitting.py` — Gaussian models, direct width measurements, curve fits, decimation (pure functions over arrays; no camera or plotting state)
+- `cti.py` — one table of GenTL producer (`.cti`) search paths, shared by every vendor
+- `discovery.py` — enumerating cameras and opening the selected one (`utils.py` re-exports it)
 - `beamprofiler.py` — `BeamProfiler` class, figure building, streaming, CLI entry point
 - `camera.py` — abstract `Camera` base class + Jupyter widget builder
 - `gen_camera.py` — `HarvesterCamera` for GenICam devices
 - `flir.py` / `basler.py` — vendor-specific subclasses
-- `simulated.py` — `SimulatedCamera` (no hardware)
+- `simulated.py` — `SimulatedCamera` and its beam profiles (no hardware)
 - `dash_app.py` — browser GUI with live updates, settings panel, pattern-matching callbacks
-- `utils.py` — camera discovery helpers
 - `constants.py` — shared constants and conversion factors
 
 ### Contributing

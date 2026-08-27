@@ -26,6 +26,13 @@ from .constants import (
     DEFAULT_UPDATE_INTERVAL_MS,
     MAX_DISPLAY_DIM,
 )
+from .discovery import (
+    CameraOption,
+    describe_open_camera,
+    discover_cameras,
+    find_option,
+    open_camera,
+)
 from .fitting import downsample
 
 # Optional: only present when a real GenTL backend is installed. Used by
@@ -128,6 +135,56 @@ def _saturation_fraction(image: np.ndarray) -> float:
 # ---------------------------------------------------------------------------
 
 
+def _camera_options(bp: BeamProfiler) -> tuple[list[CameraOption], str]:
+    """Discover selectable cameras and the key of the one already open.
+
+    The open camera is folded in even when discovery misses it — it can be
+    opened from an explicit ``.cti`` path on a machine where the standard
+    search finds nothing — so the dropdown always has something selected
+    rather than showing a blank box over a running stream.
+
+    Returns:
+        ``(options, current_key)``.
+    """
+    options = discover_cameras()
+    current = ""
+    if bp.camera is not None:
+        open_option = describe_open_camera(bp.camera)
+        current = open_option.key
+        if not any(o.key == current for o in options):
+            options.insert(0, open_option)
+    return options, current
+
+
+def _camera_controls(bp: BeamProfiler) -> Any:
+    """Build the camera selector: a dropdown plus a rescan button."""
+    options, current = _camera_options(bp)
+    return dbc.Row(
+        [
+            dbc.Col(
+                dbc.Select(
+                    id="dropdown-camera",
+                    options=[{"label": o.label, "value": o.key} for o in options],
+                    value=current,
+                    size="sm",
+                ),
+            ),
+            dbc.Col(
+                dbc.Button(
+                    html.I(className="bi bi-arrow-clockwise"),
+                    id="btn-camera-refresh",
+                    color="secondary",
+                    size="sm",
+                    title="Rescan for connected cameras",
+                ),
+                width="auto",
+                className="ps-1",
+            ),
+        ],
+        className="mb-2 g-0",
+    )
+
+
 def _fitting_tab(bp: BeamProfiler) -> dbc.Tab:
     """Build the **Fitting** tab content."""
     return dbc.Tab(
@@ -136,6 +193,10 @@ def _fitting_tab(bp: BeamProfiler) -> dbc.Tab:
         children=dbc.Card(
             dbc.CardBody(
                 [
+                    # Row 0 — which camera to stream from.
+                    dbc.Label("Camera", className="small mb-1"),
+                    _camera_controls(bp),
+                    html.Div(id="div-camera-status", className="small text-muted mb-2"),
                     # Row 1 — Play / Pause (full-width) with Spacebar shortcut hint.
                     dbc.Row(
                         dbc.Col(
@@ -1179,6 +1240,10 @@ def create_app(bp: BeamProfiler) -> dash.Dash:
         # (otherwise the "Dash is running on..." banner appears twice -- once
         # from Dash's handler and once propagated to the root logger).
         add_log_handler=False,
+        # The Setting panel is rebuilt from scratch every time the camera
+        # changes, so the ids its callbacks target are not all present in the
+        # initial layout. Without this Dash refuses to register them.
+        suppress_callback_exceptions=True,
     )
 
     app.index_string = """<!DOCTYPE html>
@@ -1436,6 +1501,108 @@ def _register_callbacks(app: dash.Dash, bp: BeamProfiler) -> None:
     global _server_paused, _zoom_range  # noqa: PLW0603
     _server_paused = False
     _zoom_range = None
+
+    # -- Camera selection -----------------------------------------------------
+    # Rescanning and switching both take ``_callback_lock``: swapping the
+    # camera out from under an in-flight ``ia.fetch`` would hand the
+    # Harvesters C library a destroyed acquirer, which segfaults rather than
+    # raising.
+
+    def _settings_body(items: list[Any]) -> Any:
+        """Wrap freshly built accordion items, or say why there are none."""
+        if items:
+            return dbc.Accordion(items, start_collapsed=False, always_open=True)
+        return html.P("No camera connected.", className="text-muted p-3")
+
+    @app.callback(
+        Output("dropdown-camera", "options"),
+        Output("dropdown-camera", "value"),
+        Output("div-camera-status", "children", allow_duplicate=True),
+        Input("btn-camera-refresh", "n_clicks"),
+        prevent_initial_call=True,
+    )
+    def refresh_cameras(_n: int | None) -> tuple[Any, Any, Any]:
+        """Rescan for connected cameras and repopulate the dropdown.
+
+        Enumeration runs under ``_callback_lock``, so the live view freezes
+        for as long as it takes. That is deliberate: a GenTL rescan can take a
+        second or two on a GigE network, and doing it concurrently with an
+        in-flight fetch is exactly the kind of thing the Harvesters C library
+        is unhappy about. A rescan is an explicit click, so a brief pause is
+        the right trade against a crash.
+        """
+        with _callback_lock:
+            options, current = _camera_options(bp)
+        listed = [{"label": o.label, "value": o.key} for o in options]
+        real = sum(1 for o in options if not o.is_simulated)
+        if real:
+            status = f"{real} camera{'s' if real != 1 else ''} found"
+        else:
+            status = "No hardware found - simulated only"
+        return listed, current, status
+
+    @app.callback(
+        Output("div-camera-status", "children"),
+        Output("store-paused", "data", allow_duplicate=True),
+        Output("btn-play-pause", "children", allow_duplicate=True),
+        Output("btn-play-pause", "color", allow_duplicate=True),
+        Output("settings-container", "children", allow_duplicate=True),
+        Output("input-pixel-scale", "value", allow_duplicate=True),
+        Input("dropdown-camera", "value"),
+        prevent_initial_call=True,
+    )
+    def switch_camera(key: str | None) -> tuple[Any, ...]:
+        """Open the selected camera and hand the profiler over to it.
+
+        The new camera is opened *before* the old one is closed, so a device
+        that is unplugged or already claimed by another application leaves the
+        current stream untouched instead of dropping the user into a dead app.
+
+        Streaming is left paused afterwards: the caller picked a camera, and
+        starting it is the next deliberate click.
+        """
+        global _server_paused, _zoom_range  # noqa: PLW0603
+
+        if not key:
+            return (dash.no_update,) * 6
+
+        with _callback_lock:
+            if bp.camera is not None and describe_open_camera(bp.camera).key == key:
+                return (dash.no_update,) * 6
+
+            options, _ = _camera_options(bp)
+            option = find_option(key, options)
+            if option is None:
+                return (f"Unknown camera: {key}",) + (dash.no_update,) * 5
+
+            try:
+                camera = open_camera(option)
+            except Exception as e:
+                logger.warning("Could not switch to %s: %s", option.label, e)
+                return (f"Could not open {option.label}: {e}",) + (dash.no_update,) * 5
+
+            bp.attach_camera(camera)
+
+            # Everything derived from the previous camera is now meaningless:
+            # the zoom is in the old sensor's micrometres, the averaging
+            # buffer holds frames of the old shape, and the fps window
+            # measured a different device.
+            _server_paused = True
+            _zoom_range = None
+            _recent_frame_times.clear()
+            _reset_avg_state()
+
+            items = _build_setting_items(bp)
+            scale = round(bp.pixel_size, 4)
+
+        return (
+            f"{option.label} ready - press Play",
+            True,
+            [html.I(className="bi bi-play-fill me-1"), "Play"],
+            "success",
+            _settings_body(items),
+            scale,
+        )
 
     # -- Play / Pause toggle --------------------------------------------------
     @app.callback(
@@ -1732,158 +1899,156 @@ def _register_callbacks(app: dash.Dash, bp: BeamProfiler) -> None:
             return dash.no_update, val
         return val, dash.no_update
 
-    # -- ROI apply (conditional) ----------------------------------------------
-    has_roi = bp.camera is not None and hasattr(bp.camera, "set_roi")
-    if has_roi:
+    # -- ROI apply ------------------------------------------------------------
+    # Registered unconditionally: the attached camera can change at runtime,
+    # so whether one supports ROI is not a question that can be settled once
+    # at start-up. Each callback re-checks the live camera instead.
 
-        @app.callback(
-            Output("div-roi-status", "children"),
-            Input("btn-roi-apply", "n_clicks"),
-            State("input-roi-ox", "value"),
-            State("input-roi-oy", "value"),
-            State("input-roi-w", "value"),
-            State("input-roi-h", "value"),
-            prevent_initial_call=True,
-        )
-        def apply_roi(_n: int, ox: int, oy: int, w: int, h: int) -> str:
-            if bp.camera is None:
-                return "No camera"
-            if ox is None or oy is None or w is None or h is None:
-                return "Please enter offset/width/height"
-            with _callback_lock:
-                try:
-                    offset_x = int(ox)
-                    offset_y = int(oy)
-                    width = int(w)
-                    height = int(h)
-                    was_acquiring = bp.camera.is_acquiring
-                    if was_acquiring:
-                        bp.camera.stop_acquisition()
-                    getattr(bp.camera, "set_roi")(
-                        offset_x=offset_x, offset_y=offset_y, width=width, height=height
-                    )
-                    if was_acquiring:
-                        bp.camera.start_acquisition()
-                    roi = getattr(bp.camera, "roi_info")
-                    return f"ROI: {roi['width']}×{roi['height']} at ({roi['offset_x']},{roi['offset_y']})"
-                except Exception as e:
-                    logger.warning(f"Failed to set ROI: {e}")
-                    return f"Error: {e}"
+    @app.callback(
+        Output("div-roi-status", "children"),
+        Input("btn-roi-apply", "n_clicks"),
+        State("input-roi-ox", "value"),
+        State("input-roi-oy", "value"),
+        State("input-roi-w", "value"),
+        State("input-roi-h", "value"),
+        prevent_initial_call=True,
+    )
+    def apply_roi(_n: int, ox: int, oy: int, w: int, h: int) -> str:
+        if bp.camera is None:
+            return "No camera"
+        if ox is None or oy is None or w is None or h is None:
+            return "Please enter offset/width/height"
+        with _callback_lock:
+            try:
+                offset_x = int(ox)
+                offset_y = int(oy)
+                width = int(w)
+                height = int(h)
+                was_acquiring = bp.camera.is_acquiring
+                if was_acquiring:
+                    bp.camera.stop_acquisition()
+                getattr(bp.camera, "set_roi")(
+                    offset_x=offset_x, offset_y=offset_y, width=width, height=height
+                )
+                if was_acquiring:
+                    bp.camera.start_acquisition()
+                roi = getattr(bp.camera, "roi_info")
+                return (
+                    f"ROI: {roi['width']}×{roi['height']} at ({roi['offset_x']},{roi['offset_y']})"
+                )
+            except Exception as e:
+                logger.warning(f"Failed to set ROI: {e}")
+                return f"Error: {e}"
 
-        @app.callback(
-            Output("input-roi-ox", "value"),
-            Output("input-roi-oy", "value"),
-            Output("input-roi-w", "value"),
-            Output("input-roi-h", "value"),
-            Output("div-roi-status", "children", allow_duplicate=True),
-            Input("btn-roi-reset", "n_clicks"),
-            prevent_initial_call=True,
-        )
-        def reset_roi(_n: int) -> tuple[int, int, int, int, str]:
-            if bp.camera is None:
-                return 0, 0, 0, 0, "No camera"
-            with _callback_lock:
-                try:
-                    was_acquiring = bp.camera.is_acquiring
-                    if was_acquiring:
-                        bp.camera.stop_acquisition()
-                    getattr(bp.camera, "set_roi")(offset_x=0, offset_y=0, width=None, height=None)
-                    if was_acquiring:
-                        bp.camera.start_acquisition()
-                    roi = getattr(bp.camera, "roi_info")
-                    return 0, 0, roi["max_width"], roi["max_height"], "Reset to full sensor"
-                except Exception as e:
-                    logger.warning(f"Failed to reset ROI: {e}")
-                    return 0, 0, 0, 0, f"Error: {e}"
+    @app.callback(
+        Output("input-roi-ox", "value"),
+        Output("input-roi-oy", "value"),
+        Output("input-roi-w", "value"),
+        Output("input-roi-h", "value"),
+        Output("div-roi-status", "children", allow_duplicate=True),
+        Input("btn-roi-reset", "n_clicks"),
+        prevent_initial_call=True,
+    )
+    def reset_roi(_n: int) -> tuple[int, int, int, int, str]:
+        if bp.camera is None:
+            return 0, 0, 0, 0, "No camera"
+        with _callback_lock:
+            try:
+                was_acquiring = bp.camera.is_acquiring
+                if was_acquiring:
+                    bp.camera.stop_acquisition()
+                getattr(bp.camera, "set_roi")(offset_x=0, offset_y=0, width=None, height=None)
+                if was_acquiring:
+                    bp.camera.start_acquisition()
+                roi = getattr(bp.camera, "roi_info")
+                return 0, 0, roi["max_width"], roi["max_height"], "Reset to full sensor"
+            except Exception as e:
+                logger.warning(f"Failed to reset ROI: {e}")
+                return 0, 0, 0, 0, f"Error: {e}"
 
     # -- GenICam feature callbacks (pattern-matching) -------------------------
-    has_genicam = (
-        bp.camera is not None
-        and hasattr(bp.camera, "_discover_features")
-        and bp.camera._discover_features()
+    # Also unconditional. Pattern-matching callbacks happily target components
+    # that appear later, which is exactly what happens when a camera switch
+    # rebuilds the Setting panel with a different feature set.
+
+    @app.callback(
+        Output({"type": "genicam-num", "feature": MATCH}, "value"),
+        Output({"type": "genicam-num-input", "feature": MATCH}, "value"),
+        Input({"type": "genicam-num", "feature": MATCH}, "value"),
+        Input({"type": "genicam-num-input", "feature": MATCH}, "value"),
+        prevent_initial_call=True,
     )
-    if has_genicam:
+    def set_genicam_numeric(slider_val: float | None, input_val: float | None) -> tuple[Any, Any]:
+        trigger = ctx.triggered_id
+        source = trigger.get("type") if isinstance(trigger, dict) else None
+        value = slider_val if source == "genicam-num" else input_val
+        if value is None or bp.camera is None or not isinstance(trigger, dict):
+            return dash.no_update, dash.no_update
+        feature = trigger.get("feature")
+        if feature is None:
+            return dash.no_update, dash.no_update
+        with _callback_lock:
+            nm = getattr(bp.camera, "node_map", None)
+            if nm is not None:
+                node = getattr(nm, feature, None)
+                if node is not None:
+                    try:
+                        was_acquiring = bp.camera.is_acquiring
+                        node.value = value
+                        if was_acquiring and not bp.camera.is_acquiring and not _server_paused:
+                            bp.camera.start_acquisition()
+                    except Exception as e:
+                        logger.debug("Failed to set %s: %s", feature, e)
+        # Mirror to the other control only (see set_exposure for rationale).
+        if source == "genicam-num":
+            return dash.no_update, value
+        return value, dash.no_update
 
-        @app.callback(
-            Output({"type": "genicam-num", "feature": MATCH}, "value"),
-            Output({"type": "genicam-num-input", "feature": MATCH}, "value"),
-            Input({"type": "genicam-num", "feature": MATCH}, "value"),
-            Input({"type": "genicam-num-input", "feature": MATCH}, "value"),
-            prevent_initial_call=True,
-        )
-        def set_genicam_numeric(
-            slider_val: float | None, input_val: float | None
-        ) -> tuple[Any, Any]:
-            trigger = ctx.triggered_id
-            source = trigger.get("type") if isinstance(trigger, dict) else None
-            value = slider_val if source == "genicam-num" else input_val
-            if value is None or bp.camera is None or not isinstance(trigger, dict):
-                return dash.no_update, dash.no_update
-            feature = trigger.get("feature")
-            if feature is None:
-                return dash.no_update, dash.no_update
-            with _callback_lock:
-                nm = getattr(bp.camera, "node_map", None)
-                if nm is not None:
-                    node = getattr(nm, feature, None)
-                    if node is not None:
-                        try:
-                            was_acquiring = bp.camera.is_acquiring
-                            node.value = value
-                            if was_acquiring and not bp.camera.is_acquiring and not _server_paused:
-                                bp.camera.start_acquisition()
-                        except Exception as e:
-                            logger.debug("Failed to set %s: %s", feature, e)
-            # Mirror to the other control only (see set_exposure for rationale).
-            if source == "genicam-num":
-                return dash.no_update, value
-            return value, dash.no_update
+    @app.callback(
+        Output({"type": "genicam-sel", "feature": MATCH}, "value"),
+        Input({"type": "genicam-sel", "feature": MATCH}, "value"),
+        prevent_initial_call=True,
+    )
+    def set_genicam_select(value: str | None) -> Any:
+        if value is None or bp.camera is None:
+            return dash.no_update
+        feature = ctx.triggered_id["feature"]
+        with _callback_lock:
+            nm = getattr(bp.camera, "node_map", None)
+            if nm is not None:
+                node = getattr(nm, feature, None)
+                if node is not None:
+                    try:
+                        was_acquiring = bp.camera.is_acquiring
+                        node.value = value
+                        if was_acquiring and not bp.camera.is_acquiring and not _server_paused:
+                            bp.camera.start_acquisition()
+                    except Exception as e:
+                        logger.debug("Failed to set %s: %s", feature, e)
+        return value
 
-        @app.callback(
-            Output({"type": "genicam-sel", "feature": MATCH}, "value"),
-            Input({"type": "genicam-sel", "feature": MATCH}, "value"),
-            prevent_initial_call=True,
-        )
-        def set_genicam_select(value: str | None) -> Any:
-            if value is None or bp.camera is None:
-                return dash.no_update
-            feature = ctx.triggered_id["feature"]
-            with _callback_lock:
-                nm = getattr(bp.camera, "node_map", None)
-                if nm is not None:
-                    node = getattr(nm, feature, None)
-                    if node is not None:
-                        try:
-                            was_acquiring = bp.camera.is_acquiring
-                            node.value = value
-                            if was_acquiring and not bp.camera.is_acquiring and not _server_paused:
-                                bp.camera.start_acquisition()
-                        except Exception as e:
-                            logger.debug("Failed to set %s: %s", feature, e)
-            return value
-
-        @app.callback(
-            Output({"type": "genicam-sw", "feature": MATCH}, "value"),
-            Input({"type": "genicam-sw", "feature": MATCH}, "value"),
-            prevent_initial_call=True,
-        )
-        def set_genicam_switch(value: bool) -> Any:
-            if bp.camera is None:
-                return dash.no_update
-            feature = ctx.triggered_id["feature"]
-            with _callback_lock:
-                nm = getattr(bp.camera, "node_map", None)
-                if nm is not None:
-                    node = getattr(nm, feature, None)
-                    if node is not None:
-                        try:
-                            was_acquiring = bp.camera.is_acquiring
-                            node.value = value
-                            if was_acquiring and not bp.camera.is_acquiring and not _server_paused:
-                                bp.camera.start_acquisition()
-                        except Exception as e:
-                            logger.debug("Failed to set %s: %s", feature, e)
-            return value
+    @app.callback(
+        Output({"type": "genicam-sw", "feature": MATCH}, "value"),
+        Input({"type": "genicam-sw", "feature": MATCH}, "value"),
+        prevent_initial_call=True,
+    )
+    def set_genicam_switch(value: bool) -> Any:
+        if bp.camera is None:
+            return dash.no_update
+        feature = ctx.triggered_id["feature"]
+        with _callback_lock:
+            nm = getattr(bp.camera, "node_map", None)
+            if nm is not None:
+                node = getattr(nm, feature, None)
+                if node is not None:
+                    try:
+                        was_acquiring = bp.camera.is_acquiring
+                        node.value = value
+                        if was_acquiring and not bp.camera.is_acquiring and not _server_paused:
+                            bp.camera.start_acquisition()
+                    except Exception as e:
+                        logger.debug("Failed to set %s: %s", feature, e)
+        return value
 
     # -- Main update loop -----------------------------------------------------
     @app.callback(
