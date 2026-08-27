@@ -170,10 +170,6 @@ uv run pytest --cov-report=html        # HTML coverage report
 uv run pytest tests/test_profiler.py   # single file
 ```
 
-Current suite: **815 tests, 99% coverage**. The suite is hermetic — an
-autouse fixture hides any camera SDK installed on the machine, so results
-do not depend on what happens to be plugged in.
-
 ### Architecture
 
 - `fitting.py` — Gaussian models, direct width measurements, curve fits, decimation (pure functions over arrays; no camera or plotting state)

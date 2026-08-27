@@ -15,6 +15,32 @@ os.environ["PYBEAMPROFILER_NO_BROWSER"] = "1"
 # The real vendor search tables, captured before anything blanks them.
 REAL_VENDOR_DIRS = cti._VENDOR_DIRS
 
+# The GenICam bindings ship as binary wheels and are not available on every
+# platform/interpreter combination the project supports -- notably macOS on
+# Python 3.14, where no genicam release has a wheel. Tests that genuinely need
+# the real enums skip rather than fail there.
+try:  # pragma: no cover - depends on what is installed
+    import genicam.genapi  # noqa: F401
+
+    HAS_GENICAM = True
+except ImportError:  # pragma: no cover
+    HAS_GENICAM = False
+
+requires_genicam = pytest.mark.skipif(
+    not HAS_GENICAM, reason="genicam bindings are not installed on this platform"
+)
+
+try:  # pragma: no cover - depends on what is installed
+    import harvesters.core  # noqa: F401
+
+    HAS_HARVESTERS = True
+except ImportError:  # pragma: no cover
+    HAS_HARVESTERS = False
+
+requires_harvesters = pytest.mark.skipif(
+    not HAS_HARVESTERS, reason="harvesters is not importable on this platform"
+)
+
 
 @pytest.fixture(autouse=True)
 def _no_installed_sdk(request, monkeypatch):

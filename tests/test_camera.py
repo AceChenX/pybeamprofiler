@@ -7,6 +7,7 @@ from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pytest
+from conftest import requires_genicam, requires_harvesters
 
 from pybeamprofiler import BeamProfiler, SimulatedCamera
 from pybeamprofiler.camera import _categorize_feature
@@ -579,6 +580,7 @@ class TestGenCameraSensorLookup:
         assert result is None
 
 
+@requires_harvesters
 class TestGenCameraGetImage:
     """Test HarvesterCamera.get_image timeout normalisation and stall recovery."""
 
@@ -1986,6 +1988,7 @@ class TestDiscoverFeatures:
         assert "Gamma" in all_features
         assert "BadNode" not in all_features
 
+    @requires_genicam
     def test_nodes_api_with_interface_type_and_visibility(self):
         """Simulate a real GenICam ``node_map`` that exposes a ``.nodes``
         iterable where each entry has ``principal_interface_type`` /

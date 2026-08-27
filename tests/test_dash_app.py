@@ -10,6 +10,7 @@ import dash_bootstrap_components as dbc
 import numpy as np
 import plotly.graph_objs as go
 import pytest
+from conftest import requires_genicam
 from dash import html
 
 from pybeamprofiler.beamprofiler import BeamProfiler
@@ -2358,6 +2359,7 @@ class TestCallbackErrorBranches:
 # ─── Small branch coverage for helpers and callbacks ────────────────────────
 
 
+@requires_genicam
 class TestIsReadonlyEAccessMode:
     """``_is_readonly`` branches that depend on GenICam's ``EAccessMode``
     enum — exercised only when a node exposes ``get_access_mode`` AND

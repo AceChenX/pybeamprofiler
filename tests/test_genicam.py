@@ -4,6 +4,7 @@ from unittest.mock import MagicMock, Mock, patch
 
 import numpy as np
 import pytest
+from conftest import requires_harvesters
 
 
 class TestHarvesterCamera:
@@ -292,6 +293,7 @@ class TestHarvesterCameraErrors:
             assert "not found" in str(e)
 
 
+@requires_harvesters
 class TestHarvesterCameraGetImage:
     """Test get_image auto-start and timeout wrapping."""
 
