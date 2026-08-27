@@ -50,6 +50,8 @@ class BeamProfiler:
         pixel_size: Pixel pitch in micrometers. Required with *file*; with a
             camera it overrides the value the camera reports, which is worth
             doing when binning is on or the camera reports nothing useful.
+        serial_number: Open this specific device when more than one camera of
+            the requested type is attached. Ignored by the simulated camera.
 
     Attributes:
         width_x: Beam width in x, in the selected definition (μm)
@@ -68,6 +70,7 @@ class BeamProfiler:
         definition: str = "gaussian",
         exposure_time: float | None = None,
         pixel_size: float | None = None,
+        serial_number: str | None = None,
     ) -> None:
         """Initialize the beam profiler.
 
@@ -102,6 +105,10 @@ class BeamProfiler:
         if pixel_size is not None and pixel_size <= 0:
             raise ValueError(f"pixel_size must be greater than zero, got {pixel_size}")
 
+        # Kept so :meth:`attach_camera` knows whether the scale was the
+        # caller's choice (honour it) or the previous camera's (re-derive it).
+        self._pixel_size_override: float | None = pixel_size
+
         if file:
             self._load_file(file)
             self._mode = "static"
@@ -109,7 +116,7 @@ class BeamProfiler:
                 raise ValueError("Pixel size must be provided for static beam image files")
             self.pixel_size = pixel_size
         elif camera:
-            self._initialize_camera(camera)
+            self._initialize_camera(camera, serial_number)
         else:
             self.camera = SimulatedCamera()
             self.camera.open()
@@ -127,20 +134,25 @@ class BeamProfiler:
         else:
             raise ValueError("Either camera or file must be provided and successfully loaded")
 
-    def _initialize_camera(self, camera: str) -> None:
-        """Initialize camera hardware.
+    def _initialize_camera(self, camera: str, serial_number: str | None = None) -> None:
+        """Open the named camera type.
+
+        A physical camera that fails to open is an error worth surfacing —
+        silently handing back simulated data would look like a working
+        measurement. Only an unrecognised name falls back to the simulator.
 
         Args:
-            camera: Camera type string
+            camera: Camera type string ('flir', 'basler', 'simulated').
+            serial_number: Specific device to open when several are attached.
 
         Raises:
-            RuntimeError: If physical camera fails to open
+            RuntimeError: If a physical camera fails to open.
         """
         camera_lower = camera.lower()
         if camera_lower == "flir":
-            self.camera = FlirCamera()
+            self.camera = FlirCamera(serial_number=serial_number)
         elif camera_lower == "basler":
-            self.camera = BaslerCamera()
+            self.camera = BaslerCamera(serial_number=serial_number)
         elif camera_lower == "simulated":
             self.camera = SimulatedCamera()
         else:
@@ -485,6 +497,70 @@ class BeamProfiler:
         """
         self.width_x = D4SIGMA_FACTOR * sigma_x * self.pixel_size
         self.width_y = D4SIGMA_FACTOR * sigma_y * self.pixel_size
+
+    def attach_camera(self, camera: Camera, *, close_previous: bool = True) -> None:
+        """Swap in an already-open *camera*, replacing the current one.
+
+        Everything derived from the old camera is dropped, which matters more
+        than it looks: the fitter warm-starts each frame from the previous
+        frame's parameters, and a centre or sigma measured on a 1024x1024
+        sensor is a nonsense starting point for a 1280x1024 one. Carrying it
+        over makes the first fits after a switch converge slowly or not at
+        all.
+
+        Args:
+            camera: An **opened** camera to take over from the current one.
+            close_previous: Close the camera being replaced. Leave this on
+                unless you intend to keep using it — a GenICam device stays
+                claimed until it is closed, so the old one would block any
+                attempt to reopen it.
+        """
+        previous = self.camera
+        if previous is camera:
+            return
+
+        if previous is not None and close_previous:
+            try:
+                if previous.is_acquiring:
+                    previous.stop_acquisition()
+                previous.close()
+            except Exception:
+                logger.warning("Error closing the previous camera", exc_info=True)
+
+        self.camera = camera
+        self._mode = "camera"
+        self.width_pixels = camera.width
+        self.height_pixels = camera.height
+        # A pixel size the caller pinned at construction time stays pinned;
+        # otherwise take the new camera's own pitch rather than the old one's.
+        self.pixel_size = (
+            self._pixel_size_override
+            if self._pixel_size_override is not None
+            else camera.pixel_size
+        )
+        self.reset_analysis()
+
+    def reset_analysis(self) -> None:
+        """Forget everything measured from previous frames.
+
+        Clears the warm-start parameters, the cached projections and the last
+        frame, so the next :meth:`analyze` starts from a cold estimate.
+        """
+        self._last_popt_x = None
+        self._last_popt_y = None
+        self._last_popt_2d = None
+        self._last_proj_x = None
+        self._last_proj_y = None
+        self.last_img = None
+        self.width_x = 0.0
+        self.width_y = 0.0
+        self.center_x = 0.0
+        self.center_y = 0.0
+        self.angle_deg = 0.0
+        self.peak_value = 0.0
+        for attr in ("_linecut_x", "_linecut_y"):
+            if hasattr(self, attr):
+                delattr(self, attr)
 
     def stop(self) -> None:
         """Stop any active continuous streams and stop camera acquisition."""

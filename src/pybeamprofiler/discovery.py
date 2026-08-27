@@ -26,8 +26,11 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-#: Dropdown value for the built-in simulated camera.
+#: Camera kind for the built-in simulator.
 SIMULATED_KEY = "simulated"
+
+#: Prefix for simulated devices; the remainder is the profile key.
+SIMULATED_PREFIX = "simulated:"
 
 #: Prefix for real GenICam devices; the remainder is the serial number.
 GENICAM_PREFIX = "genicam:"
@@ -155,14 +158,32 @@ class CameraOption:
         return self.kind == SIMULATED_KEY
 
 
-#: The always-available fallback, so the GUI is usable with no hardware.
-SIMULATED_OPTION = CameraOption(
-    key=SIMULATED_KEY,
-    label="Simulated camera",
-    kind=SIMULATED_KEY,
-    vendor="pybeamprofiler",
-    model="SimulatedCamera",
-)
+def simulated_options() -> list[CameraOption]:
+    """The built-in fake cameras, one per :data:`SIMULATED_PROFILES` entry.
+
+    More than one is offered deliberately: it means the camera selector can
+    be exercised end to end — including the close/reopen path and the
+    re-layout that a different sensor size forces — on a machine with no
+    hardware attached.
+    """
+    from .simulated import SIMULATED_PROFILES
+
+    return [
+        CameraOption(
+            key=f"{SIMULATED_PREFIX}{profile.key}",
+            label=f"{profile.name} ({profile.serial_number})",
+            kind=SIMULATED_KEY,
+            vendor="pybeamprofiler",
+            model=profile.name,
+            serial_number=profile.serial_number,
+        )
+        for profile in SIMULATED_PROFILES
+    ]
+
+
+def default_simulated_option() -> CameraOption:
+    """The simulated camera used when nothing else is selected."""
+    return simulated_options()[0]
 
 
 def _describe(info: dict[str, str | int]) -> CameraOption:
@@ -200,12 +221,12 @@ def discover_cameras(
     be far less useful than a short list.
 
     Args:
-        include_simulated: Append the built-in simulated camera. Keep this on
-            for the GUI; turn it off when you only want real hardware.
+        include_simulated: Append the built-in simulated cameras. Keep this
+            on for the GUI; turn it off when you only want real hardware.
         cti_file: Restrict the search to one GenTL producer.
 
     Returns:
-        Real devices first (in enumeration order), then the simulator.
+        Real devices first (in enumeration order), then the simulated ones.
     """
     options: list[CameraOption] = []
     try:
@@ -225,7 +246,7 @@ def discover_cameras(
             unique.append(option)
 
     if include_simulated:
-        unique.append(SIMULATED_OPTION)
+        unique.extend(simulated_options())
     return unique
 
 
@@ -257,10 +278,10 @@ def open_camera(option: CameraOption) -> Camera:
         RuntimeError: If the device cannot be opened — most often because
             another application already holds it.
     """
-    from .simulated import SimulatedCamera
-
     if option.is_simulated:
-        camera: Camera = SimulatedCamera()
+        from .simulated import SimulatedCamera, profile_for
+
+        camera: Camera = SimulatedCamera(profile_for(option.key.removeprefix(SIMULATED_PREFIX)))
         camera.open()
         return camera
 

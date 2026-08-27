@@ -228,7 +228,7 @@ class TestListCamerasEdgeCases:
 
 class TestCameraOption:
     def test_simulated_option_is_flagged(self):
-        assert discovery.SIMULATED_OPTION.is_simulated is True
+        assert discovery.default_simulated_option().is_simulated is True
 
     def test_real_option_is_not(self):
         option = discovery._describe(
@@ -269,11 +269,47 @@ class TestCameraOption:
         assert len({a, b}) == 1
 
 
+class TestSimulatedOptions:
+    """More than one simulator is offered so the selector can be exercised
+    end to end without hardware."""
+
+    def test_one_option_per_profile(self):
+        from pybeamprofiler.simulated import SIMULATED_PROFILES
+
+        options = discovery.simulated_options()
+        assert len(options) == len(SIMULATED_PROFILES) >= 2
+
+    def test_keys_are_unique_and_prefixed(self):
+        options = discovery.simulated_options()
+        keys = [o.key for o in options]
+        assert len(set(keys)) == len(keys)
+        assert all(k.startswith(discovery.SIMULATED_PREFIX) for k in keys)
+
+    def test_all_are_flagged_simulated(self):
+        assert all(o.is_simulated for o in discovery.simulated_options())
+
+    def test_labels_carry_the_fake_serial(self):
+        for option in discovery.simulated_options():
+            assert option.serial_number in option.label
+
+    def test_default_is_the_first_profile(self):
+        from pybeamprofiler.simulated import DEFAULT_PROFILE
+
+        assert discovery.default_simulated_option().serial_number == DEFAULT_PROFILE.serial_number
+
+    def test_profiles_differ_in_sensor_geometry(self):
+        """Clones would not prove the selector re-laid anything out."""
+        from pybeamprofiler.simulated import SIMULATED_PROFILES
+
+        shapes = {(p.width, p.height, p.pixel_size) for p in SIMULATED_PROFILES}
+        assert len(shapes) == len(SIMULATED_PROFILES)
+
+
 class TestDiscoverCameras:
     def test_simulated_is_always_offered(self):
         with patch("pybeamprofiler.discovery.list_cameras", return_value=[]):
             options = discovery.discover_cameras()
-        assert options == [discovery.SIMULATED_OPTION]
+        assert options == discovery.simulated_options()
 
     def test_simulated_can_be_excluded(self):
         with patch("pybeamprofiler.discovery.list_cameras", return_value=[]):
@@ -287,7 +323,9 @@ class TestDiscoverCameras:
         with patch("pybeamprofiler.discovery.list_cameras", return_value=devices):
             options = discovery.discover_cameras()
 
-        assert [o.key for o in options] == ["genicam:111", "genicam:222", "simulated"]
+        keys = [o.key for o in options]
+        assert keys[:2] == ["genicam:111", "genicam:222"]
+        assert all(k.startswith(discovery.SIMULATED_PREFIX) for k in keys[2:])
 
     def test_the_same_camera_seen_through_two_producers_appears_once(self):
         """A Basler USB3 device enumerates through both the GEV and U3V .cti."""
@@ -298,13 +336,13 @@ class TestDiscoverCameras:
         with patch("pybeamprofiler.discovery.list_cameras", return_value=devices):
             options = discovery.discover_cameras()
 
-        assert [o.key for o in options] == ["genicam:222", "simulated"]
+        assert [o.key for o in options if not o.is_simulated] == ["genicam:222"]
 
     def test_discovery_failure_still_offers_the_simulator(self):
         """Behind a Refresh button, a short list beats a traceback."""
         with patch("pybeamprofiler.discovery.list_cameras", side_effect=RuntimeError("no SDK")):
             options = discovery.discover_cameras()
-        assert options == [discovery.SIMULATED_OPTION]
+        assert options == discovery.simulated_options()
 
     def test_cti_file_is_forwarded(self):
         with patch("pybeamprofiler.discovery.list_cameras", return_value=[]) as mock_list:
@@ -314,24 +352,49 @@ class TestDiscoverCameras:
 
 class TestFindOption:
     def test_finds_by_key(self):
-        options = [discovery.SIMULATED_OPTION]
-        assert discovery.find_option("simulated", options) is discovery.SIMULATED_OPTION
+        options = discovery.simulated_options()
+        assert discovery.find_option(options[0].key, options) is options[0]
 
     def test_unknown_key_is_none(self):
-        assert discovery.find_option("genicam:nope", [discovery.SIMULATED_OPTION]) is None
+        assert discovery.find_option("genicam:nope", discovery.simulated_options()) is None
 
     def test_blank_key_is_none(self):
-        assert discovery.find_option(None, [discovery.SIMULATED_OPTION]) is None
-        assert discovery.find_option("", [discovery.SIMULATED_OPTION]) is None
+        options = discovery.simulated_options()
+        assert discovery.find_option(None, options) is None
+        assert discovery.find_option("", options) is None
 
 
 class TestOpenCamera:
     def test_opens_the_simulator(self):
         from pybeamprofiler.simulated import SimulatedCamera
 
-        cam = discovery.open_camera(discovery.SIMULATED_OPTION)
+        cam = discovery.open_camera(discovery.default_simulated_option())
         assert isinstance(cam, SimulatedCamera)
         assert cam.node_map is not None, "open() should have built the node map"
+        cam.close()
+
+    @pytest.mark.parametrize("index", range(2))
+    def test_each_simulated_option_opens_its_own_profile(self, index):
+        from pybeamprofiler.simulated import SimulatedCamera
+
+        option = discovery.simulated_options()[index]
+        cam = discovery.open_camera(option)
+        assert isinstance(cam, SimulatedCamera)
+        assert cam.serial_number == option.serial_number
+        assert (cam.width, cam.height) == (cam.profile.width, cam.profile.height)
+        cam.close()
+
+    def test_an_unknown_simulated_profile_falls_back_to_the_default(self):
+        from pybeamprofiler.simulated import DEFAULT_PROFILE, SimulatedCamera
+
+        option = discovery.CameraOption(
+            key=f"{discovery.SIMULATED_PREFIX}does-not-exist",
+            label="ghost",
+            kind=discovery.SIMULATED_KEY,
+        )
+        cam = discovery.open_camera(option)
+        assert isinstance(cam, SimulatedCamera)
+        assert cam.profile is DEFAULT_PROFILE
         cam.close()
 
     def test_opens_a_genicam_device_by_serial(self):

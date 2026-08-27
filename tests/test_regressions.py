@@ -499,3 +499,100 @@ class TestFeatureDiscoveryCache:
         a._discover_features()
         assert b._feature_cache is None
         a.close()
+
+
+class TestSimulatedProfiles:
+    """Multiple simulated cameras exist so the selector can be exercised
+    without hardware. Each must behave like its own device."""
+
+    def test_default_matches_the_historical_constants(self):
+        """``SimulatedCamera()`` with no argument must not have changed."""
+        from pybeamprofiler import constants
+        from pybeamprofiler.simulated import SimulatedCamera
+
+        cam = SimulatedCamera()
+        assert (cam.width, cam.height) == (constants.SIMULATED_WIDTH, constants.SIMULATED_HEIGHT)
+        assert cam.pixel_size == constants.SIMULATED_PIXEL_SIZE
+        assert cam._sigma_x == constants.SIMULATED_SIGMA_X
+        assert cam._sigma_y == constants.SIMULATED_SIGMA_Y
+        cam.close()
+
+    @pytest.mark.parametrize("profile_index", [0, 1])
+    def test_frame_shape_follows_the_profile(self, profile_index):
+        from pybeamprofiler.simulated import SIMULATED_PROFILES, SimulatedCamera
+
+        profile = SIMULATED_PROFILES[profile_index]
+        cam = SimulatedCamera(profile)
+        cam.open()
+        assert cam.get_image().shape == (profile.height, profile.width)
+        cam.close()
+
+    @pytest.mark.parametrize("profile_index", [0, 1])
+    def test_roi_still_crops_correctly(self, profile_index):
+        """The frame is rendered at full sensor size and then cropped.
+
+        ``width``/``height`` track the ROI while the render buffer stays at
+        sensor size — mixing the two up broadcasts a full-sensor noise array
+        against an ROI-sized buffer and raises.
+        """
+        from pybeamprofiler.simulated import SIMULATED_PROFILES, SimulatedCamera
+
+        cam = SimulatedCamera(SIMULATED_PROFILES[profile_index])
+        cam.open()
+        cam.set_roi(offset_x=10, offset_y=20, width=64, height=48)
+
+        img = cam.get_image()
+        assert img.shape == (48, 64)
+        assert img.shape == (cam.height_pixels, cam.width_pixels)
+        cam.close()
+
+    @pytest.mark.parametrize("profile_index", [0, 1])
+    def test_roi_clamps_to_this_profile_sensor(self, profile_index):
+        from pybeamprofiler.simulated import SIMULATED_PROFILES, SimulatedCamera
+
+        profile = SIMULATED_PROFILES[profile_index]
+        cam = SimulatedCamera(profile)
+        cam.open()
+        cam.set_roi(offset_x=0, offset_y=0, width=99_999, height=99_999)
+
+        assert cam.roi_info["max_width"] == profile.width
+        assert cam.roi_info["max_height"] == profile.height
+        assert cam.get_image().shape == (profile.height, profile.width)
+        cam.close()
+
+    def test_tilted_profile_produces_a_rotated_beam(self):
+        """The 2D fit must recover the tilt the profile asked for."""
+        from pybeamprofiler.simulated import SIMULATED_PROFILES, SimulatedCamera
+
+        tilted = next(p for p in SIMULATED_PROFILES if p.theta_deg)
+        cam = SimulatedCamera(tilted)
+        cam.open()
+
+        bp = BeamProfiler(camera="simulated", fit="2d")
+        bp.attach_camera(cam)
+        for _ in range(4):  # let the warm-started fit settle
+            bp.analyze(cam.get_image())
+
+        assert bp.angle_deg == pytest.approx(tilted.theta_deg, abs=5.0)
+        assert max(bp.width_x, bp.width_y) / min(bp.width_x, bp.width_y) > 2.0
+        cam.close()
+
+    def test_node_map_reports_this_profile(self):
+        from pybeamprofiler.simulated import SIMULATED_PROFILES, SimulatedCamera
+
+        profile = SIMULATED_PROFILES[1]
+        cam = SimulatedCamera(profile)
+        cam.open()
+        nm = cam.node_map
+        assert nm is not None
+        assert nm.DeviceModelName.value == profile.name
+        assert nm.DeviceSerialNumber.value == profile.serial_number
+        assert nm.WidthMax.value == profile.width
+        assert nm.HeightMax.value == profile.height
+        cam.close()
+
+    def test_profiles_have_unique_keys_and_serials(self):
+        from pybeamprofiler.simulated import SIMULATED_PROFILES
+
+        assert len({p.key for p in SIMULATED_PROFILES}) == len(SIMULATED_PROFILES)
+        assert len({p.serial_number for p in SIMULATED_PROFILES}) == len(SIMULATED_PROFILES)
