@@ -1,4 +1,10 @@
-"""Basler camera interface using Harvesters/GenICam."""
+"""Basler cameras (Pylon).
+
+Only locating the GenTL producer differs from the generic GenICam path, and
+even that is delegated to :mod:`pybeamprofiler.cti`. Basler ships one
+producer per transport layer, so all of them are loaded — which interface a
+given camera speaks is not known until it is opened.
+"""
 
 import logging
 import os

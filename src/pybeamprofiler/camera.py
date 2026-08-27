@@ -1,4 +1,16 @@
-"""Base camera interface for beam profiler."""
+"""The :class:`Camera` interface, and the Jupyter panel built from it.
+
+Every camera — simulated or real — implements the same small contract:
+open, acquire, hand back a 2D frame, close. Concrete implementations live in
+``simulated.py`` and ``gen_camera.py``.
+
+The bulk of this module is the ``ipywidgets`` control panel. It is generated
+by introspecting a camera's GenICam ``node_map`` rather than hard-coding a
+list of features, because which features exist varies by vendor, model and
+firmware. That introspection is deliberately defensive: cameras expose
+plenty of nodes that appear in the map but raise the moment you touch them,
+so anything that cannot be rendered is skipped rather than reported.
+"""
 
 from __future__ import annotations
 
@@ -134,22 +146,26 @@ class Camera(ABC):
 
     @abstractmethod
     def open(self) -> None:
-        """Open connection to the camera."""
+        """Claim the device and read back its capabilities.
+
+        A GenICam device stays claimed until :meth:`close`, so exactly one
+        process can hold it at a time.
+        """
         ...
 
     @abstractmethod
     def close(self) -> None:
-        """Close connection to the camera."""
+        """Release the device. Must be safe to call twice."""
         ...
 
     @abstractmethod
     def start_acquisition(self) -> None:
-        """Start image acquisition."""
+        """Begin streaming frames into the producer's buffer ring."""
         ...
 
     @abstractmethod
     def stop_acquisition(self) -> None:
-        """Stop image acquisition."""
+        """Stop streaming and discard whatever is still buffered."""
         ...
 
     @abstractmethod
@@ -165,12 +181,16 @@ class Camera(ABC):
 
     @abstractmethod
     def set_exposure(self, exposure_time: float) -> None:
-        """Set exposure time in seconds."""
+        """Set exposure time in seconds.
+
+        Implementations that buffer frames should flush them, or the next
+        few frames will still carry the old exposure.
+        """
         ...
 
     @abstractmethod
     def set_gain(self, gain: float) -> None:
-        """Set gain."""
+        """Set gain, in whatever units the device uses (usually dB)."""
         ...
 
     def setting(self, **kwargs: Any) -> None:

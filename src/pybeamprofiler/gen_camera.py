@@ -1,4 +1,16 @@
-"""GenICam camera wrapper using Harvesters library."""
+"""GenICam cameras, driven through Harvesters.
+
+:class:`HarvesterCamera` is the workhorse behind every real device: FLIR and
+Basler differ only in where their GenTL producer lives, which
+:mod:`pybeamprofiler.cti` already handles, so both vendor classes are thin
+subclasses.
+
+Two things here exist because of how the underlying C library behaves rather
+than because the GenICam standard asks for them: acquisition is restarted
+after an exposure change so the producer's buffer ring cannot deliver
+stale-exposure frames, and a silent producer is given one stop/start
+recovery attempt before the caller is left waiting forever.
+"""
 
 from __future__ import annotations
 

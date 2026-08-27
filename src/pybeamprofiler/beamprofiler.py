@@ -1,4 +1,16 @@
-"""Laser beam profiler with Gaussian fitting and visualization."""
+"""The :class:`BeamProfiler` façade and the command-line entry point.
+
+This is the object users hold: it owns a camera, runs a frame through
+:mod:`pybeamprofiler.fitting`, and turns the result into a figure or a live
+stream. The numerical work itself lives in ``fitting.py``; what is here is
+the state that has to persist between frames — which camera, which fit
+method, and the previous frame's parameters that each new fit warm-starts
+from.
+
+Three display paths hang off :meth:`BeamProfiler.plot`, chosen by
+environment rather than by argument: a live async loop inside Jupyter, the
+Dash app in a terminal, and a matplotlib animation if Dash is missing.
+"""
 
 from __future__ import annotations
 

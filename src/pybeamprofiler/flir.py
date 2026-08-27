@@ -1,4 +1,9 @@
-"""FLIR camera interface using Harvesters/GenICam."""
+"""FLIR cameras (Spinnaker).
+
+Only locating the GenTL producer differs from the generic GenICam path, and
+that is delegated to :mod:`pybeamprofiler.cti`. Spinnaker ships a single
+producer per toolchain, so the first one found is enough.
+"""
 
 import logging
 import os

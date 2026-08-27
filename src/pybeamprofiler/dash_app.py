@@ -1,7 +1,16 @@
-"""Dash web application for pyBeamprofiler GUI.
+"""The live browser GUI: figure building, the app factory, and callbacks.
 
-Provides a rich browser-based interface with live camera streaming,
-interactive fitting controls, and camera settings management.
+The page's components are built in :mod:`pybeamprofiler.dash_layout`; what is
+here is everything that moves — the heatmap figure rebuilt on each tick, and
+the callbacks behind every control.
+
+One rule governs the whole module: anything that touches the camera or the
+profiler's state holds ``_callback_lock``. The Harvesters backend is a C
+library that will segfault, not raise, if a buffer is fetched while the
+acquirer is being destroyed, so the render tick and the controls that stop,
+reconfigure or replace the camera are strictly serialised. The render tick
+takes the lock without blocking and skips a frame rather than queueing, so a
+slow camera fetch cannot make the controls feel stuck.
 """
 
 from __future__ import annotations
@@ -732,6 +741,12 @@ def _register_callbacks(app: dash.Dash, bp: BeamProfiler) -> None:
         prevent_initial_call=True,
     )
     def toggle_pause(n: int, paused: bool) -> tuple[bool, list[Any], str, Any]:
+        """Start or stop streaming, and relabel the button to match.
+
+        Also rebuilds the Setting panel: values the camera changed on its
+        own while running (auto-exposure, temperature) are only worth
+        re-reading when the stream is not competing for the lock.
+        """
         global _server_paused  # noqa: PLW0603
         new_paused = not paused
 
@@ -768,6 +783,7 @@ def _register_callbacks(app: dash.Dash, bp: BeamProfiler) -> None:
         prevent_initial_call=True,
     )
     def save_frame_png(_n: int) -> dict[str, Any] | None:
+        """Download the current frame as a PNG."""
         img = bp.last_img
         if img is None:
             return None
@@ -788,6 +804,11 @@ def _register_callbacks(app: dash.Dash, bp: BeamProfiler) -> None:
         prevent_initial_call=True,
     )
     def save_frame_npy(_n: int) -> dict[str, Any] | None:
+        """Download the current frame as a raw ``.npy`` array.
+
+        Unlike the PNG this keeps the original dtype, so 12- and 16-bit
+        sensor data survives for later analysis.
+        """
         img = bp.last_img
         if img is None:
             return None
@@ -807,6 +828,7 @@ def _register_callbacks(app: dash.Dash, bp: BeamProfiler) -> None:
         Input("switch-color", "value"),
     )
     def toggle_colorscale(color_on: bool) -> bool:
+        """Grey out the colorscale picker when colour is switched off."""
         return not color_on
 
     # -- Auto-range toggle disables min/max inputs ----------------------------
@@ -816,6 +838,7 @@ def _register_callbacks(app: dash.Dash, bp: BeamProfiler) -> None:
         Input("switch-autorange", "value"),
     )
     def toggle_autorange(auto: bool) -> tuple[bool, bool]:
+        """Grey out the manual min/max boxes while auto-range is on."""
         return auto, auto
 
     # -- Dark / Light theme toggle --------------------------------------------
@@ -865,6 +888,7 @@ def _register_callbacks(app: dash.Dash, bp: BeamProfiler) -> None:
         prevent_initial_call=True,
     )
     def auto_fit_zoom(n_clicks: int | None) -> Any:
+        """Zoom to a +/-3 sigma box around the fitted beam centre."""
         global _zoom_range  # noqa: PLW0603
         if not n_clicks:
             return dash.no_update
@@ -894,6 +918,7 @@ def _register_callbacks(app: dash.Dash, bp: BeamProfiler) -> None:
         prevent_initial_call=True,
     )
     def reset_zoom(n_clicks: int | None) -> Any:
+        """Zoom back out to the full sensor."""
         global _zoom_range  # noqa: PLW0603
         if not n_clicks:
             return dash.no_update
@@ -971,6 +996,7 @@ def _register_callbacks(app: dash.Dash, bp: BeamProfiler) -> None:
         prevent_initial_call=True,
     )
     def set_exposure(slider_val: float | None, input_val: float | None) -> tuple[Any, Any]:
+        """Apply an exposure change from either the slider or the box."""
         trigger = ctx.triggered_id
         val = slider_val if trigger == "slider-exposure" else input_val
         if val is None:
@@ -1002,6 +1028,7 @@ def _register_callbacks(app: dash.Dash, bp: BeamProfiler) -> None:
         prevent_initial_call=True,
     )
     def set_gain(slider_val: float | None, input_val: float | None) -> tuple[Any, Any]:
+        """Apply a gain change from either the slider or the box."""
         trigger = ctx.triggered_id
         val = slider_val if trigger == "slider-gain" else input_val
         if val is None:
@@ -1036,6 +1063,11 @@ def _register_callbacks(app: dash.Dash, bp: BeamProfiler) -> None:
         prevent_initial_call=True,
     )
     def apply_roi(_n: int, ox: int, oy: int, w: int, h: int) -> str:
+        """Apply the requested region of interest and report what stuck.
+
+        Cameras quantise ROI values to their own granularity, so the status
+        line reports what the device accepted, not what was asked for.
+        """
         if bp.camera is None:
             return "No camera"
         if ox is None or oy is None or w is None or h is None:
@@ -1072,6 +1104,7 @@ def _register_callbacks(app: dash.Dash, bp: BeamProfiler) -> None:
         prevent_initial_call=True,
     )
     def reset_roi(_n: int) -> tuple[int, int, int, int, str]:
+        """Restore the full sensor and refresh the ROI boxes."""
         if bp.camera is None:
             return 0, 0, 0, 0, "No camera"
         with _callback_lock:
@@ -1101,6 +1134,7 @@ def _register_callbacks(app: dash.Dash, bp: BeamProfiler) -> None:
         prevent_initial_call=True,
     )
     def set_genicam_numeric(slider_val: float | None, input_val: float | None) -> tuple[Any, Any]:
+        """Write a numeric GenICam feature from its slider or box."""
         trigger = ctx.triggered_id
         source = trigger.get("type") if isinstance(trigger, dict) else None
         value = slider_val if source == "genicam-num" else input_val
@@ -1132,6 +1166,7 @@ def _register_callbacks(app: dash.Dash, bp: BeamProfiler) -> None:
         prevent_initial_call=True,
     )
     def set_genicam_select(value: str | None) -> Any:
+        """Write an enumerated GenICam feature from its dropdown."""
         if value is None or bp.camera is None:
             return dash.no_update
         feature = ctx.triggered_id["feature"]
@@ -1155,6 +1190,7 @@ def _register_callbacks(app: dash.Dash, bp: BeamProfiler) -> None:
         prevent_initial_call=True,
     )
     def set_genicam_switch(value: bool) -> Any:
+        """Write a boolean GenICam feature from its switch."""
         if bp.camera is None:
             return dash.no_update
         feature = ctx.triggered_id["feature"]
@@ -1205,6 +1241,17 @@ def _register_callbacks(app: dash.Dash, bp: BeamProfiler) -> None:
         dark_theme: bool,
         avg_n: int | None,
     ) -> tuple[Any, ...]:
+        """Grab a frame, fit it, and redraw — once per interval tick.
+
+        Almost every control on the page arrives here as ``State`` rather than
+        ``Input``: they should change what the *next* frame looks like, not
+        force an extra redraw of their own.
+
+        The tick is skipped rather than queued if the previous one is still
+        running. Queueing would let a camera slower than the interval build an
+        unbounded backlog of stale frames, and would leave the controls (which
+        share the lock) waiting behind all of them.
+        """
         if paused or _server_paused:
             return (dash.no_update,) * 4
 
