@@ -16,7 +16,7 @@ import dash
 import pytest
 from dash import html
 
-from pybeamprofiler import dash_app, discovery
+from pybeamprofiler import dash_app, dash_layout, discovery
 from pybeamprofiler.beamprofiler import BeamProfiler
 from pybeamprofiler.simulated import SIMULATED_PROFILES, SimulatedCamera
 
@@ -50,17 +50,17 @@ def profiler():
 
 def _other_key(bp: BeamProfiler) -> str:
     """A selectable camera that is not the one currently open."""
-    options, current = dash_app._camera_options(bp)
+    options, current = dash_layout._camera_options(bp)
     return next(o.key for o in options if o.key != current)
 
 
 class TestCameraOptionsForTheDropdown:
     def test_lists_every_simulated_camera(self, profiler):
-        options, _ = dash_app._camera_options(profiler)
+        options, _ = dash_layout._camera_options(profiler)
         assert len(options) == len(SIMULATED_PROFILES)
 
     def test_current_camera_is_preselected(self, profiler):
-        options, current = dash_app._camera_options(profiler)
+        options, current = dash_layout._camera_options(profiler)
         assert current in {o.key for o in options}
         assert current == discovery.describe_open_camera(profiler.camera).key
 
@@ -70,15 +70,15 @@ class TestCameraOptionsForTheDropdown:
         It still has to appear as the selected entry, or the dropdown shows a
         blank box over a running stream.
         """
-        with patch.object(dash_app, "discover_cameras", return_value=[]):
-            options, current = dash_app._camera_options(profiler)
+        with patch.object(dash_layout, "discover_cameras", return_value=[]):
+            options, current = dash_layout._camera_options(profiler)
 
         assert len(options) == 1
         assert options[0].key == current
 
     def test_no_camera_leaves_the_selection_empty(self, profiler):
         profiler.camera = None
-        options, current = dash_app._camera_options(profiler)
+        options, current = dash_layout._camera_options(profiler)
         assert current == ""
         assert options  # the simulated entries are still offered
 
@@ -87,7 +87,7 @@ class TestRefreshCameras:
     def test_repopulates_the_dropdown(self, profiler):
         listed, current, status = _callbacks(profiler)["refresh_cameras"](1)
         assert [o["value"] for o in listed] == [
-            o.key for o in dash_app._camera_options(profiler)[0]
+            o.key for o in dash_layout._camera_options(profiler)[0]
         ]
         assert current
 
@@ -100,13 +100,13 @@ class TestRefreshCameras:
             discovery.CameraOption(key="genicam:1", label="FLIR A", kind="genicam"),
             discovery.CameraOption(key="genicam:2", label="FLIR B", kind="genicam"),
         ]
-        with patch.object(dash_app, "discover_cameras", return_value=found):
+        with patch.object(dash_layout, "discover_cameras", return_value=found):
             _, _, status = _callbacks(profiler)["refresh_cameras"](1)
         assert status == "2 cameras found"
 
     def test_singular_wording_for_one_camera(self, profiler):
         found = [discovery.CameraOption(key="genicam:1", label="FLIR A", kind="genicam")]
-        with patch.object(dash_app, "discover_cameras", return_value=found):
+        with patch.object(dash_layout, "discover_cameras", return_value=found):
             _, _, status = _callbacks(profiler)["refresh_cameras"](1)
         assert status == "1 camera found"
 
@@ -190,7 +190,7 @@ class TestSwitchCamera:
         assert isinstance(result[4], dbc.Accordion)
 
     def test_reselecting_the_current_camera_is_a_no_op(self, profiler):
-        _, current = dash_app._camera_options(profiler)
+        _, current = dash_layout._camera_options(profiler)
         old = profiler.camera
 
         result = _callbacks(profiler)["switch_camera"](current)

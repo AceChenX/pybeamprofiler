@@ -163,14 +163,18 @@ def measure_d4s(profile: np.ndarray) -> tuple[float, float]:
         profile: 1D intensity profile.
 
     Returns:
-        ``(center, d4sigma_width)`` in pixel units.  A blank profile yields the
-        array midpoint and a width of 1 px rather than a division by zero.
+        ``(center, d4sigma_width)`` in pixel units.  A blank or non-finite
+        profile yields the array midpoint and a width of 1 px rather than a
+        division by zero or a silent NaN.
     """
     profile = profile - np.min(profile)  # Remove baseline
     profile = np.maximum(profile, 0)  # Guard against float round-off
 
     total_intensity = float(np.sum(profile))
-    if total_intensity == 0:
+    # A blank profile divides by zero; a non-finite one (an inf pixel in a
+    # float image) makes every moment NaN, which would then propagate silently
+    # into the reported width. Both mean "no usable signal".
+    if total_intensity == 0 or not np.isfinite(total_intensity):
         return len(profile) / 2.0, 1.0
 
     x = np.arange(len(profile), dtype=float)

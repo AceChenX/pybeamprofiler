@@ -41,5 +41,9 @@ D4SIGMA_FACTOR = 4.0
 DEFAULT_DASH_PORT = 8050
 DEFAULT_UPDATE_INTERVAL_MS = 50  # milliseconds
 
+# Maximum frames in the rolling-average buffer. Caps memory at N x frame
+# size, and bounds the input the GUI offers.
+MAX_AVG_FRAMES = 32
+
 # Display
 MAX_DISPLAY_DIM = 1024

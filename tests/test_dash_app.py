@@ -14,14 +14,14 @@ from conftest import requires_genicam
 from dash import html
 
 from pybeamprofiler.beamprofiler import BeamProfiler
-from pybeamprofiler.dash_app import (
+from pybeamprofiler.dash_app import build_figure, create_app
+from pybeamprofiler.dash_layout import (
     COLORSCALES,
     _build_setting_items,
+    _camera_options,
     _fitting_tab,
     _format_results,
     _setting_tab,
-    build_figure,
-    create_app,
 )
 from pybeamprofiler.simulated import SimulatedCamera, _SimulatedNode, _SimulatedNodeMap
 
@@ -371,7 +371,7 @@ class TestTabBuilders:
     def test_fitting_tab_returns_tab(self):
         bp = BeamProfiler(camera="simulated")
         assert bp.camera is not None
-        tab = _fitting_tab(bp)
+        tab = _fitting_tab(bp, *_camera_options(bp))
         assert isinstance(tab, dbc.Tab)
         assert tab.tab_id == "tab-fitting"  # ty: ignore[unresolved-attribute]
 
@@ -557,7 +557,7 @@ class TestBuildGenicamControl:
     """Tests for _build_genicam_control helper."""
 
     def test_boolean_feature_creates_switch(self):
-        from pybeamprofiler.dash_app import _build_genicam_control
+        from pybeamprofiler.dash_layout import _build_genicam_control
         from pybeamprofiler.simulated import _SimulatedNode
 
         class MockCam:
@@ -570,7 +570,7 @@ class TestBuildGenicamControl:
         assert "genicam-sw" in layout_str
 
     def test_enum_feature_creates_select(self):
-        from pybeamprofiler.dash_app import _build_genicam_control
+        from pybeamprofiler.dash_layout import _build_genicam_control
         from pybeamprofiler.simulated import _SimulatedNode
 
         class MockCam:
@@ -583,7 +583,7 @@ class TestBuildGenicamControl:
         assert "genicam-sel" in layout_str
 
     def test_numeric_feature_creates_slider(self):
-        from pybeamprofiler.dash_app import _build_genicam_control
+        from pybeamprofiler.dash_layout import _build_genicam_control
         from pybeamprofiler.simulated import _SimulatedNode
 
         class MockCam:
@@ -597,7 +597,7 @@ class TestBuildGenicamControl:
         assert "Slider" in layout_str
 
     def test_readonly_numeric_shows_text(self):
-        from pybeamprofiler.dash_app import _build_genicam_control
+        from pybeamprofiler.dash_layout import _build_genicam_control
         from pybeamprofiler.simulated import _SimulatedNode
 
         class MockCam:
@@ -611,7 +611,7 @@ class TestBuildGenicamControl:
         assert "genicam-num" not in layout_str
 
     def test_string_enable_creates_select(self):
-        from pybeamprofiler.dash_app import _build_genicam_control
+        from pybeamprofiler.dash_layout import _build_genicam_control
         from pybeamprofiler.simulated import _SimulatedNode
 
         class MockCam:
@@ -624,7 +624,7 @@ class TestBuildGenicamControl:
         assert "genicam-sel" in layout_str
 
     def test_string_auto_creates_select(self):
-        from pybeamprofiler.dash_app import _build_genicam_control
+        from pybeamprofiler.dash_layout import _build_genicam_control
         from pybeamprofiler.simulated import _SimulatedNode
 
         class MockCam:
@@ -635,7 +635,7 @@ class TestBuildGenicamControl:
         assert ctrl is not None
 
     def test_no_node_map_returns_none(self):
-        from pybeamprofiler.dash_app import _build_genicam_control
+        from pybeamprofiler.dash_layout import _build_genicam_control
 
         class MockCam:
             node_map = None
@@ -643,7 +643,7 @@ class TestBuildGenicamControl:
         assert _build_genicam_control(MockCam(), "Anything") is None
 
     def test_missing_feature_returns_none(self):
-        from pybeamprofiler.dash_app import _build_genicam_control
+        from pybeamprofiler.dash_layout import _build_genicam_control
         from pybeamprofiler.simulated import _SimulatedNode
 
         class MockCam:
@@ -653,7 +653,7 @@ class TestBuildGenicamControl:
         assert _build_genicam_control(MockCam(), "NonexistentFeature") is None
 
     def test_value_exception_returns_none(self):
-        from pybeamprofiler.dash_app import _build_genicam_control
+        from pybeamprofiler.dash_layout import _build_genicam_control
 
         class FailingNode:
             @property
@@ -687,7 +687,7 @@ class TestDashGenicamSettingItems:
         items = _build_setting_items(bp)
         titles = {item.title for item in items}  # ty: ignore[unresolved-attribute]
         non_discovery_titles = {"Camera Info"}
-        from pybeamprofiler.dash_app import _PINNED_CATEGORIES
+        from pybeamprofiler.dash_layout import _PINNED_CATEGORIES
 
         non_discovery_titles.update(_PINNED_CATEGORIES)
         genicam_titles = titles - non_discovery_titles
@@ -903,19 +903,19 @@ class TestIsReadonly:
     """Tests for _is_readonly helper."""
 
     def test_readonly_simulated_node(self):
-        from pybeamprofiler.dash_app import _is_readonly
+        from pybeamprofiler.dash_layout import _is_readonly
 
         node = _SimulatedNode("locked", readonly=True)
         assert _is_readonly(node) is True
 
     def test_writable_simulated_node(self):
-        from pybeamprofiler.dash_app import _is_readonly
+        from pybeamprofiler.dash_layout import _is_readonly
 
         node = _SimulatedNode(42)
         assert _is_readonly(node) is False
 
     def test_node_without_access_mode(self):
-        from pybeamprofiler.dash_app import _is_readonly
+        from pybeamprofiler.dash_layout import _is_readonly
 
         class PlainNode:
             pass
@@ -923,7 +923,7 @@ class TestIsReadonly:
         assert _is_readonly(PlainNode()) is False
 
     def test_access_mode_raises(self):
-        from pybeamprofiler.dash_app import _is_readonly
+        from pybeamprofiler.dash_layout import _is_readonly
 
         class FailNode:
             def get_access_mode(self):
@@ -939,17 +939,17 @@ class TestHumanize:
     """Tests for the _humanize helper."""
 
     def test_camel_case(self):
-        from pybeamprofiler.dash_app import _humanize
+        from pybeamprofiler.dash_layout import _humanize
 
         assert _humanize("AcquisitionFrameRate") == "Acquisition Frame Rate"
 
     def test_single_word(self):
-        from pybeamprofiler.dash_app import _humanize
+        from pybeamprofiler.dash_layout import _humanize
 
         assert _humanize("Gain") == "Gain"
 
     def test_consecutive_uppercase_unchanged(self):
-        from pybeamprofiler.dash_app import _humanize
+        from pybeamprofiler.dash_layout import _humanize
 
         assert _humanize("ROIWidth") == "ROIWidth"
 
@@ -961,7 +961,7 @@ class TestBuildGenicamControlEdgeCases:
     """Edge cases for _build_genicam_control."""
 
     def test_readonly_string_shows_text(self):
-        from pybeamprofiler.dash_app import _build_genicam_control
+        from pybeamprofiler.dash_layout import _build_genicam_control
 
         ctrl = _build_genicam_control(
             type(
@@ -981,7 +981,7 @@ class TestBuildGenicamControlEdgeCases:
         assert "genicam-sel" not in layout_str
 
     def test_empty_string_shows_text(self):
-        from pybeamprofiler.dash_app import _build_genicam_control
+        from pybeamprofiler.dash_layout import _build_genicam_control
 
         ctrl = _build_genicam_control(
             type("C", (), {"node_map": type("N", (), {"EmptyVal": _SimulatedNode("")})()})(),
@@ -992,7 +992,7 @@ class TestBuildGenicamControlEdgeCases:
         assert "genicam-sel" not in layout_str
 
     def test_generic_string_creates_select(self):
-        from pybeamprofiler.dash_app import _build_genicam_control
+        from pybeamprofiler.dash_layout import _build_genicam_control
 
         ctrl = _build_genicam_control(
             type("C", (), {"node_map": type("N", (), {"SomeStr": _SimulatedNode("hello")})()})(),
@@ -1199,11 +1199,11 @@ class TestAveragedImage:
 
     def test_n_clamped_to_max(self):
         from pybeamprofiler import dash_app as da
-        from pybeamprofiler.dash_app import _MAX_AVG_FRAMES
+        from pybeamprofiler.constants import MAX_AVG_FRAMES
 
         da._reset_avg_state()
-        da._averaged_image(np.zeros((4, 4), dtype=np.uint8), _MAX_AVG_FRAMES + 100)
-        assert da._avg_buffer.maxlen == _MAX_AVG_FRAMES
+        da._averaged_image(np.zeros((4, 4), dtype=np.uint8), MAX_AVG_FRAMES + 100)
+        assert da._avg_buffer.maxlen == MAX_AVG_FRAMES
 
     def test_n_zero_or_negative_treated_as_one(self):
         from pybeamprofiler import dash_app as da
@@ -1892,7 +1892,7 @@ class TestPreexistingEdgeCases:
 
     def test_exposure_controls_handles_bad_range(self):
         """``exposure_range`` returning a non-iterable shouldn't crash."""
-        from pybeamprofiler.dash_app import _exposure_controls
+        from pybeamprofiler.dash_layout import _exposure_controls
 
         class FakeCam:
             exposure_range = 5  # not unpackable
@@ -1902,7 +1902,7 @@ class TestPreexistingEdgeCases:
         assert ctrls  # didn't crash, fell back to defaults
 
     def test_gain_controls_handles_bad_range(self):
-        from pybeamprofiler.dash_app import _gain_controls
+        from pybeamprofiler.dash_layout import _gain_controls
 
         class FakeCam:
             gain_range = "oops"  # not unpackable to two floats
@@ -1912,7 +1912,7 @@ class TestPreexistingEdgeCases:
         assert ctrls
 
     def test_roi_controls_no_roi_info_returns_none(self):
-        from pybeamprofiler.dash_app import _roi_controls
+        from pybeamprofiler.dash_layout import _roi_controls
 
         class FakeCam:
             pass
@@ -1921,7 +1921,7 @@ class TestPreexistingEdgeCases:
 
     def test_build_genicam_control_unsupported_value_returns_none(self):
         """A node whose value is an exotic type (e.g. tuple) yields no control."""
-        from pybeamprofiler.dash_app import _build_genicam_control
+        from pybeamprofiler.dash_layout import _build_genicam_control
 
         class FakeNode:
             value = (1, 2, 3)  # not bool, str, int, float
@@ -2371,7 +2371,7 @@ class TestIsReadonlyEAccessMode:
         # the true branch inside the helper.
         from genicam.genapi import EAccessMode  # ty: ignore[unresolved-import]
 
-        from pybeamprofiler.dash_app import _is_readonly
+        from pybeamprofiler.dash_layout import _is_readonly
 
         mode = getattr(EAccessMode, mode_name)
 
@@ -2387,7 +2387,7 @@ class TestIsReadonlyEAccessMode:
     def test_access_mode_writable(self):
         from genicam.genapi import EAccessMode  # ty: ignore[unresolved-import]
 
-        from pybeamprofiler.dash_app import _is_readonly
+        from pybeamprofiler.dash_layout import _is_readonly
 
         class Node:
             def get_access_mode(self):
@@ -2398,13 +2398,13 @@ class TestIsReadonlyEAccessMode:
     def test_no_genicam_installed_returns_false(self):
         """When ``genicam.genapi`` isn't importable the helper short-
         circuits to ``False`` — we can't know whether the node is RO."""
-        from pybeamprofiler.dash_app import _is_readonly
+        from pybeamprofiler.dash_layout import _is_readonly
 
         class Node:
             def get_access_mode(self):
                 return 3  # would match RO if the enum were loaded
 
-        with patch("pybeamprofiler.dash_app._EAccessMode", None):
+        with patch("pybeamprofiler.dash_layout._EAccessMode", None):
             assert _is_readonly(Node()) is False
 
 
@@ -2416,7 +2416,7 @@ class TestBuildGenicamControlNumericCoercion:
     def test_non_numeric_min_falls_through(self):
         """Min that can't be coerced to float must hit the
         ``except (TypeError, ValueError): pass`` path (lines 557-558)."""
-        from pybeamprofiler.dash_app import _build_genicam_control
+        from pybeamprofiler.dash_layout import _build_genicam_control
 
         class WeirdNode:
             value = "nope"
@@ -2438,7 +2438,7 @@ class TestRoiControlsBranch:
     flaky camera doesn't blow up the panel (lines 644-645)."""
 
     def test_roi_info_raises_returns_none(self):
-        from pybeamprofiler.dash_app import _roi_controls
+        from pybeamprofiler.dash_layout import _roi_controls
 
         # Using ``__getattr__`` lets ``hasattr`` succeed on the first probe
         # (returns a stub dict) but the subsequent ``getattr`` in the
