@@ -1100,3 +1100,57 @@ class TestAFrameWithNoPlausibleBeam:
         assert out[0] is not dash.no_update
         assert "—" in str(out[1])
         assert "error" not in str(out[2]).lower()
+
+
+class TestDefensiveEdges:
+    """The unhappy paths of the fixes above, each a line or two."""
+
+    def test_a_boolean_frame_saves_as_black_and_white(self):
+        frame = np.zeros((4, 4), dtype=bool)
+        frame[0, 0] = True
+        saved = _saved_png(BeamProfiler(camera="simulated"), frame)
+        assert saved.dtype == np.uint8
+        assert saved[0, 0] == 255 and saved[1, 1] == 0
+
+    def test_an_entirely_non_finite_frame_saves_as_black(self):
+        saved = _saved_png(BeamProfiler(camera="simulated"), np.full((4, 4), np.nan))
+        assert saved.max() == 0
+
+    def test_without_a_camera_the_request_is_mirrored(self):
+        assert dash_app._paired_values(5.0, None, from_slider=True) == (dash.no_update, 5.0)
+
+    def test_a_feature_the_camera_lacks_is_left_alone(self):
+        bp = _profiler()
+        cbs = _callbacks(bp)
+        with patch("pybeamprofiler.dash_app.ctx") as ctx:
+            ctx.triggered_id = {"type": "genicam-sel", "feature": "NoSuchFeature"}
+            assert cbs["set_genicam_select"]("On") == "On"
+
+    def test_a_node_that_cannot_be_read_back_mirrors_the_request(self):
+        class WriteOnly:
+            min = max = symbolics = None
+
+            @property
+            def value(self) -> Any:
+                raise RuntimeError("not readable")
+
+            @value.setter
+            def value(self, v: Any) -> None:
+                pass
+
+        bp = _profiler()
+        getattr(bp.camera, "node_map").TriggerSoftware = WriteOnly()
+        cbs = _callbacks(bp)
+        with patch("pybeamprofiler.dash_app.ctx") as ctx:
+            ctx.triggered_id = {"type": "genicam-sw", "feature": "TriggerSoftware"}
+            assert cbs["set_genicam_switch"](True) is True
+
+    def test_a_camera_that_cannot_even_be_stopped_is_still_paused(self):
+        bp = _profiler()
+        cbs = _callbacks(bp)
+        assert bp.camera is not None
+        bp.camera.get_image = _raiser(RuntimeError("gone"))  # ty: ignore[invalid-assignment]
+        with patch.object(bp.camera, "stop_acquisition", side_effect=RuntimeError("also gone")):
+            outs = [_tick(cbs) for _ in range(dash_app._MAX_CAMERA_FAILURES)]
+        assert outs[-1][4] is True
+        assert dash_app._server_paused is True
