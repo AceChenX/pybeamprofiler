@@ -69,9 +69,6 @@ dev = [
     "ty>=0.0.84",
     "pre-commit>=4.6",
 ]
-matplotlib = [
-    "matplotlib>=3.10",  # Optional fallback for command-line streaming
-]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
