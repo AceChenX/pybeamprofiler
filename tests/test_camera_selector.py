@@ -9,6 +9,7 @@ stopped so that Play is a deliberate act.
 
 from __future__ import annotations
 
+import math
 from typing import Any
 from unittest.mock import patch
 
@@ -172,7 +173,7 @@ class TestSwitchCamera:
         assert profiler._last_popt_y is None
         assert profiler._last_popt_2d is None
         assert profiler.last_img is None
-        assert profiler.width_x == 0.0
+        assert math.isnan(profiler.width_x)
 
     def test_zoom_and_frame_buffers_are_cleared(self, profiler):
         dash_app._zoom_range = {"x": [0, 1], "y": [0, 1]}

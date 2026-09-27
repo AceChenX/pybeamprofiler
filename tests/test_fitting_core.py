@@ -94,11 +94,12 @@ class TestMeasureFwhm:
         _, offset, _ = fitting.measure_fwhm(profile + 500.0)
         assert offset == pytest.approx(plain, rel=1e-9)
 
-    def test_flat_profile_has_zero_width(self):
+    def test_flat_profile_has_no_width(self):
+        """Nothing stands above the baseline, so there is nothing to measure."""
         center, fwhm, peak = fitting.measure_fwhm(np.full(50, 7.0))
-        assert fwhm == 0.0
+        assert np.isnan(fwhm)
+        assert np.isnan(center)
         assert peak == 0.0
-        assert 0 <= center < 50
 
     def test_interpolates_between_samples(self):
         """A triangle with known flanks pins the sub-pixel interpolation."""
@@ -118,7 +119,22 @@ class TestMeasureFwhm:
 
     def test_single_sample(self):
         center, fwhm, peak = fitting.measure_fwhm(np.array([42.0]))
-        assert (center, fwhm, peak) == (0.0, 0.0, 0.0)
+        assert np.isnan(center) and np.isnan(fwhm)
+        assert peak == 0.0
+
+    def test_a_noisy_profile_does_not_read_narrow(self):
+        """The noisy maximum reads high and noise dips on the flanks cross
+        half-maximum early: unsmoothed, a sigma-50 profile at a peak SNR of 10
+        read 30% narrow on average."""
+        x = np.arange(1024.0)
+        errors = []
+        for seed in range(40):
+            rng = np.random.default_rng(seed)
+            profile = (
+                100 * np.exp(-((x - 512) ** 2) / (2 * 50.0**2)) + 20 + rng.normal(0, 10, x.size)
+            )
+            errors.append(fitting.measure_fwhm(profile)[1] / (GAUSSIAN_TO_FWHM * 50.0) - 1)
+        assert abs(np.mean(errors)) < 0.03
 
     def test_unsigned_input_does_not_wrap(self):
         """uint8 arithmetic must not underflow during baseline removal."""
@@ -135,10 +151,10 @@ class TestMeasureD4s:
         assert center == pytest.approx(100.0, abs=0.5)
         assert d4s == pytest.approx(4.0 * sigma, rel=0.02)
 
-    def test_blank_profile_returns_midpoint(self):
+    def test_blank_profile_has_no_width(self):
         center, d4s = fitting.measure_d4s(np.zeros(80))
-        assert center == 40.0
-        assert d4s == 1.0
+        assert np.isnan(center)
+        assert np.isnan(d4s)
 
     def test_flat_top_is_wider_than_its_gaussian_fit_would_suggest(self):
         """D4σ is shape-free, which is the whole point of offering it."""
@@ -521,14 +537,27 @@ class TestFitEvaluationCap:
     def test_the_bounded_solver_gets_a_real_cap(self):
         """``maxfev`` is an lm-only name; the bounded path needs ``max_nfev``
         or scipy silently falls back to its own 700-evaluation default."""
-        import inspect
-
         from pybeamprofiler.constants import MAX_FIT_2D_EVALS
 
-        source = inspect.getsource(fitting.fit_2d_gaussian)
-        assert "max_nfev=MAX_FIT_2D_EVALS" in source
-        assert "maxfev" not in source.split("bounds=bounds")[1]
-        assert MAX_FIT_2D_EVALS > 0
+        y, x = np.mgrid[0:80, 0:80]
+        img = fitting.gaussian_2d((x, y), 200.0, 40.0, 38.0, 9.0, 6.0, 0.4, 5.0).reshape(80, 80)
+        calls = []
+        real_curve_fit = fitting.curve_fit
+
+        def spy(*args, **kwargs):
+            calls.append(kwargs)
+            return real_curve_fit(*args, **kwargs)
+
+        with patch("pybeamprofiler.fitting.curve_fit", side_effect=spy):
+            # A warm start with a collapsed sigma makes LM fail its check, so
+            # both the unbounded and the bounded paths run.
+            fitting.fit_2d_gaussian(img, last_popt=[200.0, 40.0, 38.0, 1e-3, 1e-3, 0.0, 5.0])
+
+        bounded = [kw for kw in calls if "bounds" in kw]
+        assert bounded, "the bounded solver never ran"
+        for kw in bounded:
+            assert kw.get("max_nfev") == MAX_FIT_2D_EVALS
+            assert "maxfev" not in kw
 
 
 def _image_major_axis(img):

@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import math
 import os
 import signal
 import threading
@@ -72,6 +73,10 @@ class BeamProfiler:
         center_y: Beam center y position (pixels)
         angle_deg: Beam rotation angle (degrees; 2D fit only, else 0)
         peak_value: Peak intensity of the last analyzed frame
+
+    Widths and centre are NaN before the first frame is analysed, and for
+    any frame without a measurable beam; so is the angle when a 2D fit finds
+    no beam.
     """
 
     def __init__(
@@ -98,21 +103,30 @@ class BeamProfiler:
         self.fit_method: str = fit
         self.definition: str = definition
 
-        self.width_x: float = 0.0
-        self.width_y: float = 0.0
-        self.center_x: float = 0.0
-        self.center_y: float = 0.0
+        # NaN until a frame has been analysed, and for any frame without a
+        # measurable beam.
+        self.width_x: float = math.nan
+        self.width_y: float = math.nan
+        self.center_x: float = math.nan
+        self.center_y: float = math.nan
         self.angle_deg: float = 0.0
         self.peak_value: float = 0.0
 
+        # Warm starts: the last *plausible* fit on each path.
         self._last_popt_x: np.ndarray | list[Any] | None = None
         self._last_popt_y: np.ndarray | list[Any] | None = None
         self._last_popt_2d: np.ndarray | list[Any] | None = None
+        # Frame geometry the warm starts belong to.
+        self._analysis_shape: tuple[int, ...] | None = None
         self._stream_task: asyncio.Task[None] | None = None
 
+        # What the last analysed frame produced, for drawing it.
         self.last_img: np.ndarray | None = None
         self._last_proj_x: np.ndarray | None = None
         self._last_proj_y: np.ndarray | None = None
+        self._ellipse: tuple[float, float, float, float, float] | None = None
+        self._linecut_x: int | None = None
+        self._linecut_y: int | None = None
 
         if pixel_size is not None and pixel_size <= 0:
             raise ValueError(f"pixel_size must be greater than zero, got {pixel_size}")
@@ -344,78 +358,72 @@ class BeamProfiler:
     def _fit_2d_gaussian(
         self,
         image: np.ndarray,
-        sigma_hint: float | None = None,
+        sigma_hint: float | tuple[float, float] | None = None,
         center_hint: tuple[float, float] | None = None,
-    ) -> np.ndarray | list[Any]:
+    ) -> np.ndarray | None:
         """Fit a rotated 2D Gaussian, warm-starting from the previous frame.
 
-        Only converged parameters are cached as the next warm start — a failed
-        fit returns its initial guess but leaves ``_last_popt_2d`` alone, so one
-        bad frame can't poison every frame after it.
+        Only a plausible fit becomes the next warm start. A failed frame
+        leaves the last good one in place: the beam may only have been
+        blocked for a moment, and if it has moved instead, the fit's own cold
+        retry copes.
 
         Args:
             image: 2D intensity array.
-            sigma_hint: Rough beam sigma in pixels.
+            sigma_hint: Rough beam sigma in pixels along ``(x, y)``.
             center_hint: Rough beam centre in pixels. With *sigma_hint*, lets
                 a small beam be cropped out of a large sensor rather than
                 decimated below the fit's resolution.
 
         Returns:
-            ``[amplitude, x0, y0, sigma_x, sigma_y, theta, offset]``.
+            ``[amplitude, x0, y0, sigma_x, sigma_y, theta, offset]``, or
+            ``None`` if the frame holds no beam the fit could find.
         """
-        popt, converged = fitting.fit_2d_gaussian(
+        popt, ok = fitting.fit_2d_gaussian(
             image,
             self._last_popt_2d,
             max_dim=self._MAX_FIT_2D_DIM,
             sigma_hint=sigma_hint,
             center_hint=center_hint,
         )
-        if converged:
-            self._last_popt_2d = popt
+        if not ok:
+            return None
+        popt = np.asarray(popt, dtype=float)
+        self._last_popt_2d = popt
         return popt
 
     def beam_ellipse(self) -> tuple[float, float, float, float, float] | None:
-        """Return the fitted 1/e² beam ellipse in pixel coordinates.
+        """The beam's outline on the last analysed frame, in pixel coordinates.
 
-        Returns ``(cx, cy, rx, ry, angle_rad)`` where *rx* / *ry* are the 1/e²
-        semi-axes (2σ).  In ``2d`` mode these come from the rotated 2D fit —
-        using the 1D projection widths there would draw a badly wrong ellipse,
-        since projecting a tilted beam onto the axes smears both widths toward
-        each other.  Otherwise the two independent axis fits are used and the
-        angle is zero.
+        Returns ``(cx, cy, rx, ry, angle_rad)``, the ellipse whose full axes
+        are the reported widths in whichever definition is selected: the 1/e²
+        contour for ``gaussian``, the half-maximum one for ``fwhm``. The one
+        exception is ``2d`` mode with the Gaussian definition, which draws the
+        fitted, tilted ellipse itself. Its reported widths are projections
+        onto the image axes, and an ellipse built from those would smear a
+        tilted beam's outline toward a circle.
 
         Returns:
-            The ellipse parameters, or ``None`` if nothing has been fitted yet.
+            The ellipse, or ``None`` before the first frame and for a frame
+            with no measurable beam.
         """
-        if self.fit_method == "2d" and self._last_popt_2d is not None:
-            _, x0, y0, sigma_x, sigma_y, theta, _ = self._last_popt_2d
-            return (
-                float(x0),
-                float(y0),
-                2.0 * abs(float(sigma_x)),
-                2.0 * abs(float(sigma_y)),
-                float(theta),
-            )
-
-        popt_x, popt_y = self._last_popt_x, self._last_popt_y
-        if popt_x is None or popt_y is None:
-            return None
-        return (
-            float(popt_x[1]),
-            float(popt_y[1]),
-            2.0 * abs(float(popt_x[2])),
-            2.0 * abs(float(popt_y[2])),
-            0.0,
-        )
+        return self._ellipse
 
     def _fit_projections(
         self, prof_x: np.ndarray, prof_y: np.ndarray
-    ) -> tuple[np.ndarray | list[Any], np.ndarray | list[Any]]:
-        """Fit both axis profiles, warm-starting from the previous frame."""
-        popt_x = self._fit_1d_gaussian(prof_x, self._last_popt_x)
-        popt_y = self._fit_1d_gaussian(prof_y, self._last_popt_y)
-        self._last_popt_x, self._last_popt_y = popt_x, popt_y
-        return popt_x, popt_y
+    ) -> tuple[np.ndarray | None, np.ndarray | None]:
+        """Fit both axis profiles, warm-starting from the previous frame.
+
+        Returns ``None`` for an axis without a plausible fit. As in 2D, only
+        plausible fits are kept as the next warm start.
+        """
+        popt_x, ok_x = fitting._fit_1d(prof_x, self._last_popt_x)
+        popt_y, ok_y = fitting._fit_1d(prof_y, self._last_popt_y)
+        if ok_x:
+            self._last_popt_x = popt_x
+        if ok_y:
+            self._last_popt_y = popt_y
+        return (popt_x if ok_x else None), (popt_y if ok_y else None)
 
     def _integrate(self, image: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         """Sum the image down each axis and cache the result for plotting."""
@@ -423,15 +431,15 @@ class BeamProfiler:
         self._last_proj_y = np.sum(image, axis=1)
         return self._last_proj_x, self._last_proj_y
 
-    def analyze(self, image: np.ndarray) -> tuple[np.ndarray | list[Any], np.ndarray | list[Any]]:
+    def analyze(self, image: np.ndarray) -> tuple[np.ndarray | None, np.ndarray | None]:
         """Measure the beam in *image* and update every reported parameter.
 
         Two things decide what happens here, and they are independent:
 
         * ``definition`` picks how the width is *measured*.  ``fwhm`` and
-          ``d4s`` are read straight off the integrated profile with no model,
-          so they also override ``fit_method`` — a shape-free measurement and
-          a Gaussian fit would disagree, and the definition wins.
+          ``d4s`` are read straight off the image with no model, so they also
+          override ``fit_method`` — a shape-free measurement and a Gaussian
+          fit would disagree, and the definition wins.
         * ``fit_method`` picks what the Gaussian fit is run against:
           ``1d`` the integrated profiles, ``2d`` the whole frame (the only
           mode that recovers a rotation angle), ``linecut`` a single row and
@@ -440,11 +448,18 @@ class BeamProfiler:
         Either way the axis fits are returned, because the GUI draws them
         alongside the data even when they didn't set the reported width.
 
+        A frame with no measurable beam is reported as such: widths, centre
+        and (in ``2d`` mode) angle become NaN and :meth:`beam_ellipse` returns
+        ``None``, rather than carrying over the previous frame's numbers or
+        presenting a fit to noise as a measurement.
+
         Args:
             image: 2D intensity array.
 
         Returns:
-            ``(x_fit_params, y_fit_params)`` for the two axis profiles.
+            ``(x_fit_params, y_fit_params)`` for the two axis profiles, each
+            ``[amplitude, center, sigma, offset]`` or ``None`` if that axis
+            could not be fitted.
 
         Raises:
             ValueError: If image is None, empty, or not 2D.
@@ -462,83 +477,105 @@ class BeamProfiler:
         if image.size == 0:
             raise ValueError("Image cannot be empty")
 
+        if image.shape != self._analysis_shape:
+            # A new frame geometry -- an ROI, binning, another camera -- moves
+            # the origin every cached parameter is measured from. Warm starts
+            # from the old geometry only slow the next fit down, or worse.
+            self._forget_warm_starts()
+            self._analysis_shape = image.shape
+
         self.peak_value = float(np.max(image))
-        self._last_proj_x = None
-        self._last_proj_y = None
         self.angle_deg = 0.0
+        self._ellipse = None
+        self._linecut_x = self._linecut_y = None
 
-        # ── Model-free definitions: measure first, fit only for the plot ──
         if self.definition in ("fwhm", "d4s"):
-            proj_x, proj_y = self._integrate(image)
-
-            if self.definition == "fwhm":
-                center_x, width_x, _ = self._measure_fwhm(proj_x)
-                center_y, width_y, _ = self._measure_fwhm(proj_y)
-            else:
-                center_x, width_x = self._measure_d4s(proj_x)
-                center_y, width_y = self._measure_d4s(proj_y)
-
-            self.center_x, self.center_y = center_x, center_y
-            self.width_x = width_x * self.pixel_size
-            self.width_y = width_y * self.pixel_size
-            return self._fit_projections(proj_x, proj_y)
-
-        # ── Gaussian definition: the fit sets the width ──
+            return self._analyze_model_free(image)
         if self.fit_method == "linecut":
-            peak_y, peak_x = np.unravel_index(int(np.argmax(image)), image.shape)
-            # Remembered so the GUI can draw the crosshair it measured along.
-            self._linecut_x = peak_x
-            self._linecut_y = peak_y
-
-            popt_x, popt_y = self._fit_projections(image[peak_y, :], image[:, peak_x])
-            self._update_widths(abs(popt_x[2]), abs(popt_y[2]))
-            self.center_x, self.center_y = popt_x[1], popt_y[1]
-            return popt_x, popt_y
-
+            return self._analyze_linecut(image)
         if self.fit_method == "2d":
-            # Integrate first: the projections both feed the profile plots and
-            # give the fit a cheap estimate of how big the beam is, which is
-            # what decides whether the default (decimated) fit grid can still
-            # resolve it.
-            proj_x, proj_y = self._integrate(image)
-            cx_hint, width_x_hint = fitting.measure_d4s(proj_x)
-            cy_hint, width_y_hint = fitting.measure_d4s(proj_y)
-            popt = self._fit_2d_gaussian(
-                image,
-                sigma_hint=min(width_x_hint, width_y_hint) / D4SIGMA_FACTOR,
-                center_hint=(cx_hint, cy_hint),
-            )
-            _, x0, y0, sigma_x, sigma_y, theta, _ = popt
-
-            # Report widths along the *image* axes, as 1D mode does. The
-            # principal-axis sigmas cannot be used directly: (sx, sy, theta)
-            # and (sy, sx, theta+90) are the same ellipse, so on a near-round
-            # beam the solver flips between them and the reported X and Y
-            # widths would swap from frame to frame. The projected widths are
-            # invariant to that.
-            self._update_widths(*fitting.image_axis_sigmas(sigma_x, sigma_y, theta))
-            self.center_x, self.center_y = x0, y0
-            # theta is canonicalised to the major axis in [0, pi).
-            self.angle_deg = float(np.degrees(theta) % 180)
-            return self._fit_projections(proj_x, proj_y)
-
+            return self._analyze_2d(image)
         popt_x, popt_y = self._fit_projections(*self._integrate(image))
-        self._update_widths(abs(popt_x[2]), abs(popt_y[2]))
-        self.center_x, self.center_y = popt_x[1], popt_y[1]
+        self._record_gaussian(popt_x, popt_y)
         return popt_x, popt_y
 
-    def _update_widths(self, sigma_x: float, sigma_y: float) -> None:
-        """Record widths from Gaussian sigmas, in the 1/e² (4σ) convention.
+    def _analyze_model_free(self, image: np.ndarray) -> tuple[np.ndarray | None, np.ndarray | None]:
+        """FWHM or D4σ, measured off the frame itself; the fits only draw curves."""
+        proj_x, proj_y = self._integrate(image)
+        if self.definition == "fwhm":
+            # Band-limited profiles: see measure_fwhm_2d for why a full-frame
+            # projection reads narrow on noisy data.
+            measured = fitting.measure_fwhm_2d(image)
+        else:
+            # D4σ needs a 2D integration window (ISO 11146). Taking it from
+            # full-frame projections would sum the noise of every beam-free
+            # row into each sample.
+            measured = fitting.measure_d4s_2d(image)
+        self._record(*measured)
+        return self._fit_projections(proj_x, proj_y)
 
-        Only the Gaussian-definition paths call this; the model-free paths
-        assign ``width_x`` / ``width_y`` from their own measurement.
+    def _analyze_linecut(self, image: np.ndarray) -> tuple[np.ndarray | None, np.ndarray | None]:
+        """Gaussian fits along the row and column through the brightest pixel."""
+        peak_y, peak_x = np.unravel_index(int(np.argmax(image)), image.shape)
+        # Remembered so the GUI can draw the crosshair it measured along.
+        self._linecut_x, self._linecut_y = int(peak_x), int(peak_y)
+        row = np.asarray(image[peak_y, :], dtype=float)
+        column = np.asarray(image[:, peak_x], dtype=float)
+        # The profiles plotted under the fit curves have to be the ones that
+        # were fitted, not the full-frame projections.
+        self._last_proj_x, self._last_proj_y = row, column
+        popt_x, popt_y = self._fit_projections(row, column)
+        self._record_gaussian(popt_x, popt_y)
+        return popt_x, popt_y
 
-        Args:
-            sigma_x: Gaussian sigma in x (pixels).
-            sigma_y: Gaussian sigma in y (pixels).
+    def _analyze_2d(self, image: np.ndarray) -> tuple[np.ndarray | None, np.ndarray | None]:
+        """A rotated 2D Gaussian over the whole frame."""
+        # The projection fits run first: they feed the profile plots, and
+        # they are a cheap estimate of the beam's size and position, which
+        # decides whether a decimated fit grid can still resolve it.
+        popt_x, popt_y = self._fit_projections(*self._integrate(image))
+        sigma_hint = center_hint = None
+        if popt_x is not None and popt_y is not None:
+            sigma_hint = (abs(float(popt_x[2])), abs(float(popt_y[2])))
+            center_hint = (float(popt_x[1]), float(popt_y[1]))
+
+        popt = self._fit_2d_gaussian(image, sigma_hint=sigma_hint, center_hint=center_hint)
+        if popt is None:
+            self._record(math.nan, math.nan, math.nan, math.nan)
+            self.angle_deg = math.nan
+            return popt_x, popt_y
+
+        _, x0, y0, sigma_x, sigma_y, theta, _ = (float(v) for v in popt)
+        # Report widths along the *image* axes, as 1D mode does. The
+        # principal-axis sigmas cannot be used directly: (sx, sy, theta) and
+        # (sy, sx, theta+90) are the same ellipse, so on a near-round beam the
+        # solver flips between them and the reported X and Y widths would
+        # swap from frame to frame. The projected widths are invariant to it.
+        sx_img, sy_img = fitting.image_axis_sigmas(sigma_x, sigma_y, theta)
+        self._record(x0, y0, D4SIGMA_FACTOR * sx_img, D4SIGMA_FACTOR * sy_img)
+        self._ellipse = (x0, y0, 2.0 * abs(sigma_x), 2.0 * abs(sigma_y), theta)
+        # theta is canonicalised to the major axis in [0, pi).
+        self.angle_deg = float(np.degrees(theta) % 180)
+        return popt_x, popt_y
+
+    def _record_gaussian(self, popt_x: np.ndarray | None, popt_y: np.ndarray | None) -> None:
+        """Record a frame's result from the two axis fits (1/e² = 4σ widths)."""
+        nan = (math.nan, math.nan)
+        cx, wx = (popt_x[1], D4SIGMA_FACTOR * abs(popt_x[2])) if popt_x is not None else nan
+        cy, wy = (popt_y[1], D4SIGMA_FACTOR * abs(popt_y[2])) if popt_y is not None else nan
+        self._record(cx, cy, wx, wy)
+
+    def _record(self, cx: float, cy: float, width_x_px: float, width_y_px: float) -> None:
+        """Store one frame's result, and the axis-aligned outline that goes with it.
+
+        Centres stay in pixels; widths are converted to μm here, once. Any
+        NaN input means that part of the frame had no measurable beam.
         """
-        self.width_x = D4SIGMA_FACTOR * sigma_x * self.pixel_size
-        self.width_y = D4SIGMA_FACTOR * sigma_y * self.pixel_size
+        self.center_x, self.center_y = float(cx), float(cy)
+        self.width_x = float(width_x_px) * self.pixel_size
+        self.width_y = float(width_y_px) * self.pixel_size
+        if all(math.isfinite(float(v)) for v in (cx, cy, width_x_px, width_y_px)):
+            self._ellipse = (float(cx), float(cy), width_x_px / 2.0, width_y_px / 2.0, 0.0)
 
     def attach_camera(self, camera: Camera, *, close_previous: bool = True) -> None:
         """Swap in an already-open *camera*, replacing the current one.
@@ -585,24 +622,31 @@ class BeamProfiler:
     def reset_analysis(self) -> None:
         """Forget everything measured from previous frames.
 
-        Clears the warm-start parameters, the cached projections and the last
-        frame, so the next :meth:`analyze` starts from a cold estimate.
+        Clears the warm starts, the last frame and everything derived from it,
+        so the next :meth:`analyze` starts from a cold estimate. Call it
+        whenever the frame's geometry changes in a way :meth:`analyze` can't
+        see -- for example an ROI moved without changing its size.
         """
+        self._forget_warm_starts()
+        self._analysis_shape = None
+        self._last_proj_x = None
+        self._last_proj_y = None
+        self._ellipse = None
+        self._linecut_x = None
+        self._linecut_y = None
+        self.last_img = None
+        self.width_x = math.nan
+        self.width_y = math.nan
+        self.center_x = math.nan
+        self.center_y = math.nan
+        self.angle_deg = 0.0
+        self.peak_value = 0.0
+
+    def _forget_warm_starts(self) -> None:
+        """Drop the cached fit parameters that seed the next frame's fits."""
         self._last_popt_x = None
         self._last_popt_y = None
         self._last_popt_2d = None
-        self._last_proj_x = None
-        self._last_proj_y = None
-        self.last_img = None
-        self.width_x = 0.0
-        self.width_y = 0.0
-        self.center_x = 0.0
-        self.center_y = 0.0
-        self.angle_deg = 0.0
-        self.peak_value = 0.0
-        for attr in ("_linecut_x", "_linecut_y"):
-            if hasattr(self, attr):
-                delattr(self, attr)
 
     def stop(self) -> None:
         """Stop any active continuous streams and stop camera acquisition."""
@@ -736,8 +780,8 @@ class BeamProfiler:
         # Add linecut crosshair lines if using linecut method
         if (
             self.fit_method == "linecut"
-            and hasattr(self, "_linecut_x")
-            and hasattr(self, "_linecut_y")
+            and self._linecut_x is not None
+            and self._linecut_y is not None
         ):
             linecut_x_um = self._linecut_x * self.pixel_size
             linecut_y_um = self._linecut_y * self.pixel_size
@@ -880,8 +924,8 @@ class BeamProfiler:
         # Add linecut crosshair lines if using linecut method
         if (
             self.fit_method == "linecut"
-            and hasattr(self, "_linecut_x")
-            and hasattr(self, "_linecut_y")
+            and self._linecut_x is not None
+            and self._linecut_y is not None
         ):
             linecut_x_um = self._linecut_x * self.pixel_size
             linecut_y_um = self._linecut_y * self.pixel_size

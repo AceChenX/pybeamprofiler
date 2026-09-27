@@ -852,14 +852,17 @@ class TestAnalyzeProjectionCaching:
         assert bp._last_proj_x is not None
         assert bp._last_proj_y is not None
 
-    def test_linecut_no_projections(self):
+    def test_linecut_caches_the_profiles_it_fitted(self):
+        """The plot must show the row and column the fit ran on, not the
+        full-frame projections, which a single-row fit doesn't describe."""
         bp = BeamProfiler(camera="simulated")
         assert bp.camera is not None
         img = bp.camera.get_image()
         bp.fit_method = "linecut"
         bp.analyze(img)
-        assert bp._last_proj_x is None
-        assert bp._last_proj_y is None
+        assert bp._linecut_x is not None and bp._linecut_y is not None
+        np.testing.assert_array_equal(bp._last_proj_x, img[bp._linecut_y, :])
+        np.testing.assert_array_equal(bp._last_proj_y, img[:, bp._linecut_x])
 
 
 # ─── build_figure light theme and 2D rotation ─────────────────────────────

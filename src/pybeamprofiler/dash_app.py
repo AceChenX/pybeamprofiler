@@ -180,8 +180,10 @@ def build_figure(
     traces.append(go.Heatmap(**heat_kwargs))
 
     # ── Linecut crosshairs ──────────────────────────────────────
-    if bp.fit_method == "linecut" and hasattr(bp, "_linecut_x") and hasattr(bp, "_linecut_y"):
-        lx, ly = bp._linecut_x * ps, bp._linecut_y * ps
+    linecut_x = getattr(bp, "_linecut_x", None)
+    linecut_y = getattr(bp, "_linecut_y", None)
+    if bp.fit_method == "linecut" and linecut_x is not None and linecut_y is not None:
+        lx, ly = linecut_x * ps, linecut_y * ps
         for xs, ys in [([lx, lx], [0, y_max]), ([0, x_max], [ly, ly])]:
             traces.append(
                 go.Scatter(

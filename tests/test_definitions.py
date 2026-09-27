@@ -183,14 +183,14 @@ class TestDefinitionEdgeCases:
 
     @pytest.mark.parametrize("definition", ["gaussian", "fwhm", "d4s"])
     def test_empty_image_all_definitions(self, definition):
-        """Test empty images don't crash with any definition."""
+        """An empty frame reports no beam with every definition."""
         bp = BeamProfiler(camera="simulated", definition=definition)
         assert bp.camera is not None
         empty_img = np.zeros((100, 100))
 
         popt_x, popt_y = bp.analyze(empty_img)
-        assert popt_x is not None
-        assert popt_y is not None
+        assert popt_x is None and popt_y is None
+        assert np.isnan(bp.width_x) and np.isnan(bp.width_y)
 
         bp.camera.close()
 
@@ -463,11 +463,9 @@ class TestEdgeCases:
         for definition in ["gaussian", "fwhm", "d4s"]:
             bp = BeamProfiler(definition=definition)
             img = np.zeros((100, 100))
-            # Should not crash, even if it returns some fit (scipy can fit zeros)
             popt_x, popt_y = bp.analyze(img)
-            # Just verify it doesn't crash and returns something
-            assert popt_x is not None
-            assert popt_y is not None
+            assert popt_x is None and popt_y is None
+            assert np.isnan(bp.width_x)
 
     def test_definition_switching(self):
         """Test switching definition on the fly."""

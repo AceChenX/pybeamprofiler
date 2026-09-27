@@ -153,22 +153,22 @@ class TestFittingEdgeCases:
     """Test fitting with edge cases and invalid data."""
 
     def test_empty_image(self, beam_profiler):
-        """Test fitting handles empty images gracefully."""
+        """A blank frame has no beam, and says so instead of raising."""
         bp = beam_profiler
-        empty_img = np.zeros((100, 100))
-
-        popt_x, popt_y = bp.analyze(empty_img)
-        assert popt_x is not None
-        assert popt_y is not None
+        popt_x, popt_y = bp.analyze(np.zeros((100, 100)))
+        assert popt_x is None and popt_y is None
+        assert np.isnan(bp.width_x) and np.isnan(bp.width_y)
 
     def test_noisy_image(self, beam_profiler):
-        """Test fitting handles noisy images."""
+        """Pure noise is not a beam, however well a Gaussian can be fitted to it."""
         bp = beam_profiler
-        noisy_img = np.random.randint(0, 50, (100, 100), dtype=np.uint8)
+        rng = np.random.default_rng(3)
+        noisy_img = rng.integers(0, 50, (100, 100), dtype=np.uint8)
 
         popt_x, popt_y = bp.analyze(noisy_img)
-        assert popt_x is not None
-        assert popt_y is not None
+        assert popt_x is None and popt_y is None
+        assert np.isnan(bp.width_x) and np.isnan(bp.width_y)
+        assert bp.beam_ellipse() is None
 
     def test_multiple_consecutive_fits(self, beam_profiler):
         """Test multiple consecutive fits produce consistent results."""

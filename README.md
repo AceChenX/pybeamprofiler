@@ -130,9 +130,16 @@ order as FWHM < FW@1/e < FW@1/e². `d4s` is the ISO 11146 second-moment width,
 which equals 4σ for a Gaussian but — unlike a fit — stays meaningful for
 flat-top and multi-lobed beams.
 
-Choosing `fwhm` or `d4s` measures directly off the integrated profile with no
-model, so it takes precedence over `fit`; the Gaussian fit still runs, but only
-to draw the overlay.
+Choosing `fwhm` or `d4s` measures directly off the frame with no model, so it
+takes precedence over `fit`; the Gaussian fit still runs, but only to draw the
+curves over the profiles. `d4s` follows ISO 11146: the background is removed
+and the moments are taken inside a window three beam widths across, iterated
+until it settles. `fwhm` is read off profiles summed over just the band the
+beam occupies, which keeps the noise of the rest of the sensor out of it.
+
+A frame with no beam standing clear of the noise (a blocked beam, a blank
+sensor) reports NaN widths rather than a fit to the noise, and the next frame
+with a beam is measured afresh.
 
 ## Troubleshooting
 

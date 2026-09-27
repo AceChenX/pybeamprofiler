@@ -7,7 +7,7 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 import pytest
 
-from pybeamprofiler import BeamProfiler
+from pybeamprofiler import BeamProfiler, fitting
 
 
 class TestBeamProfilerProperties:
@@ -531,25 +531,36 @@ class TestFitFailures:
         assert len(result) == 4
         bp.camera.close()
 
-    def test_2d_fit_runtime_error_fallback(self):
-        """Test _fit_2d_gaussian falls back to initial guess on failure."""
+    def test_2d_fit_runtime_error_reports_no_beam(self):
+        """A fit that fails from every start is not dressed up as a result."""
         bp = BeamProfiler(camera="simulated")
         assert bp.camera is not None
-        img = np.random.uniform(0, 255, (32, 32)).astype(np.float64)
+        y, x = np.mgrid[0:32, 0:32]
+        img = bp.gaussian_2d((x, y), 100.0, 16.0, 16.0, 5.0, 5.0, 0.0, 10.0).reshape(32, 32)
         with patch("pybeamprofiler.fitting.curve_fit", side_effect=RuntimeError("fit failed")):
             result = bp._fit_2d_gaussian(img)
-        assert len(result) == 7
+        assert result is None
+        assert bp._last_popt_2d is None
         bp.camera.close()
 
-    def test_2d_fit_uses_cached_guess(self):
-        """Test _fit_2d_gaussian uses cached initial guess."""
+    def test_2d_fit_starts_from_the_cached_parameters(self):
         bp = BeamProfiler(camera="simulated")
         assert bp.camera is not None
-        img = np.random.uniform(0, 255, (32, 32)).astype(np.float64)
-        bp._last_popt_2d = [100, 16, 16, 5, 5, 0, 10]
-        with patch("pybeamprofiler.fitting.curve_fit", side_effect=RuntimeError("fit failed")):
-            result = bp._fit_2d_gaussian(img)
-        assert result == [100, 16, 16, 5, 5, 0, 10]
+        y, x = np.mgrid[0:32, 0:32]
+        img = bp.gaussian_2d((x, y), 100.0, 16.0, 16.0, 5.0, 5.0, 0.0, 10.0).reshape(32, 32)
+        cached = [100.0, 15.0, 17.0, 5.0, 4.0, 0.0, 10.0]
+        bp._last_popt_2d = cached
+        starts = []
+
+        def record(*args, **kwargs):
+            starts.append(np.asarray(kwargs["p0"], dtype=float))
+            raise RuntimeError("fit failed")
+
+        with patch("pybeamprofiler.fitting.curve_fit", side_effect=record):
+            bp._fit_2d_gaussian(img)
+        np.testing.assert_allclose(starts[0], cached, atol=1e-9)
+        # A failure leaves the last good warm start in place.
+        assert bp._last_popt_2d == cached
         bp.camera.close()
 
 
@@ -900,8 +911,8 @@ class TestMeasureMethods:
         bp = BeamProfiler(camera="simulated")
         assert bp.camera is not None
         center, width = bp._measure_d4s(np.zeros(100))
-        assert center == 50.0
-        assert width == 1.0
+        assert np.isnan(center)
+        assert np.isnan(width)
         bp.camera.close()
 
     def test_measure_fwhm_edge_cases(self):
@@ -1329,19 +1340,18 @@ class TestFit2DDownsampledFallback:
         # Image larger than _MAX_FIT_2D_DIM → triggers downsampling.
         h = w = bp._MAX_FIT_2D_DIM * 2
         img = np.zeros((h, w), dtype=np.uint8)
-        img[h // 2, w // 2] = 255  # single pixel → curve_fit will fail
+        img[h // 2, w // 2] = 255
 
         with patch(
             "pybeamprofiler.fitting.curve_fit",
             side_effect=RuntimeError("no convergence"),
         ):
-            result = bp._fit_2d_gaussian(img)
+            guess, ok = fitting.fit_2d_gaussian(img, max_dim=bp._MAX_FIT_2D_DIM)
+            assert bp._fit_2d_gaussian(img) is None
 
         # The initial guess must come back in *original* (un-downsampled)
-        # coordinates: x0/y0/sigmas should be around the original center,
-        # not half-size.
-        assert result is not None
-        # Centre coords must be near the original image centre, not the
-        # downsampled centre — sanity-check against the downsample factor.
-        assert result[1] > bp._MAX_FIT_2D_DIM / 2  # x0 scaled back
-        assert result[2] > bp._MAX_FIT_2D_DIM / 2  # y0 scaled back
+        # coordinates: near the original image centre, not the downsampled
+        # centre.
+        assert not ok
+        assert guess[1] > bp._MAX_FIT_2D_DIM / 2  # x0 scaled back
+        assert guess[2] > bp._MAX_FIT_2D_DIM / 2  # y0 scaled back

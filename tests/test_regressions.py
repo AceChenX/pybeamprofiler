@@ -54,6 +54,7 @@ class TestBeamEllipseUsesTheRightFit:
         assert np.degrees(angle) % 180 == pytest.approx(40.0, abs=2.0)
 
         # And it is genuinely different from what the projections would give.
+        assert popt_x is not None and popt_y is not None
         proj_rx, proj_ry = 2 * abs(popt_x[2]), 2 * abs(popt_y[2])
         assert abs(rx - proj_rx) > 5.0
         assert abs(ry - proj_ry) > 5.0
@@ -73,6 +74,7 @@ class TestBeamEllipseUsesTheRightFit:
         ellipse = bp.beam_ellipse()
         assert ellipse is not None
         cx, cy, rx, ry, angle = ellipse
+        assert popt_x is not None and popt_y is not None
         assert angle == 0.0
         assert cx == pytest.approx(popt_x[1])
         assert rx == pytest.approx(2 * abs(popt_x[2]))
@@ -270,31 +272,35 @@ class TestPixelSizeOverride:
 
 class TestTinyImages:
     """Profiles shorter than the parameter count raise TypeError from
-    curve_fit, which used to escape ``analyze``."""
+    curve_fit, which used to escape ``analyze``. A flat frame that small has
+    no beam in it, and must say so rather than report a fit to nothing."""
 
     @pytest.mark.parametrize("size", [1, 2, 3, 4])
     def test_analyze_survives_tiny_images(self, size):
         bp = BeamProfiler(camera="simulated")
         img = np.full((size, size), 100, dtype=np.uint8)
         popt_x, popt_y = bp.analyze(img)  # must not raise
-        assert len(popt_x) == 4
-        assert len(popt_y) == 4
+        assert popt_x is None and popt_y is None
+        assert np.isnan(bp.width_x) and np.isnan(bp.width_y)
 
+    @pytest.mark.parametrize("fit", ["1d", "2d", "linecut"])
     @pytest.mark.parametrize("definition", ["gaussian", "fwhm", "d4s"])
-    def test_tiny_images_for_every_definition(self, definition):
+    @pytest.mark.parametrize("size", [1, 2, 3])
+    def test_tiny_flat_frames_report_no_beam(self, size, definition, fit):
+        bp = BeamProfiler(camera="simulated", fit=fit, definition=definition)
+        bp.analyze(np.full((size, size), 50, dtype=np.uint8))
+        assert np.isnan(bp.width_x)
+        assert bp.beam_ellipse() is None
+
+    @pytest.mark.parametrize("definition", ["fwhm", "d4s"])
+    def test_a_tiny_frame_with_a_beam_still_measures(self, definition):
+        """The model-free definitions need no minimum sample count."""
+        img = np.full((5, 5), 10, dtype=np.uint8)
+        img[2, 2] = 200
         bp = BeamProfiler(camera="simulated", definition=definition)
-        bp.analyze(np.full((2, 2), 50, dtype=np.uint8))
-        assert np.isfinite(bp.width_x)
-
-    def test_tiny_image_in_2d_mode(self):
-        bp = BeamProfiler(camera="simulated", fit="2d")
-        bp.analyze(np.full((3, 3), 50, dtype=np.uint8))
-        assert np.isfinite(bp.width_x)
-
-    def test_tiny_image_in_linecut_mode(self):
-        bp = BeamProfiler(camera="simulated", fit="linecut")
-        bp.analyze(np.full((3, 3), 50, dtype=np.uint8))
-        assert np.isfinite(bp.width_x)
+        bp.analyze(img)
+        assert np.isfinite(bp.width_x) and bp.width_x > 0
+        assert bp.center_x == pytest.approx(2.0)
 
 
 class TestSimulatedCameraRoi:
