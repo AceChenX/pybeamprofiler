@@ -147,6 +147,120 @@ def _normalize_profile(
     return (data - lo) / rng * span * fraction
 
 
+def _profile_traces(
+    bp: BeamProfiler,
+    image: np.ndarray,
+    popt_x: np.ndarray | list[Any] | None,
+    popt_y: np.ndarray | list[Any] | None,
+    *,
+    xrange: list[float] | None,
+    yrange: list[float] | None,
+    line_colour: str,
+    fill_x: str,
+    fill_y: str,
+) -> list[Any]:
+    """The X and Y profiles, and their fits, for :func:`build_figure`."""
+    h, w = image.shape
+    ps = bp.pixel_size
+    x_max, y_max = w * ps, h * ps
+    cut_x = getattr(bp, "_linecut_x", None)
+    cut_y = getattr(bp, "_linecut_y", None)
+    traces: list[Any] = []
+
+    # ── Where the profiles go ───────────────────────────────────
+    # Each profile hugs an edge of whatever is in view -- the X projection
+    # the bottom, the Y projection the left -- and takes a fraction of the
+    # view, not of the sensor. Pinned to the sensor's own edges, as they
+    # used to be, they were left behind by any zoom: after Auto-fit none of
+    # either curve was on screen. When the view extends past the sensor the
+    # profile stays on the sensor's edge, where its fill ends.
+    view_x = xrange if xrange is not None else [0.0, x_max]
+    view_y = yrange if yrange is not None else [0.0, y_max]
+    x_base, x_span = max(view_y[0], 0.0), view_y[1] - view_y[0]
+    y_base, y_span = max(view_x[0], 0.0), view_x[1] - view_x[0]
+
+    # ── The profiles to draw ────────────────────────────────────
+    # Whatever the fit was run on: the cached projections, or in linecut mode
+    # the row and column through the peak. Falling back to the full-frame
+    # sums there drew the fit of one row over the projection of the whole
+    # frame -- on a tilted beam a 575 um curve under a 327 um fit.
+    cached_proj_x = getattr(bp, "_last_proj_x", None)
+    cached_proj_y = getattr(bp, "_last_proj_y", None)
+    if (
+        (cached_proj_x is None or cached_proj_y is None)
+        and bp.fit_method == "linecut"
+        and cut_x is not None
+        and cut_y is not None
+        and 0 <= cut_x < w
+        and 0 <= cut_y < h
+    ):
+        cached_proj_x, cached_proj_y = image[int(cut_y), :], image[:, int(cut_x)]
+    proj_x = (cached_proj_x if cached_proj_x is not None else np.sum(image, axis=0)).astype(float)
+    proj_y = (cached_proj_y if cached_proj_y is not None else np.sum(image, axis=1)).astype(float)
+
+    # ── X profile (bottom edge) ─────────────────────────────────
+    x_ax = np.arange(w)
+    norm_x = x_base + _normalize_profile(proj_x, x_span)
+
+    traces.append(
+        go.Scatter(
+            x=x_ax * ps,
+            y=norm_x,
+            mode="lines",
+            line=dict(color=line_colour, width=1.5),
+            fill="tozeroy",
+            fillcolor=fill_x,
+            showlegend=False,
+            hoverinfo="skip",
+        )
+    )
+    if popt_x is not None:
+        fit_x = bp.gaussian(x_ax, *popt_x).astype(float)
+        norm_fit_x = x_base + _normalize_profile(fit_x, x_span, reference=proj_x)
+        traces.append(
+            go.Scatter(
+                x=x_ax * ps,
+                y=norm_fit_x,
+                mode="lines",
+                line=dict(color="#FF4444", width=2),
+                showlegend=False,
+                hoverinfo="skip",
+            )
+        )
+
+    # ── Y profile (left edge) ──────────────────────────────────
+    y_ax = np.arange(h)
+    norm_y = y_base + _normalize_profile(proj_y, y_span)
+
+    traces.append(
+        go.Scatter(
+            x=norm_y,
+            y=y_ax * ps,
+            mode="lines",
+            line=dict(color=line_colour, width=1.5),
+            fill="tozerox",
+            fillcolor=fill_y,
+            showlegend=False,
+            hoverinfo="skip",
+        )
+    )
+    if popt_y is not None:
+        fit_y = bp.gaussian(y_ax, *popt_y).astype(float)
+        norm_fit_y = y_base + _normalize_profile(fit_y, y_span, reference=proj_y)
+        traces.append(
+            go.Scatter(
+                x=norm_fit_y,
+                y=y_ax * ps,
+                mode="lines",
+                line=dict(color="#FF4444", width=2),
+                showlegend=False,
+                hoverinfo="skip",
+            )
+        )
+
+    return traces
+
+
 def build_figure(
     bp: BeamProfiler,
     image: np.ndarray | None,
@@ -164,7 +278,9 @@ def build_figure(
 
     The X projection is drawn along the bottom edge and the Y projection
     along the left edge, similar to LaseView.  Returns an empty figure
-    when *image* is ``None``.
+    when *image* is ``None``. With the profiler's heatmap-only flag set
+    (``--heatmap-only``) the profiles and their fits are left out; the
+    heatmap, the beam ellipse and the linecut crosshair stay.
 
     Args:
         bp: BeamProfiler instance (used for pixel size and cached projections).
@@ -260,94 +376,23 @@ def build_figure(
         bg_paper = "#ffffff"
         fg = "#333"
 
-    # ── Where the profiles go ───────────────────────────────────
-    # Each profile hugs an edge of whatever is in view -- the X projection
-    # the bottom, the Y projection the left -- and takes a fraction of the
-    # view, not of the sensor. Pinned to the sensor's own edges, as they
-    # used to be, they were left behind by any zoom: after Auto-fit none of
-    # either curve was on screen. When the view extends past the sensor the
-    # profile stays on the sensor's edge, where its fill ends.
-    view_x = xrange if xrange is not None else [0.0, x_max]
-    view_y = yrange if yrange is not None else [0.0, y_max]
-    x_base, x_span = max(view_y[0], 0.0), view_y[1] - view_y[0]
-    y_base, y_span = max(view_x[0], 0.0), view_x[1] - view_x[0]
-
-    # ── The profiles to draw ────────────────────────────────────
-    # Whatever the fit was run on: the cached projections, or in linecut mode
-    # the row and column through the peak. Falling back to the full-frame
-    # sums there drew the fit of one row over the projection of the whole
-    # frame -- on a tilted beam a 575 um curve under a 327 um fit.
-    cached_proj_x = getattr(bp, "_last_proj_x", None)
-    cached_proj_y = getattr(bp, "_last_proj_y", None)
-    if (
-        (cached_proj_x is None or cached_proj_y is None)
-        and bp.fit_method == "linecut"
-        and cut_x is not None
-        and cut_y is not None
-        and 0 <= cut_x < w
-        and 0 <= cut_y < h
-    ):
-        cached_proj_x, cached_proj_y = image[int(cut_y), :], image[:, int(cut_x)]
-    proj_x = (cached_proj_x if cached_proj_x is not None else np.sum(image, axis=0)).astype(float)
-    proj_y = (cached_proj_y if cached_proj_y is not None else np.sum(image, axis=1)).astype(float)
-
-    # ── X profile (bottom edge) ─────────────────────────────────
-    x_ax = np.arange(w)
-    norm_x = x_base + _normalize_profile(proj_x, x_span)
-
-    traces.append(
-        go.Scatter(
-            x=x_ax * ps,
-            y=norm_x,
-            mode="lines",
-            line=dict(color=prof_line, width=1.5),
-            fill="tozeroy",
-            fillcolor=fill_x,
-            showlegend=False,
-            hoverinfo="skip",
-        )
-    )
-    if popt_x is not None:
-        fit_x = bp.gaussian(x_ax, *popt_x).astype(float)
-        norm_fit_x = x_base + _normalize_profile(fit_x, x_span, reference=proj_x)
-        traces.append(
-            go.Scatter(
-                x=x_ax * ps,
-                y=norm_fit_x,
-                mode="lines",
-                line=dict(color="#FF4444", width=2),
-                showlegend=False,
-                hoverinfo="skip",
-            )
-        )
-
-    # ── Y profile (left edge) ──────────────────────────────────
-    y_ax = np.arange(h)
-    norm_y = y_base + _normalize_profile(proj_y, y_span)
-
-    traces.append(
-        go.Scatter(
-            x=norm_y,
-            y=y_ax * ps,
-            mode="lines",
-            line=dict(color=prof_line, width=1.5),
-            fill="tozerox",
-            fillcolor=fill_y,
-            showlegend=False,
-            hoverinfo="skip",
-        )
-    )
-    if popt_y is not None:
-        fit_y = bp.gaussian(y_ax, *popt_y).astype(float)
-        norm_fit_y = y_base + _normalize_profile(fit_y, y_span, reference=proj_y)
-        traces.append(
-            go.Scatter(
-                x=norm_fit_y,
-                y=y_ax * ps,
-                mode="lines",
-                line=dict(color="#FF4444", width=2),
-                showlegend=False,
-                hoverinfo="skip",
+    # ── Profiles ────────────────────────────────────────────────
+    # Heatmap-only mode (--heatmap-only) leaves the curves out. The flag used
+    # to be stored and then ignored here, so it changed nothing in the GUI.
+    # Checked with ``is True`` because an unknown attribute on the profiler
+    # is looked up on the camera, and a mock camera's would be truthy.
+    if getattr(bp, "_heatmap_only", False) is not True:
+        traces.extend(
+            _profile_traces(
+                bp,
+                image,
+                popt_x,
+                popt_y,
+                xrange=xrange,
+                yrange=yrange,
+                line_colour=prof_line,
+                fill_x=fill_x,
+                fill_y=fill_y,
             )
         )
 

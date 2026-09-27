@@ -1154,3 +1154,37 @@ class TestDefensiveEdges:
             outs = [_tick(cbs) for _ in range(dash_app._MAX_CAMERA_FAILURES)]
         assert outs[-1][4] is True
         assert dash_app._server_paused is True
+
+
+class TestHeatmapOnlyModeIsHonoured:
+    """``--heatmap-only`` ("Draw only the heatmap, without the profile
+    curves") was stored on the profiler by plot() and then ignored by the
+    Dash figure, so from the command line the flag did nothing."""
+
+    @staticmethod
+    def _curves(fig: Any) -> list[Any]:
+        """Profile and fit traces: the scatters that are neither the dashed
+        ellipse nor the dotted crosshair."""
+        return [t for t in fig.data if t.type == "scatter" and t.line.dash is None]
+
+    def test_the_profiles_and_their_fits_are_left_out(self):
+        bp = _profiler()
+        bp._heatmap_only = True
+        fig = _tick(_callbacks(bp))[0]
+
+        assert fig.data[0].type == "heatmap"
+        assert self._curves(fig) == []
+        assert _ellipse_centre(fig) is not None  # the ellipse stays
+
+    def test_the_linecut_crosshair_stays(self):
+        bp = _profiler()
+        bp._heatmap_only = True
+        fig = _tick(_callbacks(bp), analysis="linecut")[0]
+
+        assert self._curves(fig) == []
+        assert _crosshair(fig) is not None
+
+    def test_the_curves_are_drawn_by_default(self):
+        bp = _profiler()
+        fig = _tick(_callbacks(bp))[0]
+        assert len(self._curves(fig)) == 4
