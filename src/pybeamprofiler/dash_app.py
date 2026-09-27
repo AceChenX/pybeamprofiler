@@ -1466,6 +1466,13 @@ def _register_callbacks(app: dash.Dash, bp: BeamProfiler) -> None:
             return nothing
 
         try:
+            if _server_paused:
+                # A Pause or a camera switch completed between the check
+                # above and taking the lock. Fetching now would restart the
+                # acquisition it just stopped: HarvesterCamera.get_image
+                # starts a stopped stream by itself.
+                return show_paused()
+
             # Either change starts the fits from scratch. A new fit method
             # fits different data, so the old warm start is meaningless; a
             # model-free definition (FWHM, D4σ) skips the 2D fit and the

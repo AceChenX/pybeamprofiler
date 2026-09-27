@@ -808,3 +808,27 @@ class TestTheButtonFollowsAPauseMadeElsewhere:
         assert out[0] is dash.no_update
         assert out[4] is True
         assert "Play" in str(out[5]) and out[6] == "success"
+
+
+class TestAPauseRacingATickIsHonoured:
+    """The tick checked the server-side pause flag before taking the lock.
+    A Pause that completed in between went unseen, and the tick fetched a
+    frame anyway -- which on a Harvesters camera restarts the acquisition
+    the Pause had just stopped, leaving a "paused" camera streaming."""
+
+    def test_the_tick_does_not_fetch_after_a_pause_it_raced(self, monkeypatch):
+        from unittest.mock import MagicMock
+
+        bp = _profiler()
+        cbs = _callbacks(bp)
+        assert bp.camera is not None
+        fetch = MagicMock(wraps=bp.camera.get_image)
+        bp.camera.get_image = fetch  # ty: ignore[invalid-assignment]
+        pause = lambda: cbs["toggle_pause"](1, False)  # noqa: E731
+        monkeypatch.setattr(dash_app, "_callback_lock", _InterleavingLock(pause))
+
+        out = _tick(cbs)  # the browser still thinks it is playing
+
+        fetch.assert_not_called()
+        assert not bp.camera.is_acquiring
+        assert out[4] is True  # and the page is told it is paused
