@@ -847,8 +847,9 @@ class TestTheLinecutPlotShowsWhatWasFitted:
         fig = _tick(cbs, analysis="linecut")[0]
         img = bp.last_img
         assert img is not None
-        row = img[int(bp._linecut_y), :].astype(float)
-        column = img[:, int(bp._linecut_x)].astype(float)
+        assert bp._linecut_x is not None and bp._linecut_y is not None
+        row = img[bp._linecut_y, :].astype(float)
+        column = img[:, bp._linecut_x].astype(float)
         height, width = (n * bp.pixel_size for n in img.shape)
 
         drawn = _profiles(fig)
@@ -866,6 +867,7 @@ class TestAFitIsDrawnToTheDatasScale:
         y, x = np.mgrid[0:64, 0:80]
         img = (200 * np.exp(-((x - 40) ** 2 + (y - 30) ** 2) / (2 * 6.0**2)) + 10).astype(np.uint8)
         popt_x, popt_y = bp.analyze(img)
+        assert popt_x is not None and popt_y is not None
         half = [popt_x[0] / 2, popt_x[1], popt_x[2], popt_x[3]]
 
         fig = dash_app.build_figure(bp, img, half, popt_y)
@@ -1063,10 +1065,11 @@ class TestAFrameWithNoPlausibleBeam:
 
     @staticmethod
     def _no_beam(bp: BeamProfiler, image: np.ndarray) -> tuple[None, None]:
-        nan = float("nan")
-        bp.width_x = bp.width_y = bp.center_x = bp.center_y = nan
-        bp.peak_value = float(image.max())
-        bp._last_popt_x = bp._last_popt_y = bp._last_popt_2d = None
+        """Analyse a frame that really holds no beam, through the real method
+        (the tick test patches ``bp.analyze``), and check what it reports."""
+        popt_x, popt_y = BeamProfiler.analyze(bp, np.full_like(image, 10))
+        assert popt_x is None and popt_y is None
+        assert np.isnan(bp.width_x) and np.isnan(bp.center_x)
         return None, None
 
     def test_the_results_show_dashes_not_nan(self):
@@ -1080,10 +1083,9 @@ class TestAFrameWithNoPlausibleBeam:
     def test_the_figure_draws_the_frame_and_nothing_it_cannot_know(self):
         bp = BeamProfiler(camera="simulated")
         bp.fit_method = "linecut"
-        bp._linecut_x = None  # ty: ignore[invalid-assignment]
-        bp._linecut_y = None  # ty: ignore[invalid-assignment]
         image = np.full((64, 64), 10, dtype=np.uint8)
         self._no_beam(bp, image)
+        assert bp._linecut_x is None and bp._linecut_y is None
 
         fig = dash_app.build_figure(bp, image, None, None)
 

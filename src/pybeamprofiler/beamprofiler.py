@@ -583,6 +583,10 @@ class BeamProfiler:
         # were fitted, not the full-frame projections.
         self._last_proj_x, self._last_proj_y = row, column
         popt_x, popt_y = self._fit_projections(row, column)
+        if popt_x is None and popt_y is None:
+            # No beam on either line: the "brightest pixel" is just the
+            # loudest noise, and a crosshair there would look like a result.
+            self._linecut_x = self._linecut_y = None
         self._record_gaussian(popt_x, popt_y)
         return popt_x, popt_y
 
@@ -684,6 +688,9 @@ class BeamProfiler:
         so the next :meth:`analyze` starts from a cold estimate. Call it
         whenever the frame's geometry changes in a way :meth:`analyze` can't
         see -- for example an ROI moved without changing its size.
+
+        A loaded file's image is kept: in file mode ``last_img`` is the
+        source itself, not a cached frame, and nothing could fetch it again.
         """
         self._forget_warm_starts()
         self._analysis_shape = None

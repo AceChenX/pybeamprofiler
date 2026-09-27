@@ -946,9 +946,10 @@ def _setting_tab(bp: BeamProfiler) -> dbc.Tab:
 def _format_results(bp: BeamProfiler) -> list[Any]:
     """Format fitted beam parameters for the results panel.
 
-    A frame with no plausible beam leaves the widths and the centre NaN;
-    those read "—" rather than "nan μm". "No fit data" is kept for the state
-    before anything has been measured, when the widths are exactly zero.
+    "No fit data" is for the state before any frame has been analysed, and
+    after the analysis is reset (a switch, an ROI, a new definition). A frame
+    that was analysed but held no plausible beam leaves the widths and the
+    centre NaN; those read "—" rather than "nan μm".
     """
     rows: list[Any] = []
 
@@ -961,7 +962,7 @@ def _format_results(bp: BeamProfiler) -> list[Any]:
             className="mb-1",
         )
 
-    if not (bp.width_x > 0 or math.isnan(bp.width_x) or math.isnan(bp.width_y)):
+    if getattr(bp, "_analysis_shape", None) is None:
         rows.append(html.Span("No fit data", className="text-muted"))
         return rows
 

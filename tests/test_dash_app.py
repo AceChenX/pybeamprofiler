@@ -402,8 +402,8 @@ class TestBuildFigureGeometry:
         bp = BeamProfiler(camera="simulated")
         bp.pixel_size = self.PIXEL
         bp.fit_method = "linecut"
-        bp._linecut_x = np.intp(20)  # column
-        bp._linecut_y = np.intp(45)  # row
+        bp._linecut_x = 20  # column
+        bp._linecut_y = 45  # row
         img = np.zeros((60, 80), dtype=np.uint8)
 
         fig = build_figure(bp, img, None, None)
@@ -909,10 +909,20 @@ class TestFormatResultsExtended:
         text = str(rows)
         assert "Angle" in text
 
-    def test_zero_width_shows_no_data(self):
+    def test_a_frame_without_a_beam_shows_dashes(self):
+        bp = BeamProfiler(camera="simulated")
+        rng = np.random.default_rng(0)
+        bp.analyze(rng.normal(20.0, 3.0, (60, 80)))
+        text = str(_format_results(bp))
+        assert "No fit data" not in text
+        assert "—" in text and "nan" not in text
+
+    def test_a_reset_shows_no_data_again(self):
         bp = BeamProfiler(camera="simulated")
         assert bp.camera is not None
-        bp.width_x = 0.0
+        bp.analyze(bp.camera.get_image())
+        assert "No fit data" not in str(_format_results(bp))
+        bp.reset_analysis()
         rows = _format_results(bp)
         assert len(rows) == 1
         assert "No fit data" in str(rows[0])

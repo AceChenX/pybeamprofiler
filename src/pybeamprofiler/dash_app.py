@@ -163,8 +163,6 @@ def _profile_traces(
     h, w = image.shape
     ps = bp.pixel_size
     x_max, y_max = w * ps, h * ps
-    cut_x = getattr(bp, "_linecut_x", None)
-    cut_y = getattr(bp, "_linecut_y", None)
     traces: list[Any] = []
 
     # ── Where the profiles go ───────────────────────────────────
@@ -180,21 +178,12 @@ def _profile_traces(
     y_base, y_span = max(view_x[0], 0.0), view_x[1] - view_x[0]
 
     # ── The profiles to draw ────────────────────────────────────
-    # Whatever the fit was run on: the cached projections, or in linecut mode
-    # the row and column through the peak. Falling back to the full-frame
-    # sums there drew the fit of one row over the projection of the whole
-    # frame -- on a tilted beam a 575 um curve under a 327 um fit.
+    # Whatever the fit was run on, which analyze() caches: the projections,
+    # or in linecut mode the row and column through the peak. Drawing the
+    # full-frame sums there put the fit of one row over the projection of the
+    # whole frame -- on a tilted beam a 575 um curve under a 327 um fit.
     cached_proj_x = getattr(bp, "_last_proj_x", None)
     cached_proj_y = getattr(bp, "_last_proj_y", None)
-    if (
-        (cached_proj_x is None or cached_proj_y is None)
-        and bp.fit_method == "linecut"
-        and cut_x is not None
-        and cut_y is not None
-        and 0 <= cut_x < w
-        and 0 <= cut_y < h
-    ):
-        cached_proj_x, cached_proj_y = image[int(cut_y), :], image[:, int(cut_x)]
     proj_x = (cached_proj_x if cached_proj_x is not None else np.sum(image, axis=0)).astype(float)
     proj_y = (cached_proj_y if cached_proj_y is not None else np.sum(image, axis=1)).astype(float)
 
