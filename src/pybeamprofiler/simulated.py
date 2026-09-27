@@ -304,11 +304,17 @@ class SimulatedCamera(Camera):
 
     def open(self) -> None:
         """Open the simulated camera and initialize the node map."""
+        self._generation += 1
         self.node_map = _SimulatedNodeMap(self)
         logger.info("Simulated camera opened.")
 
     def close(self) -> None:
-        """Release simulated camera resources (no-op)."""
+        """Release simulated camera resources.
+
+        There is nothing to release, but controls built for this camera
+        stop writing to it, as they do for a real one.
+        """
+        self._generation += 1
         logger.info("Simulated camera closed.")
 
     def start_acquisition(self) -> None:

@@ -371,3 +371,128 @@ class TestGetImageTimeoutIsABound:
         finished, took, exc = _timed(lambda: camera.get_image(timeout=5.0))
         assert finished and exc is None
         assert 0.1 < took < 1.0
+
+
+class TestDeviceAccessIsSerialised:
+    """Stopping or closing from one thread while another held a fetched
+    buffer freed the buffer under it: 7 of 8 runs segfaulted on TLSimu.
+    ``BeamProfiler.stop()`` in Jupyter does exactly that to the
+    ``asyncio.to_thread(get_image)`` still in flight, and the Dash SIGINT
+    handler closes the camera without the GUI lock."""
+
+    @staticmethod
+    def _park_inside_fetch(monkeypatch) -> tuple[threading.Event, threading.Event]:
+        """Make get_image() stop, holding its buffer, until released."""
+        inside, release = threading.Event(), threading.Event()
+        real = gen_camera._to_mono
+
+        def slow_copy(component: Any) -> Any:
+            inside.set()
+            release.wait(2.0)
+            return real(component)
+
+        monkeypatch.setattr(gen_camera, "_to_mono", slow_copy)
+        return inside, release
+
+    @pytest.mark.parametrize("action", ["stop_acquisition", "close"])
+    def test_waits_for_the_frame_being_copied(self, camera, monkeypatch, action):
+        camera.start_acquisition()
+        inside, release = self._park_inside_fetch(monkeypatch)
+        errors: list[BaseException] = []
+
+        def grab() -> None:
+            try:
+                camera.get_image(timeout=1.0)
+            except BaseException as exc:  # noqa: BLE001 - reported below
+                errors.append(exc)
+
+        fetcher = threading.Thread(target=grab, daemon=True)
+        fetcher.start()
+        assert inside.wait(1.0)
+
+        other = threading.Thread(target=getattr(camera, action), daemon=True)
+        other.start()
+        other.join(0.2)
+        still_waiting = other.is_alive()
+        release.set()
+        fetcher.join(2.0)
+        other.join(2.0)
+
+        assert still_waiting, f"{action}() ran while another thread held a buffer"
+        assert errors == []
+
+    def test_a_stop_ends_a_wait_in_progress_without_restarting(self, camera):
+        """get_image() starts a stopped camera, but only when called: a stop
+        from another thread mid-wait must stick."""
+        camera.start_acquisition()
+        camera.ia.frames_ready = False
+        finished, took, exc = _timed(
+            lambda: (
+                threading.Timer(0.1, camera.stop_acquisition).start(),
+                camera.get_image(timeout=2.0),
+            )
+        )
+        camera.ia.frames_ready = True
+        assert finished and isinstance(exc, TimeoutError)
+        assert took < 1.0
+        assert not camera.is_acquiring
+        assert camera.ia.calls[-1] == "stop"
+
+    def test_stop_waits_at_most_one_slice(self, camera):
+        """Waiting for the lock must not mean waiting out the whole timeout."""
+        camera.start_acquisition()
+        camera.ia.frames_ready = False
+
+        def grab() -> None:
+            with pytest.raises(TimeoutError):
+                camera.get_image(timeout=2.0)
+
+        fetcher = threading.Thread(target=grab, daemon=True)
+        fetcher.start()
+        time.sleep(0.05)
+        started = time.monotonic()
+        camera.stop_acquisition()
+        assert time.monotonic() - started < 0.5
+        camera.ia.frames_ready = True
+        fetcher.join(3.0)
+
+
+class TestPanelControlsOfAClosedCamera:
+    """A Jupyter panel stays on screen after its camera is swapped out or
+    closed. Its controls held nodes of the released device, and touching one
+    segfaulted the kernel (reproduced on TLSimu)."""
+
+    def test_a_control_refuses_once_its_camera_is_closed(self, camera, caplog):
+        (dropdown,) = camera._create_feature_controls(["TriggerMode"], {})
+        old_node_map = camera.node_map
+        camera.close()
+
+        with caplog.at_level("WARNING"):
+            dropdown.value = "On"
+
+        assert old_node_map.TriggerMode.value == "Off"
+        assert "since been closed" in caplog.text
+
+    def test_a_control_refuses_after_a_reopen(self, camera):
+        (dropdown,) = camera._create_feature_controls(["TriggerMode"], {})
+        old_node_map = camera.node_map
+        camera.close()
+        camera.open()
+
+        dropdown.value = "On"
+
+        assert old_node_map.TriggerMode.value == "Off"
+        assert camera.node_map.TriggerMode.value == "Off"
+
+    def test_a_live_control_still_writes(self, camera):
+        (dropdown,) = camera._create_feature_controls(["TriggerMode"], {})
+        dropdown.value = "On"
+        assert camera.node_map.TriggerMode.value == "On"
+
+    def test_setting_on_a_closed_camera_offers_no_device_controls(self, camera, monkeypatch):
+        import IPython.display
+
+        monkeypatch.setattr(IPython.display, "display", lambda *a, **k: None)
+        camera.close()
+        camera.setting()  # must not touch the released node map
+        assert camera._create_genicam_controls({}) == []

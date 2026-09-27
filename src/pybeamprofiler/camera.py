@@ -17,7 +17,11 @@ from __future__ import annotations
 import logging
 import math
 import re
+import threading
+import time
 from abc import ABC, abstractmethod
+from collections.abc import Iterator
+from contextlib import contextmanager
 from typing import Any, cast
 
 import numpy as np
@@ -159,12 +163,51 @@ class Camera(ABC):
         self.height: int = 0
         self.pixel_size: float = 1.0
         self.image_buffer: np.ndarray | None = None
+        # Serialises everything that touches the device. Harvesters is a C
+        # library: stopping acquisition while another thread still holds a
+        # fetched buffer frees that buffer under it, which segfaults rather
+        # than raising. Reentrant, because setters call start/stop. Never
+        # held while calling back into BeamProfiler or the Dash app, so the
+        # lock order is always "caller's lock, then this one".
+        self._lock = threading.RLock()
+        # Threads waiting in _device() for the lock; see there.
+        self._contenders = 0
+        self._contenders_lock = threading.Lock()
+        # Bumped on every open() and close(). A Jupyter control remembers
+        # the value it was built under and refuses to write once it changes:
+        # its node belongs to a device that has since been released, and
+        # touching that node would crash the kernel.
+        self._generation = 0
         # Memoised _discover_features() result plus the node map it was built
         # from (see that method for why). Keeping the object itself — rather
         # than its id() — means a replaced node map can never be mistaken for
         # the cached one via address reuse.
         self._feature_cache: dict[str, list[str]] | None = None
         self._feature_cache_source: Any = None
+
+    @contextmanager
+    def _device(self) -> Iterator[None]:
+        """Hold the device lock for anything other than fetching a frame.
+
+        A fetch releases the lock between waits, but CPython locks are not
+        fair: the fetching thread usually takes it straight back, and a
+        stop() waited up to a second behind a busy fetch loop on TLSimu.
+        Registering here first makes the fetch loop step aside at its next
+        wait boundary, so a control waits for at most one of them.
+        """
+        with self._contenders_lock:
+            self._contenders += 1
+        try:
+            with self._lock:
+                yield
+        finally:
+            with self._contenders_lock:
+                self._contenders -= 1
+
+    def _yield_to_controls(self) -> None:
+        """Wait while a control operation is queued for the device lock."""
+        while self._contenders:
+            time.sleep(0.0005)
 
     @abstractmethod
     def open(self) -> None:
@@ -295,13 +338,22 @@ class Camera(ABC):
             disabled=True,
         )
 
+        # These observers run inside the widget comm handler, where an
+        # exception is reported as a traceback in the log and leaves the
+        # two controls disagreeing; log it and keep the panel usable.
         def on_exposure_change(change: dict[str, Any]) -> None:
-            self.set_exposure(change["new"])
-            exposure_input.value = change["new"]
+            try:
+                self.set_exposure(change["new"])
+                exposure_input.value = change["new"]
+            except Exception as e:
+                logger.error(f"Error setting exposure: {e}")
 
         def on_gain_change(change: dict[str, Any]) -> None:
-            self.set_gain(change["new"])
-            gain_input.value = change["new"]
+            try:
+                self.set_gain(change["new"])
+                gain_input.value = change["new"]
+            except Exception as e:
+                logger.error(f"Error setting gain: {e}")
 
         def on_exposure_input_change(change: dict[str, Any]) -> None:
             exposure_slider.value = change["new"]
@@ -310,12 +362,19 @@ class Camera(ABC):
             gain_slider.value = change["new"]
 
         def on_start_click(b: Any) -> None:
-            self.start_acquisition()
+            try:
+                self.start_acquisition()
+            except Exception as e:
+                logger.error(f"Error starting acquisition: {e}")
+                return
             start_button.disabled = True
             stop_button.disabled = False
 
         def on_stop_click(b: Any) -> None:
-            self.stop_acquisition()
+            try:
+                self.stop_acquisition()
+            except Exception as e:
+                logger.error(f"Error stopping acquisition: {e}")
             start_button.disabled = False
             stop_button.disabled = True
 
@@ -671,15 +730,42 @@ class Camera(ABC):
 
         return self._create_enum_dropdown(node, feature_name, style)
 
+    def _write_node(self, node: Any, value: Any, feature_name: str, generation: int) -> bool:
+        """Write ``value`` to ``node`` on behalf of a panel control.
+
+        Args:
+            node: The node the control was built for.
+            value: New value.
+            feature_name: For messages.
+            generation: ``self._generation`` when the control was built.
+
+        Returns:
+            Whether the value was written. A control built before the camera
+            was last closed or reopened is refused: its node belongs to a
+            device that has been released, and on real hardware touching it
+            crashes the Python process.
+        """
+        with self._device():
+            if generation != self._generation or getattr(self, "node_map", None) is None:
+                logger.warning(
+                    "%s was not changed: this control belongs to a camera that has "
+                    "since been closed. Run setting() again for the current one.",
+                    feature_name,
+                )
+                return False
+            node.value = value
+            return True
+
     def _create_checkbox(self, node: Any, feature_name: str, current_val: bool) -> Any:
         """Create checkbox widget for a boolean GenICam feature."""
         import ipywidgets as widgets
 
         checkbox = widgets.Checkbox(value=bool(current_val), description=feature_name, indent=False)
+        generation = self._generation
 
         def on_change(change: dict[str, Any]) -> None:
             try:
-                node.value = change["new"]
+                self._write_node(node, change["new"], feature_name, generation)
             except Exception as e:
                 logger.error(f"Error setting {feature_name}: {e}")
 
@@ -721,10 +807,12 @@ class Camera(ABC):
                     value=current_val, layout=widgets.Layout(width="100px")
                 )
 
+            generation = self._generation
+
             def on_slider_change(change: dict[str, Any]) -> None:
                 try:
-                    node.value = change["new"]
-                    input_widget.value = change["new"]
+                    if self._write_node(node, change["new"], feature_name, generation):
+                        input_widget.value = change["new"]
                 except Exception as e:
                     logger.error(f"Error setting {feature_name}: {e}")
 
@@ -768,9 +856,11 @@ class Camera(ABC):
                 style=style,
             )
 
+            generation = self._generation
+
             def on_change(change: dict[str, Any]) -> None:
                 try:
-                    node.value = change["new"]
+                    self._write_node(node, change["new"], feature_name, generation)
                 except Exception as e:
                     logger.error(f"Error setting {feature_name}: {e}")
 

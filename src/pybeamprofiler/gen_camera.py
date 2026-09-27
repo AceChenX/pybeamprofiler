@@ -5,11 +5,21 @@ Basler differ only in where their GenTL producer lives, which
 :mod:`pybeamprofiler.cti` already handles, so both vendor classes are thin
 subclasses.
 
-Two things here exist because of how the underlying C library behaves rather
-than because the GenICam standard asks for them: acquisition is restarted
-after an exposure change so the producer's buffer ring cannot deliver
-stale-exposure frames, and a silent producer is given one stop/start
-recovery attempt before the caller is left waiting forever.
+Most of what is unusual here follows from how the underlying C libraries
+behave rather than from anything the GenICam standard asks for:
+
+* A GenTL producer can be initialised only once per process, so every
+  camera and every discovery pass share one Harvester (see
+  :class:`_SharedHarvester`).
+* Harvesters segfaults, rather than raising, when a fetched buffer is
+  re-queued after acquisition was stopped under it, or when a node is read
+  through a released device. Each camera therefore serialises everything
+  that touches its device, and ``close()`` drops every handle into it.
+* ``ImageAcquirer.fetch()`` is not bounded by its timeout, so frames are
+  taken with ``try_fetch`` against a deadline kept here.
+* Acquisition is restarted after an exposure change so the producer's
+  buffer ring cannot deliver stale-exposure frames, and a producer that goes
+  silent gets one stop/start recovery attempt.
 """
 
 from __future__ import annotations
@@ -482,6 +492,12 @@ class HarvesterCamera(Camera):
     Provides a unified interface for FLIR, Basler, and other GenICam-compliant
     cameras via standard GenTL producers (``.cti`` files).
 
+    Safe to use from several threads: fetching, starting, stopping, closing
+    and every node write are serialised on the camera's own lock. A fetch
+    waits in slices and steps aside between them, so a stop() or close()
+    issued mid-wait runs within one slice (0.1 s) rather than behind the
+    whole timeout.
+
     Attributes:
         node_map: GenICam node map for direct feature access, or ``None``.
         device_model: Camera model name (e.g. ``"BFS-PGE-50S5M"``).
@@ -601,22 +617,26 @@ class HarvesterCamera(Camera):
             RuntimeError: No matching camera, or the device refused to open
                 (most often because another application holds it).
         """
-        if self.ia is not None:
-            self._release_device()  # reopening: hand the old device back first
-        try:
-            if self.h is not None:
-                ia, device = self._open_private()
-            else:
-                self.h, ia, device = _acquire_device(self._harvester_files(), self._choose_device)
-                self._shared = True
-            self.ia = ia
-            self._take_device_identity(device)
-            self.node_map = ia.remote_device.node_map
-            self._configure_device()
-        except BaseException:
-            self.close()
-            raise
-        logger.info(f"Camera opened successfully: {self.device_model}")
+        with self._device():
+            if self.ia is not None:
+                self._release_device()  # reopening: hand the old device back first
+            self._generation += 1
+            try:
+                if self.h is not None:
+                    ia, device = self._open_private()
+                else:
+                    self.h, ia, device = _acquire_device(
+                        self._harvester_files(), self._choose_device
+                    )
+                    self._shared = True
+                self.ia = ia
+                self._take_device_identity(device)
+                self.node_map = ia.remote_device.node_map
+                self._configure_device()
+            except BaseException:
+                self.close()
+                raise
+            logger.info(f"Camera opened successfully: {self.device_model}")
 
     def _configure_device(self) -> None:
         """Put a freshly opened device into a known state and read it back."""
@@ -1029,21 +1049,23 @@ class HarvesterCamera(Camera):
         rather than raising. A closed camera answers "Camera not opened."
         instead, and can be opened again.
         """
-        try:
-            self.stop_acquisition()
-        except Exception:
-            logger.debug("Error stopping acquisition during close", exc_info=True)
-        was_shared = self._shared
-        self._release_device()
-        h, self.h = self.h, None
-        if h is not None and not was_shared:
+        with self._device():
             try:
-                h.reset()
+                self.stop_acquisition()
             except Exception:
-                logger.debug("Error resetting Harvester", exc_info=True)
+                logger.debug("Error stopping acquisition during close", exc_info=True)
+            was_shared = self._shared
+            self._release_device()
+            h, self.h = self.h, None
+            if h is not None and not was_shared:
+                try:
+                    h.reset()
+                except Exception:
+                    logger.debug("Error resetting Harvester", exc_info=True)
 
     def _release_device(self) -> None:
         """Give the device back and forget every handle that pointed into it."""
+        self._generation += 1
         ia, self.ia = self.ia, None
         self.node_map = None
         self.is_acquiring = False
@@ -1062,12 +1084,13 @@ class HarvesterCamera(Camera):
 
     def start_acquisition(self) -> None:
         """Start image acquisition on the GenTL producer."""
-        if not self.ia or self.is_acquiring:
-            return
-        self._start_stream()
-        # A deliberate start re-arms the stall recovery; see _recover_if_stalled.
-        self._last_successful_fetch = 0.0
-        self._stall_recovery_attempted = False
+        with self._device():
+            if not self.ia or self.is_acquiring:
+                return
+            self._start_stream()
+            # A deliberate start re-arms the stall recovery; see _recover_if_stalled.
+            self._last_successful_fetch = 0.0
+            self._stall_recovery_attempted = False
 
     def _start_stream(self) -> None:
         """Start the producer without touching the stall-recovery state."""
@@ -1076,12 +1099,13 @@ class HarvesterCamera(Camera):
 
     def stop_acquisition(self) -> None:
         """Stop image acquisition on the GenTL producer."""
-        if self.ia and self.is_acquiring:
-            try:
-                self.ia.stop()
-            except Exception:
-                logger.debug("Error stopping acquisition", exc_info=True)
-        self.is_acquiring = False
+        with self._device():
+            if self.ia and self.is_acquiring:
+                try:
+                    self.ia.stop()
+                except Exception:
+                    logger.debug("Error stopping acquisition", exc_info=True)
+            self.is_acquiring = False
 
     def get_image(self, timeout: float | None = None) -> np.ndarray:
         """Fetch the next frame from the GenTL producer.
@@ -1112,8 +1136,11 @@ class HarvesterCamera(Camera):
         if timeout is None:
             timeout = max(2.0, (self.exposure_time or 0) + 2.0)
         deadline = time.monotonic() + max(timeout, 0.0)
+        first = True
         while True:
-            img = self._fetch_slice(deadline)
+            self._yield_to_controls()
+            img = self._fetch_slice(deadline, may_start=first)
+            first = False
             if img is not None:
                 return img
             if time.monotonic() >= deadline:
@@ -1125,50 +1152,60 @@ class HarvesterCamera(Camera):
                     "use by another application."
                 )
 
-    def _fetch_slice(self, deadline: float) -> np.ndarray | None:
+    def _fetch_slice(self, deadline: float, *, may_start: bool) -> np.ndarray | None:
         """Wait for one frame until ``deadline``, but no longer than one slice.
+
+        Args:
+            deadline: ``time.monotonic()`` value to give up at.
+            may_start: Start acquisition if it is not running. Only the first
+                slice of a call may: between slices another thread may have
+                stopped acquisition on purpose (``BeamProfiler.stop()``), and
+                restarting it would leave the camera streaming after "stop".
 
         Returns:
             The frame, or ``None`` if none arrived (or it was incomplete).
         """
-        if not self.ia:
-            raise RuntimeError("Camera not opened.")
-        if not self.is_acquiring:
-            self.start_acquisition()
-        self._recover_if_stalled()
+        with self._lock:
+            if not self.ia:
+                raise RuntimeError("Camera not opened.")
+            if not self.is_acquiring:
+                if not may_start:
+                    raise TimeoutError("Acquisition was stopped while waiting for a frame.")
+                self.start_acquisition()
+            self._recover_if_stalled()
 
-        # try_fetch(timeout=0) waits forever in Harvesters 1.4; a poll uses
-        # the shortest real wait instead.
-        wait = min(max(deadline - time.monotonic(), _POLL_S), _FETCH_SLICE_S)
-        try:
-            buffer = self.ia.try_fetch(timeout=wait)
-        except Exception as exc:
-            # Harvesters' TimeoutException shares only a name with the
-            # built-in TimeoutError; neither means "the device failed".
-            if isinstance(exc, TimeoutError) or (
-                _HarvestersTimeout is not None and isinstance(exc, _HarvestersTimeout)
-            ):
-                buffer = None
-            else:
-                raise
-        if buffer is None:
-            # Seed the stall timer on the first empty wait, so a camera that
-            # has simply not delivered its first frame yet is not "stalled".
-            if not self._last_successful_fetch:
-                self._last_successful_fetch = time.monotonic()
-            return None
+            # try_fetch(timeout=0) waits forever in Harvesters 1.4; a poll uses
+            # the shortest real wait instead.
+            wait = min(max(deadline - time.monotonic(), _POLL_S), _FETCH_SLICE_S)
+            try:
+                buffer = self.ia.try_fetch(timeout=wait)
+            except Exception as exc:
+                # Harvesters' TimeoutException shares only a name with the
+                # built-in TimeoutError; neither means "the device failed".
+                if isinstance(exc, TimeoutError) or (
+                    _HarvestersTimeout is not None and isinstance(exc, _HarvestersTimeout)
+                ):
+                    buffer = None
+                else:
+                    raise
+            if buffer is None:
+                # Seed the stall timer on the first empty wait, so a camera that
+                # has simply not delivered its first frame yet is not "stalled".
+                if not self._last_successful_fetch:
+                    self._last_successful_fetch = time.monotonic()
+                return None
 
-        with buffer as held:
-            component = held.payload.components[0]
-            self.width_pixels = component.width
-            self.height_pixels = component.height
-            img = _to_mono(component)
-        now = time.monotonic()
-        if self._last_successful_fetch:
-            self._frame_interval = now - self._last_successful_fetch
-        self._last_successful_fetch = now
-        self._stall_recovery_attempted = False
-        return img
+            with buffer as held:
+                component = held.payload.components[0]
+                self.width_pixels = component.width
+                self.height_pixels = component.height
+                img = _to_mono(component)
+            now = time.monotonic()
+            if self._last_successful_fetch:
+                self._frame_interval = now - self._last_successful_fetch
+            self._last_successful_fetch = now
+            self._stall_recovery_attempted = False
+            return img
 
     def _recover_if_stalled(self) -> None:
         """Restart acquisition once if the producer has gone quiet.
@@ -1225,22 +1262,23 @@ class HarvesterCamera(Camera):
         Args:
             exposure_time: Exposure time in seconds.
         """
-        was_acquiring = self.is_acquiring
-        if was_acquiring:
-            self.stop_acquisition()
+        with self._device():
+            was_acquiring = self.is_acquiring
+            if was_acquiring:
+                self.stop_acquisition()
 
-        if self.node_map:
-            try:
-                self.node_map.ExposureTime.value = exposure_time * 1_000_000
-            except (AttributeError, ValueError, TypeError):
+            if self.node_map:
                 try:
-                    self.node_map.ExposureTimeAbs.value = exposure_time * 1_000_000
+                    self.node_map.ExposureTime.value = exposure_time * 1_000_000
                 except (AttributeError, ValueError, TypeError):
-                    logger.error("Could not set exposure time.")
-        self.exposure_time = exposure_time
+                    try:
+                        self.node_map.ExposureTimeAbs.value = exposure_time * 1_000_000
+                    except (AttributeError, ValueError, TypeError):
+                        logger.error("Could not set exposure time.")
+            self.exposure_time = exposure_time
 
-        if was_acquiring:
-            self.start_acquisition()
+            if was_acquiring:
+                self.start_acquisition()
 
     def set_gain(self, gain: float) -> None:
         """Set camera gain, falling back to the legacy ``GainRaw`` feature.
@@ -1249,15 +1287,16 @@ class HarvesterCamera(Camera):
             gain: Gain in the camera's own units — dB on most SFNC-compliant
                 devices, raw ADC steps on older ones.
         """
-        if self.node_map:
-            try:
-                self.node_map.Gain.value = gain
-            except (AttributeError, ValueError, TypeError):
+        with self._device():
+            if self.node_map:
                 try:
-                    self.node_map.GainRaw.value = int(gain)
+                    self.node_map.Gain.value = gain
                 except (AttributeError, ValueError, TypeError):
-                    logger.error("Could not set gain.")
-        self.gain = gain
+                    try:
+                        self.node_map.GainRaw.value = int(gain)
+                    except (AttributeError, ValueError, TypeError):
+                        logger.error("Could not set gain.")
+            self.gain = gain
 
     @property
     def exposure_range(self) -> tuple[float, float]:
@@ -1299,48 +1338,49 @@ class HarvesterCamera(Camera):
                 previous ROI is put back first, and the message says what the
                 camera is now set to.
         """
-        ox = _roi_pixels("offset_x", offset_x)
-        oy = _roi_pixels("offset_y", offset_y)
-        w = None if width is None else _roi_pixels("width", width, minimum=1)
-        h = None if height is None else _roi_pixels("height", height, minimum=1)
+        with self._device():
+            ox = _roi_pixels("offset_x", offset_x)
+            oy = _roi_pixels("offset_y", offset_y)
+            w = None if width is None else _roi_pixels("width", width, minimum=1)
+            h = None if height is None else _roi_pixels("height", height, minimum=1)
 
-        if not self.node_map:
-            raise RuntimeError("Camera not opened.")
+            if not self.node_map:
+                raise RuntimeError("Camera not opened.")
 
-        x, y = self._roi_axes()
-        new_ox, new_w = _fit_axis(x, ox, w)
-        new_oy, new_h = _fit_axis(y, oy, h)
-        before = self._read_roi()
+            x, y = self._roi_axes()
+            new_ox, new_w = _fit_axis(x, ox, w)
+            new_oy, new_h = _fit_axis(y, oy, h)
+            before = self._read_roi()
 
-        was_acquiring = self.is_acquiring
-        if was_acquiring:
-            self.stop_acquisition()
-        try:
-            try:
-                self._write_roi(new_ox, new_oy, new_w, new_h, x, y)
-            except _NODE_ERRORS as exc:
-                try:
-                    self._write_roi(*before, x, y)
-                except _NODE_ERRORS:
-                    logger.warning("Could not restore the previous ROI", exc_info=True)
-                self._refresh_roi_cache()
-                raise RuntimeError(
-                    f"The camera refused a {new_w}×{new_h} ROI at ({new_ox}, {new_oy}): "
-                    f"{_node_error_text(exc)} It is set to {self.width_pixels}×"
-                    f"{self.height_pixels} at ({self._roi_offset_x}, {self._roi_offset_y})."
-                ) from exc
-            self._refresh_roi_cache()
-        finally:
+            was_acquiring = self.is_acquiring
             if was_acquiring:
-                self.start_acquisition()
+                self.stop_acquisition()
+            try:
+                try:
+                    self._write_roi(new_ox, new_oy, new_w, new_h, x, y)
+                except _NODE_ERRORS as exc:
+                    try:
+                        self._write_roi(*before, x, y)
+                    except _NODE_ERRORS:
+                        logger.warning("Could not restore the previous ROI", exc_info=True)
+                    self._refresh_roi_cache()
+                    raise RuntimeError(
+                        f"The camera refused a {new_w}×{new_h} ROI at ({new_ox}, {new_oy}): "
+                        f"{_node_error_text(exc)} It is set to {self.width_pixels}×"
+                        f"{self.height_pixels} at ({self._roi_offset_x}, {self._roi_offset_y})."
+                    ) from exc
+                self._refresh_roi_cache()
+            finally:
+                if was_acquiring:
+                    self.start_acquisition()
 
-        logger.info(
-            "ROI set: offset=(%d, %d), size=%d×%d",
-            self._roi_offset_x,
-            self._roi_offset_y,
-            self.width_pixels,
-            self.height_pixels,
-        )
+            logger.info(
+                "ROI set: offset=(%d, %d), size=%d×%d",
+                self._roi_offset_x,
+                self._roi_offset_y,
+                self.width_pixels,
+                self.height_pixels,
+            )
 
     @property
     def roi_info(self) -> dict[str, int]:
@@ -1354,16 +1394,17 @@ class HarvesterCamera(Camera):
             ``max_width``, ``max_height``. The maxima follow binning and
             decimation, which change them on the camera.
         """
-        if self.node_map:
-            try:
-                self._refresh_roi_cache()
-            except Exception:
-                logger.debug("Could not read the ROI back from the camera", exc_info=True)
-        return {
-            "offset_x": self._roi_offset_x,
-            "offset_y": self._roi_offset_y,
-            "width": self.width_pixels,
-            "height": self.height_pixels,
-            "max_width": self._roi_max_width,
-            "max_height": self._roi_max_height,
-        }
+        with self._device():
+            if self.node_map:
+                try:
+                    self._refresh_roi_cache()
+                except Exception:
+                    logger.debug("Could not read the ROI back from the camera", exc_info=True)
+            return {
+                "offset_x": self._roi_offset_x,
+                "offset_y": self._roi_offset_y,
+                "width": self.width_pixels,
+                "height": self.height_pixels,
+                "max_width": self._roi_max_width,
+                "max_height": self._roi_max_height,
+            }

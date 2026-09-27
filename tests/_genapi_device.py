@@ -158,14 +158,21 @@ class FakeBuffer:
     def __init__(self, component: FakeComponent, owner: FakeAcquirer) -> None:
         self.payload = SimpleNamespace(components=[component])
         self._owner = owner
+        self._stops = owner.stops
 
     def __enter__(self) -> FakeBuffer:
         return self
 
     def __exit__(self, *exc: object) -> None:
+        # Re-queueing a buffer that stop() or destroy() revoked while it was
+        # held is the use-after-free that segfaults with a real producer.
         if self._owner.destroyed:
             raise AssertionError(
                 "buffer re-queued on a destroyed acquirer (a segfault on hardware)"
+            )
+        if self._owner.stops != self._stops:
+            raise AssertionError(
+                "buffer re-queued after stop() revoked it (a segfault on hardware)"
             )
 
 
@@ -180,6 +187,7 @@ class FakeAcquirer:
         self.frames_ready = True
         # Every buffer arrives with packets missing, as on a lossy GigE link.
         self.incomplete = False
+        self.stops = 0
         self.calls: list[str] = []
 
     def _check(self) -> None:
@@ -195,6 +203,7 @@ class FakeAcquirer:
     def stop(self) -> None:
         self._check()
         self.calls.append("stop")
+        self.stops += 1
         self.remote_device.node_map.TLParamsLocked.value = 0
         self.acquiring = False
 
