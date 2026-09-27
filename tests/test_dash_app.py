@@ -1514,8 +1514,9 @@ class TestUpdateLiveImgPaths:
         assert hasattr(result[0], "data")
         assert result[3] == 1
 
-    def test_outer_exception_returns_no_update(self):
-        """Any exception during analyze should be caught and logged."""
+    def test_outer_exception_keeps_the_frame_and_reports_the_error(self):
+        """Any exception during analyze is caught, logged, and shown in the
+        status bar instead of leaving a frozen frame unexplained."""
         from unittest.mock import MagicMock
 
         bp = BeamProfiler(camera="simulated")
@@ -1527,7 +1528,9 @@ class TestUpdateLiveImgPaths:
         fn = self._get_update_fn(bp)
         assert fn is not None
         result = fn(1, False, True, "Hot", True, None, None, 0, "1d", "gaussian", True, 1)
-        assert all(isinstance(r, dash._no_update.NoUpdate) for r in result)
+        assert "Update error: explode" in str(result[2])
+        others = result[:2] + result[3:]
+        assert all(isinstance(r, dash._no_update.NoUpdate) for r in others)
 
 
 # ─── slider restart-on-stopped branches ───────────────────────────────────
@@ -2221,10 +2224,13 @@ class TestUpdateLiveCallback:
         fn = self._get_update_fn(bp)
         assert fn is not None
         result = fn(1, False, True, "Hot", True, None, None, 0, "1d", "gaussian", True, 1)
-        assert len(result) == 4
+        # Figure, results, status, frame count, then the pause state and the
+        # Play/Pause face, which a healthy tick leaves alone.
+        assert len(result) == 7
         fig = result[0]
         assert hasattr(fig, "data")
         assert result[3] == 1
+        assert all(isinstance(r, dash._no_update.NoUpdate) for r in result[4:])
 
     def test_live_update_switches_fit_method(self):
         bp = BeamProfiler(camera="simulated")
@@ -2243,7 +2249,7 @@ class TestUpdateLiveCallback:
         fn = self._get_update_fn(bp)
         assert fn is not None
         result = fn(1, False, True, "Hot", False, 10.0, 200.0, 0, "1d", "gaussian", True, 1)
-        assert len(result) == 4
+        assert len(result) == 7
 
     def test_live_update_greyscale(self):
         bp = BeamProfiler(camera="simulated")
@@ -2252,7 +2258,7 @@ class TestUpdateLiveCallback:
         fn = self._get_update_fn(bp)
         assert fn is not None
         result = fn(1, False, False, "Hot", True, None, None, 0, "1d", "gaussian", True, 1)
-        assert len(result) == 4
+        assert len(result) == 7
 
     def test_live_update_averages_frames(self):
         """N>1 averaging returns valid figure and populates the buffer."""

@@ -564,6 +564,46 @@ def _zoom_after_relayout(
     return new
 
 
+# Consecutive ticks on which the camera raised something other than a
+# timeout. After _MAX_CAMERA_FAILURES in a row the stream is paused: a device
+# that has gone away does not come back for being asked twenty times a
+# second, and each of those attempts used to log a full traceback while the
+# page went on showing the last good frame as if nothing had happened.
+_camera_failures = 0
+_MAX_CAMERA_FAILURES = 10
+
+# The last error a render tick logged and when, plus how many repeats have
+# been held back since, so a persistent fault is reported every so often
+# rather than on every tick.
+_last_tick_error: tuple[str, float] | None = None
+_suppressed_tick_errors = 0
+_TICK_ERROR_LOG_INTERVAL_S = 10.0
+
+
+def _error_status(message: str) -> Any:
+    """A status-bar line that reports *message* as an error."""
+    return html.Span(
+        [html.I(className="bi bi-exclamation-triangle-fill me-1"), message],
+        className="text-danger fw-bold",
+    )
+
+
+def _log_tick_error(message: str, exc: BaseException) -> None:
+    """Log a render-tick failure, at most once an interval while it repeats."""
+    global _last_tick_error, _suppressed_tick_errors  # noqa: PLW0603
+    now = time.monotonic()
+    if _last_tick_error is not None:
+        last_message, last_time = _last_tick_error
+        if last_message == message and now - last_time < _TICK_ERROR_LOG_INTERVAL_S:
+            _suppressed_tick_errors += 1
+            return
+    repeats = _suppressed_tick_errors
+    note = f" (repeated {repeats} times since last logged)" if repeats else ""
+    logger.error("%s%s", message, note, exc_info=exc)
+    _last_tick_error = (message, now)
+    _suppressed_tick_errors = 0
+
+
 def _measured_fps() -> float:
     """Compute frames-per-second from the rolling timestamp window."""
     if len(_recent_frame_times) < 2:
@@ -716,12 +756,16 @@ def _register_callbacks(app: dash.Dash, bp: BeamProfiler) -> None:
     relaunches the GUI -- would inherit the previous session's pause flag,
     zoom, fps window and averaged frames.
     """
-    global _known_options, _server_paused, _zoom_range  # noqa: PLW0603
+    global _known_options, _server_paused, _zoom_range, _camera_failures  # noqa: PLW0603
+    global _last_tick_error, _suppressed_tick_errors  # noqa: PLW0603
     _server_paused = False
     _zoom_range = None
     _known_options = []
     _reset_avg_state()
     _recent_frame_times.clear()
+    _camera_failures = 0
+    _last_tick_error = None
+    _suppressed_tick_errors = 0
 
     # -- Camera selection -----------------------------------------------------
     # Rescanning and switching both take ``_callback_lock``: swapping the
@@ -785,7 +829,7 @@ def _register_callbacks(app: dash.Dash, bp: BeamProfiler) -> None:
         Streaming is left paused afterwards: the caller picked a camera, and
         starting it is the next deliberate click.
         """
-        global _server_paused  # noqa: PLW0603
+        global _server_paused, _camera_failures  # noqa: PLW0603
 
         if not key:
             return (dash.no_update,) * 6
@@ -812,6 +856,7 @@ def _register_callbacks(app: dash.Dash, bp: BeamProfiler) -> None:
             bp.attach_camera(camera)
             _discard_frame_history(bp)
             _server_paused = True
+            _camera_failures = 0
 
             items = _build_setting_items(bp)
             scale = round(bp.pixel_size, 4)
@@ -832,19 +877,25 @@ def _register_callbacks(app: dash.Dash, bp: BeamProfiler) -> None:
         Output("btn-play-pause", "children"),
         Output("btn-play-pause", "color"),
         Output("settings-container", "children"),
+        Output("status-bar", "children", allow_duplicate=True),
         Input("btn-play-pause", "n_clicks"),
         State("store-paused", "data"),
         prevent_initial_call=True,
     )
-    def toggle_pause(n: int, paused: bool) -> tuple[bool, list[Any], str, Any]:
+    def toggle_pause(n: int, paused: bool) -> tuple[Any, ...]:
         """Start or stop streaming, and relabel the button to match.
 
         Also rebuilds the Setting panel: values the camera changed on its
         own while running (auto-exposure, temperature) are only worth
         re-reading when the stream is not competing for the lock.
+
+        A camera that refuses to start leaves the stream paused, with the
+        reason in the status bar, rather than failing the callback and
+        leaving the button and the server disagreeing about the state.
         """
-        global _server_paused  # noqa: PLW0603
+        global _server_paused, _camera_failures  # noqa: PLW0603
         new_paused = not paused
+        status: Any = dash.no_update
 
         with _callback_lock:
             _server_paused = new_paused
@@ -852,14 +903,24 @@ def _register_callbacks(app: dash.Dash, bp: BeamProfiler) -> None:
                 if new_paused:
                     bp.camera.stop_acquisition()
                 else:
-                    bp.camera.start_acquisition()
+                    try:
+                        bp.camera.start_acquisition()
+                    except Exception as e:
+                        logger.warning("Could not start the camera: %s", e)
+                        new_paused = _server_paused = True
+                        status = _error_status(
+                            f"Could not start the camera: {str(e) or type(e).__name__}"
+                        )
+            # Play is also the retry after the stream paused itself, so it
+            # starts a fresh count of camera failures.
+            _camera_failures = 0
             _recent_frame_times.clear()
             _reset_avg_state()
 
             items = _build_setting_items(bp)
 
         label, color = _play_pause_face(new_paused)
-        return new_paused, label, color, _settings_body(items)
+        return new_paused, label, color, _settings_body(items), status
 
     # -- Save current frame as PNG -------------------------------------------
     @app.callback(
@@ -1328,11 +1389,18 @@ def _register_callbacks(app: dash.Dash, bp: BeamProfiler) -> None:
         return value
 
     # -- Main update loop -----------------------------------------------------
+    # Registered last: other test suites find this callback as the final one.
     @app.callback(
         Output("live-graph", "figure"),
         Output("div-results", "children"),
         Output("status-bar", "children"),
         Output("store-frame", "data"),
+        # The tick can stop the stream (a failing camera) or find it stopped
+        # from elsewhere (another tab, a camera switch), and the button has
+        # to say so, or its first click would only repeat the pause.
+        Output("store-paused", "data", allow_duplicate=True),
+        Output("btn-play-pause", "children", allow_duplicate=True),
+        Output("btn-play-pause", "color", allow_duplicate=True),
         Input("interval", "n_intervals"),
         State("store-paused", "data"),
         State("switch-color", "value"),
@@ -1345,6 +1413,7 @@ def _register_callbacks(app: dash.Dash, bp: BeamProfiler) -> None:
         State("dropdown-definition", "value"),
         State("store-dark-theme", "data"),
         State("input-avg-n", "value"),
+        prevent_initial_call="initial_duplicate",
     )
     def update_live(
         _n: int,
@@ -1371,14 +1440,30 @@ def _register_callbacks(app: dash.Dash, bp: BeamProfiler) -> None:
         unbounded backlog of stale frames, and would leave the controls (which
         share the lock) waiting behind all of them.
         """
-        if paused or _server_paused:
-            return (dash.no_update,) * 4
+        global _camera_failures, _server_paused  # noqa: PLW0603
+        # Outputs: figure, results, status, frame count, pause flag, and the
+        # Play/Pause button's children and colour.
+        nothing = (dash.no_update,) * 7
+
+        def show_status(status: Any) -> tuple[Any, ...]:
+            return (dash.no_update, dash.no_update, status, *(dash.no_update,) * 4)
+
+        def show_paused(status: Any = dash.no_update) -> tuple[Any, ...]:
+            children, color = _play_pause_face(True)
+            return (dash.no_update, dash.no_update, status, dash.no_update, True, children, color)
+
+        if paused:
+            return nothing
+        if _server_paused:
+            # Stopped by something this page didn't see: bring its button
+            # into line.
+            return show_paused()
 
         if not _callback_lock.acquire(blocking=False):
             # A previous tick is still running; skip this one and let the
             # next interval fire. Keeps the UI responsive when a camera
             # fetch takes longer than the tick interval.
-            return (dash.no_update,) * 4
+            return nothing
 
         try:
             # Either change starts the fits from scratch. A new fit method
@@ -1401,12 +1486,30 @@ def _register_callbacks(app: dash.Dash, bp: BeamProfiler) -> None:
                 try:
                     img = bp.camera.get_image(timeout=0.1)
                 except TimeoutError:
-                    return (dash.no_update,) * 4
+                    return nothing
+                except Exception as exc:
+                    # Anything else is the device failing, or gone.
+                    _camera_failures += 1
+                    message = f"Camera error: {str(exc) or type(exc).__name__}"
+                    _log_tick_error(message, exc)
+                    if _camera_failures < _MAX_CAMERA_FAILURES:
+                        return show_status(_error_status(message))
+                    logger.warning(
+                        "Pausing the stream after %d camera errors in a row", _camera_failures
+                    )
+                    _server_paused = True
+                    _recent_frame_times.clear()
+                    try:
+                        bp.camera.stop_acquisition()
+                    except Exception:
+                        logger.debug("Stopping a failed camera also failed", exc_info=True)
+                    return show_paused(_error_status(f"{message} - paused; press Play to retry"))
             else:
                 img = bp.last_img
 
             if img is None:
-                return (dash.no_update,) * 4
+                return nothing
+            _camera_failures = 0
 
             raw = img
             img = _averaged_image(img, avg_n or 1)
@@ -1443,9 +1546,11 @@ def _register_callbacks(app: dash.Dash, bp: BeamProfiler) -> None:
                 _format_results(bp),
                 _build_status(bp, img, frame_count, raw=raw),
                 frame_count,
+                *(dash.no_update,) * 3,
             )
-        except Exception:
-            logger.exception("Update error")
-            return (dash.no_update,) * 4
+        except Exception as exc:
+            message = f"Update error: {str(exc) or type(exc).__name__}"
+            _log_tick_error(message, exc)
+            return show_status(_error_status(message))
         finally:
             _callback_lock.release()

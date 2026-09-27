@@ -687,3 +687,124 @@ class TestSaturationUsesTheSensorsBitDepth:
         assert bp.camera is not None
         bp.camera.bit_depth = depth  # ty: ignore[unresolved-attribute]
         assert dash_app._camera_bit_depth(bp) is None
+
+
+class TestAFailingCameraIsReportedAndStopped:
+    """A camera that failed mid-stream went unreported. Only a timeout was
+    handled; any other error was logged with a full traceback on every 50 ms
+    tick -- 20 a second, 72,000 an hour -- while every output stayed
+    ``no_update``, so the page kept showing the last good frame, the old
+    status line and a Pause button over a dead device."""
+
+    LOST = "GenTL error: device lost (-1011)"
+
+    def _dying(self) -> tuple[BeamProfiler, dict[str, Any]]:
+        bp = _profiler()
+        cbs = _callbacks(bp)
+        _tick(cbs)
+        assert bp.camera is not None
+        bp.camera.get_image = _raiser(RuntimeError(self.LOST))  # ty: ignore[invalid-assignment]
+        return bp, cbs
+
+    def test_the_status_bar_says_what_went_wrong(self):
+        _, cbs = self._dying()
+        out = _tick(cbs)
+        assert out[0] is dash.no_update  # the last good frame stays up
+        assert f"Camera error: {self.LOST}" in str(out[2])
+        assert dash_app._server_paused is False  # one failure is not a pattern
+
+    def test_repeated_failures_pause_the_stream_and_say_so(self):
+        bp, cbs = self._dying()
+        outs = [_tick(cbs) for _ in range(dash_app._MAX_CAMERA_FAILURES)]
+
+        assert all(o[4] is dash.no_update for o in outs[:-1])
+        paused, children, color = outs[-1][4:]
+        assert paused is True
+        assert "Play" in str(children) and color == "success"
+        assert "press Play to retry" in str(outs[-1][2])
+        assert dash_app._server_paused is True
+        assert bp.camera is not None and not bp.camera.is_acquiring
+
+    def test_the_log_gets_one_traceback_not_one_per_tick(self, caplog):
+        import logging
+
+        _, cbs = self._dying()
+        with caplog.at_level(logging.DEBUG, logger="pybeamprofiler.dash_app"):
+            for _ in range(20):
+                _tick(cbs)
+
+        errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+        assert len(errors) == 1
+        assert errors[0].exc_info is not None
+        warnings_ = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert [r.getMessage() for r in warnings_] == [
+            f"Pausing the stream after {dash_app._MAX_CAMERA_FAILURES} camera errors in a row"
+        ]
+
+    def test_a_good_frame_starts_the_count_again(self):
+        bp, cbs = self._dying()
+        assert bp.camera is not None
+        broken = bp.camera.get_image
+        for _ in range(dash_app._MAX_CAMERA_FAILURES - 1):
+            _tick(cbs)
+        del bp.camera.get_image  # the class's working method again
+        _tick(cbs)
+        bp.camera.get_image = broken  # ty: ignore[invalid-assignment]
+        for _ in range(dash_app._MAX_CAMERA_FAILURES - 1):
+            _tick(cbs)
+        assert dash_app._server_paused is False
+
+    def test_timeouts_are_not_failures(self, caplog):
+        import logging
+
+        bp = _profiler()
+        cbs = _callbacks(bp)
+        assert bp.camera is not None
+        bp.camera.get_image = _raiser(TimeoutError("no frame yet"))  # ty: ignore[invalid-assignment]
+        with caplog.at_level(logging.DEBUG, logger="pybeamprofiler.dash_app"):
+            outs = [_tick(cbs) for _ in range(2 * dash_app._MAX_CAMERA_FAILURES)]
+        assert all(v is dash.no_update for o in outs for v in o)
+        assert dash_app._server_paused is False
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+    def test_play_retries_and_a_camera_that_will_not_start_stays_paused(self):
+        bp, cbs = self._dying()
+        for _ in range(dash_app._MAX_CAMERA_FAILURES):
+            _tick(cbs)
+        assert bp.camera is not None
+
+        with patch.object(bp.camera, "start_acquisition", side_effect=RuntimeError("no device")):
+            paused, children, _, _, status = cbs["toggle_pause"](1, True)
+        assert paused is True and "Play" in str(children)
+        assert "Could not start the camera: no device" in str(status)
+        assert dash_app._server_paused is True
+
+        del bp.camera.get_image  # the device is back
+        paused, *_ = cbs["toggle_pause"](2, True)
+        assert paused is False
+        assert dash_app._camera_failures == 0
+        assert _tick(cbs)[0] is not dash.no_update
+
+
+def _raiser(exc: BaseException) -> Any:
+    def get_image(timeout: float | None = None) -> np.ndarray:
+        raise exc
+
+    return get_image
+
+
+class TestTheButtonFollowsAPauseMadeElsewhere:
+    """Pausing in one tab, or the stream pausing itself, left every other
+    tab's button offering Pause over a stopped stream, so its first click
+    only repeated the pause. A tick from such a page now relabels it."""
+
+    def test_a_page_that_thinks_it_is_playing_is_told(self):
+        bp = _profiler()
+        cbs = _callbacks(bp)
+        cbs["toggle_pause"](1, False)  # paused from "another tab"
+
+        out = _tick(cbs, paused=False)
+
+        assert out[0] is dash.no_update
+        assert out[4] is True
+        assert "Play" in str(out[5]) and out[6] == "success"
