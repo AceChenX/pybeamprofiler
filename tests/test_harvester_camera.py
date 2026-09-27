@@ -487,6 +487,30 @@ class TestPanelControlsOfAClosedCamera:
         dropdown.value = "On"
         assert camera.node_map.TriggerMode.value == "On"
 
+    def test_close_waits_for_a_panel_being_built(self, camera, monkeypatch):
+        inside, release = threading.Event(), threading.Event()
+        real = HarvesterCamera._build_feature_control
+
+        def slow_build(self: Any, *args: Any) -> Any:
+            inside.set()
+            release.wait(2.0)
+            return real(self, *args)
+
+        monkeypatch.setattr(HarvesterCamera, "_build_feature_control", slow_build)
+        builder = threading.Thread(
+            target=lambda: camera._create_feature_controls(["TriggerMode"], {}), daemon=True
+        )
+        builder.start()
+        assert inside.wait(1.0)
+        closer = threading.Thread(target=camera.close, daemon=True)
+        closer.start()
+        closer.join(0.2)
+        still_waiting = closer.is_alive()
+        release.set()
+        builder.join(2.0)
+        closer.join(2.0)
+        assert still_waiting, "close() released the device while the panel read its nodes"
+
     def test_setting_on_a_closed_camera_offers_no_device_controls(self, camera, monkeypatch):
         import IPython.display
 

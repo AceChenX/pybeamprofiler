@@ -121,6 +121,30 @@ class TestSimulatedExposureContract:
         assert cam._amplitude == pytest.approx(2 * profile.amplitude)
 
 
+class TestSimulatedCloseContract:
+    """A closed simulator refuses frames like a closed camera, so code that
+    keeps using a released camera fails in tests instead of on hardware."""
+
+    def test_a_closed_simulator_refuses(self):
+        cam = SimulatedCamera()
+        cam.open()
+        cam.close()
+        with pytest.raises(RuntimeError, match="Camera not opened"):
+            cam.get_image()
+        assert not cam.is_acquiring
+
+    def test_it_opens_again(self):
+        cam = SimulatedCamera()
+        cam.open()
+        cam.close()
+        cam.open()
+        assert cam.get_image().shape == (1024, 1024)
+        cam.close()
+
+    def test_one_never_opened_still_works(self):
+        assert SimulatedCamera().get_image().shape == (1024, 1024)
+
+
 class TestSimulatedRoiContract:
     """The simulator must refuse what a real camera refuses, or code that
     passes against it fails on hardware."""

@@ -443,26 +443,29 @@ class Camera(ABC):
         analog_accordion = widgets.Accordion(children=[gain_box])
         analog_accordion.set_title(0, "Gain")
 
-        genicam_controls = self._create_genicam_controls(style)
-
         camera_info: list[Any] = []
         camera_info.append(widgets.HTML(f"<b>Camera Type:</b> {type(self).__name__}"))
         camera_info.append(widgets.HTML(f"<b>Sensor Size:</b> {self.width}×{self.height} pixels"))
         camera_info.append(widgets.HTML(f"<b>Pixel Size:</b> {self.pixel_size:.2f} μm"))
 
-        if hasattr(self, "node_map") and self.node_map:
-            try:
-                if hasattr(self.node_map, "SensorDescription"):
-                    desc = self.node_map.SensorDescription.value  # ty:ignore[unresolved-attribute]
-                    camera_info.append(widgets.HTML(f"<b>Sensor:</b> {desc}"))
-            except Exception as e:
-                logger.debug(f"Optional feature SensorDescription not available: {e}")
-            try:
-                if hasattr(self.node_map, "DeviceModelName"):
-                    model = self.node_map.DeviceModelName.value  # ty:ignore[unresolved-attribute]
-                    camera_info.append(widgets.HTML(f"<b>Model:</b> {model}"))
-            except Exception as e:
-                logger.debug(f"Optional feature DeviceModelName not available: {e}")
+        # Building the panel reads hundreds of nodes; hold the device so a
+        # close() from another thread cannot release it half-way through.
+        with self._device():
+            genicam_controls = self._create_genicam_controls(style)
+
+            if hasattr(self, "node_map") and self.node_map:
+                try:
+                    if hasattr(self.node_map, "SensorDescription"):
+                        desc = self.node_map.SensorDescription.value  # ty:ignore[unresolved-attribute]
+                        camera_info.append(widgets.HTML(f"<b>Sensor:</b> {desc}"))
+                except Exception as e:
+                    logger.debug(f"Optional feature SensorDescription not available: {e}")
+                try:
+                    if hasattr(self.node_map, "DeviceModelName"):
+                        model = self.node_map.DeviceModelName.value  # ty:ignore[unresolved-attribute]
+                        camera_info.append(widgets.HTML(f"<b>Model:</b> {model}"))
+                except Exception as e:
+                    logger.debug(f"Optional feature DeviceModelName not available: {e}")
 
         camera_info_box = widgets.VBox(camera_info)
 
@@ -571,7 +574,8 @@ class Camera(ABC):
         map costs hundreds of round trips and can take seconds.  Which
         features *exist* is fixed for a given node map (only their values
         change), so the cache is keyed on the node map's identity and
-        naturally re-discovers after a reconnect.
+        naturally re-discovers after a reconnect; close() drops it, since a
+        closed camera's nodes must not be touched at all.
 
         Args:
             refresh: Rebuild the cache even if one is already populated.
@@ -580,6 +584,11 @@ class Camera(ABC):
             Mapping from category name to a sorted list of feature names.
             Treat it as read-only; it is the cached object.
         """
+        with self._device():
+            return self._discover_features_locked(refresh)
+
+    def _discover_features_locked(self, refresh: bool) -> dict[str, list[str]]:
+        """:meth:`_discover_features`, with the device already held."""
         if not hasattr(self, "node_map") or not self.node_map:
             return {}
 
@@ -742,20 +751,21 @@ class Camera(ABC):
         """
         controls = []
 
-        for feature_name in features:
-            # Everything here stays inside the guard: getattr and hasattr only
-            # swallow AttributeError, and a camera node that has lost its
-            # connection tends to raise something else entirely.
-            try:
-                node = getattr(self.node_map, feature_name, None)  # ty:ignore[unresolved-attribute]
-                if node is None or not hasattr(node, "value"):
+        with self._device():
+            for feature_name in features:
+                # Everything here stays inside the guard: getattr and hasattr
+                # only swallow AttributeError, and a camera node that has lost
+                # its connection tends to raise something else entirely.
+                try:
+                    node = getattr(self.node_map, feature_name, None)  # ty:ignore[unresolved-attribute]
+                    if node is None or not hasattr(node, "value"):
+                        continue
+                    control = self._build_feature_control(node, feature_name, style)
+                except Exception as e:
+                    logger.debug("Could not create a control for %s: %s", feature_name, e)
                     continue
-                control = self._build_feature_control(node, feature_name, style)
-            except Exception as e:
-                logger.debug("Could not create a control for %s: %s", feature_name, e)
-                continue
-            if control is not None:
-                controls.append(control)
+                if control is not None:
+                    controls.append(control)
 
         return controls
 

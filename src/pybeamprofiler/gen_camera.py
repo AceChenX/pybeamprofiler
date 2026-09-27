@@ -1217,8 +1217,10 @@ class HarvesterCamera(Camera):
             2D numpy array containing the frame data.
 
         Raises:
-            RuntimeError: If the camera is not open ("Camera not opened.").
-            TimeoutError: If no frame arrives in time.
+            RuntimeError: If the camera is not open ("Camera not opened."),
+                including when another thread closes it mid-wait.
+            TimeoutError: If no frame arrives in time, or another thread
+                stops acquisition mid-wait (it is not restarted behind them).
         """
         if timeout is None:
             timeout = max(2.0, (self.exposure_time or 0) + 2.0)

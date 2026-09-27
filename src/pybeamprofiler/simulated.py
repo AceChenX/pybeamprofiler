@@ -268,6 +268,10 @@ class SimulatedCamera(Camera):
         self._roi_height = self.height
 
         self.node_map: _SimulatedNodeMap | None = None
+        # Set by close(). A simulator that was never opened still produces
+        # frames, as it always has; one that was closed refuses, like a real
+        # camera, so code that keeps using a released camera fails here too.
+        self._closed = False
 
         # Precompute coordinate axes and a reusable scratch buffer so that
         # get_image() avoids reallocating a full frame every call. An
@@ -306,16 +310,20 @@ class SimulatedCamera(Camera):
     def open(self) -> None:
         """Open the simulated camera and initialize the node map."""
         self._generation += 1
+        self._closed = False
         self.node_map = _SimulatedNodeMap(self)
         logger.info("Simulated camera opened.")
 
     def close(self) -> None:
         """Release simulated camera resources.
 
-        There is nothing to release, but controls built for this camera
-        stop writing to it, as they do for a real one.
+        There is nothing to release, but the camera then behaves like a
+        closed real one: controls built for it stop writing to it, and
+        get_image() refuses until it is opened again.
         """
         self._generation += 1
+        self._closed = True
+        self.is_acquiring = False
         logger.info("Simulated camera closed.")
 
     def start_acquisition(self) -> None:
@@ -339,8 +347,13 @@ class SimulatedCamera(Camera):
 
         Returns:
             2D numpy array of uint8 intensity values.
+
+        Raises:
+            RuntimeError: If the camera has been closed ("Camera not opened.").
         """
         del timeout
+        if self._closed:
+            raise RuntimeError("Camera not opened.")
         rng = self._rng
         cx = self._center_x + rng.normal(0, self._noise_center)
         cy = self._center_y + rng.normal(0, self._noise_center)
