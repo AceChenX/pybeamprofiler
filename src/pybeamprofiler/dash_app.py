@@ -129,10 +129,20 @@ def _camera_bit_depth(bp: BeamProfiler) -> int | None:
 
 
 def _normalize_profile(
-    data: np.ndarray, span: float, fraction: float = _PROFILE_FRACTION
+    data: np.ndarray,
+    span: float,
+    fraction: float = _PROFILE_FRACTION,
+    reference: np.ndarray | None = None,
 ) -> np.ndarray:
-    """Scale a 1-D profile to occupy *fraction* of *span*."""
-    lo, hi = float(np.min(data)), float(np.max(data))
+    """Scale a 1-D profile to occupy *fraction* of *span*.
+
+    With *reference*, the scale comes from that profile's range instead of
+    *data*'s own. A fit curve is drawn this way, against the data it was fitted
+    to: scaled to its own range, any fit filled the same height as the data, so
+    a wrong amplitude or baseline was invisible on screen.
+    """
+    ref = data if reference is None else reference
+    lo, hi = float(np.min(ref)), float(np.max(ref))
     rng = hi - lo if hi != lo else 1.0
     return (data - lo) / rng * span * fraction
 
@@ -262,10 +272,27 @@ def build_figure(
     x_base, x_span = max(view_y[0], 0.0), view_y[1] - view_y[0]
     y_base, y_span = max(view_x[0], 0.0), view_x[1] - view_x[0]
 
+    # ── The profiles to draw ────────────────────────────────────
+    # Whatever the fit was run on: the cached projections, or in linecut mode
+    # the row and column through the peak. Falling back to the full-frame
+    # sums there drew the fit of one row over the projection of the whole
+    # frame -- on a tilted beam a 575 um curve under a 327 um fit.
+    cached_proj_x = getattr(bp, "_last_proj_x", None)
+    cached_proj_y = getattr(bp, "_last_proj_y", None)
+    if (
+        (cached_proj_x is None or cached_proj_y is None)
+        and bp.fit_method == "linecut"
+        and cut_x is not None
+        and cut_y is not None
+        and 0 <= cut_x < w
+        and 0 <= cut_y < h
+    ):
+        cached_proj_x, cached_proj_y = image[int(cut_y), :], image[:, int(cut_x)]
+    proj_x = (cached_proj_x if cached_proj_x is not None else np.sum(image, axis=0)).astype(float)
+    proj_y = (cached_proj_y if cached_proj_y is not None else np.sum(image, axis=1)).astype(float)
+
     # ── X profile (bottom edge) ─────────────────────────────────
     x_ax = np.arange(w)
-    cached_proj_x = getattr(bp, "_last_proj_x", None)
-    proj_x = (cached_proj_x if cached_proj_x is not None else np.sum(image, axis=0)).astype(float)
     norm_x = x_base + _normalize_profile(proj_x, x_span)
 
     traces.append(
@@ -282,7 +309,7 @@ def build_figure(
     )
     if popt_x is not None:
         fit_x = bp.gaussian(x_ax, *popt_x).astype(float)
-        norm_fit_x = x_base + _normalize_profile(fit_x, x_span)
+        norm_fit_x = x_base + _normalize_profile(fit_x, x_span, reference=proj_x)
         traces.append(
             go.Scatter(
                 x=x_ax * ps,
@@ -296,8 +323,6 @@ def build_figure(
 
     # ── Y profile (left edge) ──────────────────────────────────
     y_ax = np.arange(h)
-    cached_proj_y = getattr(bp, "_last_proj_y", None)
-    proj_y = (cached_proj_y if cached_proj_y is not None else np.sum(image, axis=1)).astype(float)
     norm_y = y_base + _normalize_profile(proj_y, y_span)
 
     traces.append(
@@ -314,7 +339,7 @@ def build_figure(
     )
     if popt_y is not None:
         fit_y = bp.gaussian(y_ax, *popt_y).astype(float)
-        norm_fit_y = y_base + _normalize_profile(fit_y, y_span)
+        norm_fit_y = y_base + _normalize_profile(fit_y, y_span, reference=proj_y)
         traces.append(
             go.Scatter(
                 x=norm_fit_y,

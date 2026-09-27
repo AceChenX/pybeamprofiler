@@ -832,3 +832,47 @@ class TestAPauseRacingATickIsHonoured:
         fetch.assert_not_called()
         assert not bp.camera.is_acquiring
         assert out[4] is True  # and the page is told it is paused
+
+
+class TestTheLinecutPlotShowsWhatWasFitted:
+    """In linecut mode the fit is to the single row and column through the
+    peak, but the curve drawn under it was the projection of the whole frame:
+    analyze() caches no projection there, and build_figure fell back to the
+    full sums. On the tilted simulator the data curve was 575 um FWHM under a
+    fit of 327 um."""
+
+    def test_the_data_curves_are_the_row_and_column_through_the_peak(self):
+        bp = _profiler("sim-2", seed=7)
+        cbs = _callbacks(bp)
+        fig = _tick(cbs, analysis="linecut")[0]
+        img = bp.last_img
+        assert img is not None
+        row = img[int(bp._linecut_y), :].astype(float)
+        column = img[:, int(bp._linecut_x)].astype(float)
+        height, width = (n * bp.pixel_size for n in img.shape)
+
+        drawn = _profiles(fig)
+        assert np.allclose(drawn["x_data"].y, dash_app._normalize_profile(row, height))
+        assert np.allclose(drawn["y_data"].x, dash_app._normalize_profile(column, width))
+
+
+class TestAFitIsDrawnToTheDatasScale:
+    """Each curve was scaled to its own min and max, so any fit -- however
+    wrong its amplitude or baseline -- filled exactly the same height as the
+    data, and the overlay could not show a bad fit."""
+
+    def test_a_fit_at_half_the_amplitude_is_drawn_at_half_the_height(self):
+        bp = BeamProfiler(camera="simulated")
+        y, x = np.mgrid[0:64, 0:80]
+        img = (200 * np.exp(-((x - 40) ** 2 + (y - 30) ** 2) / (2 * 6.0**2)) + 10).astype(np.uint8)
+        popt_x, popt_y = bp.analyze(img)
+        half = [popt_x[0] / 2, popt_x[1], popt_x[2], popt_x[3]]
+
+        fig = dash_app.build_figure(bp, img, half, popt_y)
+
+        drawn = _profiles(fig)
+        data_height = np.max(drawn["x_data"].y)
+        fit_height = np.max(drawn["x_fit"].y)
+        assert fit_height == pytest.approx(data_height / 2, rel=0.1)
+        # A correct fit still sits on its data.
+        assert np.max(drawn["y_fit"].x) == pytest.approx(np.max(drawn["y_data"].x), rel=0.05)
