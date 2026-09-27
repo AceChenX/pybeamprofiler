@@ -9,6 +9,8 @@ had ever checked is pinned against those rules instead.
 
 from __future__ import annotations
 
+import threading
+import time
 from collections.abc import Iterator
 from typing import Any
 
@@ -309,3 +311,63 @@ class TestCloseLeavesNothingBehind:
         camera.open()
         assert camera.ia is not None and camera.ia is not first
         assert camera.node_map.Width.value == 2048
+
+
+def _timed(fn: Any, limit: float = 3.0) -> tuple[bool, float, BaseException | None]:
+    """Run ``fn`` in a thread; report whether it finished, how long it took, what it raised."""
+    result: dict[str, Any] = {}
+
+    def run() -> None:
+        started = time.monotonic()
+        try:
+            fn()
+        except BaseException as exc:  # noqa: BLE001 - reported to the test
+            result["exc"] = exc
+        result["t"] = time.monotonic() - started
+
+    worker = threading.Thread(target=run, daemon=True)
+    worker.start()
+    worker.join(limit)
+    return (not worker.is_alive(), result.get("t", limit), result.get("exc"))
+
+
+class TestGetImageTimeoutIsABound:
+    """``get_image(timeout)`` called Harvesters' ``fetch()``, which restarts its
+    timeout after every incomplete buffer and treats ``timeout=0`` as
+    "forever". The Dash tick holds the GUI lock around this call, so a lossy
+    GigE link froze every control, Pause included."""
+
+    def test_every_buffer_incomplete_still_times_out(self, camera):
+        camera.start_acquisition()
+        camera.ia.incomplete = True
+        try:
+            finished, took, exc = _timed(lambda: camera.get_image(timeout=0.2))
+        finally:
+            camera.ia.incomplete = False  # lets an old-style fetch() go
+        assert finished, "get_image(timeout=0.2) was still waiting after 3 s"
+        assert isinstance(exc, TimeoutError)
+        assert took < 1.0
+
+    def test_zero_timeout_polls(self, camera):
+        camera.start_acquisition()
+        camera.ia.frames_ready = False
+        try:
+            finished, took, exc = _timed(lambda: camera.get_image(timeout=0))
+        finally:
+            camera.ia.frames_ready = True
+        assert finished, "get_image(timeout=0) blocked instead of polling"
+        assert isinstance(exc, TimeoutError)
+        assert "No frame was ready" in str(exc)
+        assert took < 0.5
+
+    def test_a_poll_returns_a_frame_that_is_ready(self, camera):
+        img = camera.get_image(timeout=0)
+        assert img.shape == (1536, 2048)
+
+    def test_a_long_timeout_returns_as_soon_as_a_frame_arrives(self, camera):
+        camera.start_acquisition()
+        camera.ia.frames_ready = False
+        threading.Timer(0.15, lambda: setattr(camera.ia, "frames_ready", True)).start()
+        finished, took, exc = _timed(lambda: camera.get_image(timeout=5.0))
+        assert finished and exc is None
+        assert 0.1 < took < 1.0

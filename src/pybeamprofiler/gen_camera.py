@@ -37,6 +37,15 @@ from .cti import find_cti_files, parse_gentl_path
 
 logger = logging.getLogger(__name__)
 
+#: Longest single wait inside get_image(). Stop, close and ROI or exposure
+#: writes are serialised with fetching, so this also bounds how long a fetch
+#: in progress can keep them waiting.
+_FETCH_SLICE_S = 0.1
+
+#: The shortest real wait, used for polls: try_fetch(timeout=0) means "wait
+#: forever" to Harvesters 1.4, not "don't wait".
+_POLL_S = 0.001
+
 
 def _genicam_errors() -> tuple[type[Exception], ...]:
     """The base classes of what the GenICam bindings raise, where installed.
@@ -555,6 +564,10 @@ class HarvesterCamera(Camera):
         # stop/start recovery instead of timing out forever.
         self._last_successful_fetch: float = 0.0
         self._stall_recovery_attempted: bool = False
+        # Seconds between the last two frames. A camera delivering a frame
+        # every 8 s is not stalled after 5 s of silence, whatever
+        # exposure_time says.
+        self._frame_interval: float = 0.0
 
     @staticmethod
     def _parse_gentl_path(gentl_path: str) -> str | list[str] | None:
@@ -1049,13 +1062,17 @@ class HarvesterCamera(Camera):
 
     def start_acquisition(self) -> None:
         """Start image acquisition on the GenTL producer."""
-        if not self.ia:
+        if not self.ia or self.is_acquiring:
             return
-        if not self.is_acquiring:
-            self.ia.start()
-            self.is_acquiring = True
-            self._last_successful_fetch = 0.0
-            self._stall_recovery_attempted = False
+        self._start_stream()
+        # A deliberate start re-arms the stall recovery; see _recover_if_stalled.
+        self._last_successful_fetch = 0.0
+        self._stall_recovery_attempted = False
+
+    def _start_stream(self) -> None:
+        """Start the producer without touching the stall-recovery state."""
+        self.ia.start()
+        self.is_acquiring = True
 
     def stop_acquisition(self) -> None:
         """Stop image acquisition on the GenTL producer."""
@@ -1064,83 +1081,139 @@ class HarvesterCamera(Camera):
                 self.ia.stop()
             except Exception:
                 logger.debug("Error stopping acquisition", exc_info=True)
-            self.is_acquiring = False
+        self.is_acquiring = False
 
     def get_image(self, timeout: float | None = None) -> np.ndarray:
         """Fetch the next frame from the GenTL producer.
 
-        For default short exposures this returns within a few ms. For long
-        exposures the caller should pass a small ``timeout`` (e.g. ``0.2``)
-        and treat :class:`TimeoutError` as "no new frame yet, try again
-        next tick" so the UI stays responsive.
+        Returns within about ``timeout`` seconds whatever the producer does.
+        Harvesters' own ``fetch()`` does not: it starts its timeout afresh
+        after every incomplete buffer, so a GigE link that drops a packet
+        from every frame kept it waiting indefinitely. Frames are therefore
+        taken with ``try_fetch`` against a deadline kept here, in slices of
+        at most ``_FETCH_SLICE_S``.
+
+        For long exposures pass a small ``timeout`` and treat
+        :class:`TimeoutError` as "no new frame yet, try again next tick", so
+        the UI stays responsive.
 
         Args:
-            timeout: Maximum seconds to wait for a frame.
-                Defaults to ``max(2.0, exposure_time + 2.0)``.
+            timeout: Maximum seconds to wait for a frame. ``0`` or less
+                polls: it returns a frame only if one is ready. Defaults to
+                ``max(2.0, exposure_time + 2.0)``.
 
         Returns:
             2D numpy array containing the frame data.
 
         Raises:
-            RuntimeError: If the camera has not been opened.
-            TimeoutError: If no frame arrives within ``timeout``.
+            RuntimeError: If the camera is not open ("Camera not opened.").
+            TimeoutError: If no frame arrives in time.
+        """
+        if timeout is None:
+            timeout = max(2.0, (self.exposure_time or 0) + 2.0)
+        deadline = time.monotonic() + max(timeout, 0.0)
+        while True:
+            img = self._fetch_slice(deadline)
+            if img is not None:
+                return img
+            if time.monotonic() >= deadline:
+                if timeout <= 0:
+                    raise TimeoutError("No frame was ready.")
+                raise TimeoutError(
+                    f"Camera did not deliver a frame within {timeout:.1f} s. "
+                    "Check that the camera is connected, powered, and not in "
+                    "use by another application."
+                )
+
+    def _fetch_slice(self, deadline: float) -> np.ndarray | None:
+        """Wait for one frame until ``deadline``, but no longer than one slice.
+
+        Returns:
+            The frame, or ``None`` if none arrived (or it was incomplete).
         """
         if not self.ia:
             raise RuntimeError("Camera not opened.")
         if not self.is_acquiring:
             self.start_acquisition()
+        self._recover_if_stalled()
 
-        if timeout is None:
-            timeout = max(2.0, (self.exposure_time or 0) + 2.0)
-
-        # One-shot stop/start recovery: if the producer has been silent for
-        # roughly ``max(5 s, 3× exposure)`` we assume the acquirer has
-        # stalled (a known issue on some GenTL stacks after long runs).
-        now = time.monotonic()
-        if self._last_successful_fetch and not self._stall_recovery_attempted:
-            stall_window = max(5.0, 3.0 * (self.exposure_time or 0.0))
-            if now - self._last_successful_fetch > stall_window:
-                logger.warning(
-                    "Acquisition appears stalled (no frame for %.1f s); "
-                    "attempting to recover by restarting acquisition.",
-                    now - self._last_successful_fetch,
-                )
-                self._stall_recovery_attempted = True
-                try:
-                    self.stop_acquisition()
-                    self.start_acquisition()
-                except Exception:
-                    logger.debug("Stall recovery failed", exc_info=True)
-
+        # try_fetch(timeout=0) waits forever in Harvesters 1.4; a poll uses
+        # the shortest real wait instead.
+        wait = min(max(deadline - time.monotonic(), _POLL_S), _FETCH_SLICE_S)
         try:
-            with self.ia.fetch(timeout=timeout) as buffer:
-                component = buffer.payload.components[0]
-                self.width_pixels = component.width
-                self.height_pixels = component.height
-                img = _to_mono(component)
-            self._last_successful_fetch = time.monotonic()
-            self._stall_recovery_attempted = False
-            return img
+            buffer = self.ia.try_fetch(timeout=wait)
         except Exception as exc:
-            # Harvesters re-exports ``_gentl.TimeoutException`` which isn't a
-            # subclass of Python's built-in ``TimeoutError`` (they merely share
-            # a name), so we catch it explicitly and re-raise as ``TimeoutError``
-            # so callers can use a single, standard-library-only except clause.
-            is_timeout = isinstance(exc, TimeoutError) or (
+            # Harvesters' TimeoutException shares only a name with the
+            # built-in TimeoutError; neither means "the device failed".
+            if isinstance(exc, TimeoutError) or (
                 _HarvestersTimeout is not None and isinstance(exc, _HarvestersTimeout)
-            )
-            if is_timeout:
-                # Seed the stall timer on the very first call so we don't
-                # falsely trigger recovery for a camera that simply hasn't
-                # warmed up yet.
-                if not self._last_successful_fetch:
-                    self._last_successful_fetch = now
-                raise TimeoutError(
-                    f"Camera did not deliver a frame within {timeout:.1f} s. "
-                    "Check that the camera is connected, powered, and not in "
-                    "use by another application."
-                ) from exc
-            raise
+            ):
+                buffer = None
+            else:
+                raise
+        if buffer is None:
+            # Seed the stall timer on the first empty wait, so a camera that
+            # has simply not delivered its first frame yet is not "stalled".
+            if not self._last_successful_fetch:
+                self._last_successful_fetch = time.monotonic()
+            return None
+
+        with buffer as held:
+            component = held.payload.components[0]
+            self.width_pixels = component.width
+            self.height_pixels = component.height
+            img = _to_mono(component)
+        now = time.monotonic()
+        if self._last_successful_fetch:
+            self._frame_interval = now - self._last_successful_fetch
+        self._last_successful_fetch = now
+        self._stall_recovery_attempted = False
+        return img
+
+    def _recover_if_stalled(self) -> None:
+        """Restart acquisition once if the producer has gone quiet.
+
+        Some GenTL stacks stop delivering after long runs until acquisition
+        is restarted. The attempt is made once per silence: a successful
+        frame, or a deliberate start_acquisition(), re-arms it. The restart
+        itself must not re-arm it -- it used to, so a camera that was
+        genuinely idle was restarted every five seconds forever, and an
+        exposure longer than that was aborted on every attempt and never
+        delivered a frame.
+
+        Silence is measured against the longest of 5 s, three exposures and
+        three of the intervals the camera has actually been delivering at,
+        so a long exposure set behind this object's back (auto-exposure, or
+        another tool before open()) is not mistaken for a stall. A camera
+        waiting for a trigger is silent by design and is left alone.
+        """
+        if not self._last_successful_fetch or self._stall_recovery_attempted:
+            return
+        silent = time.monotonic() - self._last_successful_fetch
+        window = max(5.0, 3.0 * (self.exposure_time or 0.0), 3.0 * self._frame_interval)
+        if silent <= window or self._waits_for_trigger():
+            return
+        logger.warning(
+            "Acquisition appears stalled (no frame for %.1f s); "
+            "attempting to recover by restarting acquisition.",
+            silent,
+        )
+        self._stall_recovery_attempted = True
+        try:
+            self.stop_acquisition()
+            self._start_stream()
+        except Exception:
+            logger.debug("Stall recovery failed", exc_info=True)
+
+    def _waits_for_trigger(self) -> bool:
+        """Is the camera configured to expose only when triggered?"""
+        node = _node(self.node_map, "TriggerMode")
+        if node is None:
+            return False
+        try:
+            return str(node.value) == "On"
+        except Exception:
+            return False
 
     def set_exposure(self, exposure_time: float) -> None:
         """Set exposure time, restarting acquisition to flush stale buffers.

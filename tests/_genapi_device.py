@@ -178,6 +178,8 @@ class FakeAcquirer:
         self.acquiring = False
         self.destroyed = False
         self.frames_ready = True
+        # Every buffer arrives with packets missing, as on a lossy GigE link.
+        self.incomplete = False
         self.calls: list[str] = []
 
     def _check(self) -> None:
@@ -197,8 +199,9 @@ class FakeAcquirer:
         self.acquiring = False
 
     def try_fetch(self, *, timeout: float) -> FakeBuffer | None:
+        """Harvesters 1.4 ``try_fetch``: ``None`` on timeout or an incomplete buffer."""
         self._check()
-        if not (self.acquiring and self.frames_ready):
+        if not (self.acquiring and self.frames_ready) or self.incomplete:
             time.sleep(min(timeout, 0.005))
             return None
         node_map = self.remote_device.node_map
@@ -207,6 +210,28 @@ class FakeAcquirer:
         dtype = np.uint8 if fmt == "Mono8" else np.uint16
         data = np.full(width * height, 7, dtype=dtype)
         return FakeBuffer(FakeComponent(width, height, data, fmt), self)
+
+    def fetch(self, *, timeout: float = 0) -> FakeBuffer:
+        """Harvesters 1.4 ``fetch``, including the two ways it never returns.
+
+        ``timeout=0`` means "wait forever", and an incomplete buffer is
+        discarded and the wait starts again, so the timeout bounds each
+        attempt rather than the call. Clear ``incomplete``/set
+        ``frames_ready`` from the test to let a stuck call go.
+        """
+        while True:
+            started = time.monotonic()
+            while not (self.acquiring and self.frames_ready) or self.incomplete:
+                if self.incomplete:
+                    started = time.monotonic()  # a buffer arrived, incomplete: wait anew
+                elif timeout > 0 and time.monotonic() - started > timeout:
+                    from harvesters.core import TimeoutException
+
+                    raise TimeoutException
+                time.sleep(0.002)
+            buffer = self.try_fetch(timeout=0.001)
+            if buffer is not None:
+                return buffer
 
     def destroy(self) -> None:
         self.calls.append("destroy")

@@ -320,7 +320,7 @@ class TestHarvesterCameraGetImage:
         mock_buffer.payload.components = [mock_component]
         mock_buffer.__enter__ = lambda s: mock_buffer
         mock_buffer.__exit__ = lambda s, *a: None
-        cam.ia.fetch.return_value = mock_buffer
+        cam.ia.try_fetch.return_value = mock_buffer
 
         try:
             cam.get_image(timeout=1.0)
@@ -341,7 +341,7 @@ class TestHarvesterCameraGetImage:
 
         cam = self._make_camera()
         cam.is_acquiring = True
-        cam.ia.fetch.side_effect = TimeoutException
+        cam.ia.try_fetch.side_effect = TimeoutException
 
         try:
             with pytest.raises(TimeoutError, match="did not deliver a frame"):

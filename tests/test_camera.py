@@ -652,21 +652,21 @@ class TestGenCameraGetImage:
         from harvesters.core import TimeoutException
 
         cam = self._make_mock_camera()
-        cam.ia.fetch.side_effect = TimeoutException
+        cam.ia.try_fetch.side_effect = TimeoutException
         with pytest.raises(TimeoutError, match="did not deliver a frame"):
             cam.get_image(timeout=0.1)
 
     def test_builtin_timeout_error_normalised(self):
         """Python's built-in ``TimeoutError`` is also normalised (re-wrapped)."""
         cam = self._make_mock_camera()
-        cam.ia.fetch.side_effect = TimeoutError("slow")
+        cam.ia.try_fetch.side_effect = TimeoutError("slow")
         with pytest.raises(TimeoutError, match="did not deliver a frame"):
             cam.get_image(timeout=0.1)
 
     def test_non_timeout_exception_propagates(self):
         """Non-timeout errors bubble up unchanged."""
         cam = self._make_mock_camera()
-        cam.ia.fetch.side_effect = RuntimeError("bad buffer")
+        cam.ia.try_fetch.side_effect = RuntimeError("bad buffer")
         with pytest.raises(RuntimeError, match="bad buffer"):
             cam.get_image(timeout=0.1)
 
@@ -681,7 +681,7 @@ class TestGenCameraGetImage:
         comp.width, comp.height = 4, 4
         comp.data = np.zeros(16, dtype=np.uint8)
         buf.__enter__.return_value.payload.components = [comp]
-        cam.ia.fetch.return_value = buf
+        cam.ia.try_fetch.return_value = buf
 
         img = cam.get_image(timeout=0.1)
         assert img.shape == (4, 4)
@@ -689,11 +689,11 @@ class TestGenCameraGetImage:
         assert cam._last_successful_fetch > 0.0
 
     def test_stall_recovery_restarts_acquisition(self):
-        """Consecutive timeouts beyond the stall window trigger stop/start."""
+        """Silence beyond the stall window triggers a stop/start."""
         from harvesters.core import TimeoutException
 
         cam = self._make_mock_camera()
-        cam.ia.fetch.side_effect = TimeoutException
+        cam.ia.try_fetch.side_effect = TimeoutException
         # Simulate a successful fetch 10s ago — beyond the 5s stall window
         # at a 10 ms exposure.
         cam._last_successful_fetch = time.monotonic() - 10.0
@@ -705,30 +705,82 @@ class TestGenCameraGetImage:
         cam.ia.start.assert_called()
 
     def test_stall_recovery_is_one_shot(self):
-        """A second timeout within the same stall window doesn't re-trigger recovery."""
-        from harvesters.core import TimeoutException
+        """One restart per silence, not one every stall window.
+
+        The restart called start_acquisition(), which re-armed the recovery,
+        so a camera that stayed silent was restarted every five seconds for
+        as long as it stayed silent.
+        """
+        clock = [1000.0]
+
+        def silent(timeout):
+            clock[0] += timeout
+            return None
 
         cam = self._make_mock_camera()
-        cam.ia.fetch.side_effect = TimeoutException
-        cam._last_successful_fetch = time.monotonic() - 10.0
+        cam.ia.try_fetch.side_effect = silent
+        cam._last_successful_fetch = 990.0
+
+        with patch("pybeamprofiler.gen_camera.time.monotonic", side_effect=lambda: clock[0]):
+            with pytest.raises(TimeoutError):
+                cam.get_image(timeout=0.2)
+            assert cam.ia.start.call_count == 1
+            clock[0] += 60.0
+            with pytest.raises(TimeoutError):
+                cam.get_image(timeout=0.2)
+
+        assert cam.ia.start.call_count == 1
+
+    def test_a_long_exposure_is_not_aborted_by_recovery(self):
+        """An 8 s exposure the camera already had at open() used to be
+        restarted every 5 s and so never delivered a frame."""
+        clock = [0.0]
+        started = [0.0]
+
+        def exposing(timeout):
+            clock[0] += timeout
+            if clock[0] - started[0] >= 8.0:
+                started[0] = clock[0]
+                buf = MagicMock()
+                comp = MagicMock()
+                comp.width, comp.height = 2, 2
+                comp.data = np.zeros(4, dtype=np.uint8)
+                buf.__enter__.return_value.payload.components = [comp]
+                return buf
+            return None
+
+        cam = self._make_mock_camera()
+        cam.ia.try_fetch.side_effect = exposing
+        cam.ia.start.side_effect = lambda: started.__setitem__(0, clock[0])
+
+        frames = 0
+        with patch("pybeamprofiler.gen_camera.time.monotonic", side_effect=lambda: clock[0]):
+            while clock[0] < 60.0:
+                try:
+                    cam.get_image(timeout=0.1)
+                    frames += 1
+                except TimeoutError:
+                    pass
+        assert frames >= 6
+
+    def test_a_triggered_camera_is_not_restarted(self):
+        cam = self._make_mock_camera()
+        cam.node_map = MagicMock()
+        cam.node_map.TriggerMode.value = "On"
+        cam.ia.try_fetch.return_value = None
+        cam._last_successful_fetch = time.monotonic() - 60.0
 
         with pytest.raises(TimeoutError):
-            cam.get_image(timeout=0.1)
-        stop_calls = cam.ia.stop.call_count
-        start_calls = cam.ia.start.call_count
+            cam.get_image(timeout=0.05)
 
-        with pytest.raises(TimeoutError):
-            cam.get_image(timeout=0.1)
-
-        assert cam.ia.stop.call_count == stop_calls
-        assert cam.ia.start.call_count == start_calls
+        cam.ia.stop.assert_not_called()
 
     def test_first_timeout_seeds_stall_timer(self):
         """The very first fetch timing out should NOT trigger recovery."""
         from harvesters.core import TimeoutException
 
         cam = self._make_mock_camera()
-        cam.ia.fetch.side_effect = TimeoutException
+        cam.ia.try_fetch.side_effect = TimeoutException
         assert cam._last_successful_fetch == 0.0
 
         with pytest.raises(TimeoutError):
@@ -1191,8 +1243,8 @@ class TestGenCameraDetection:
 
         mock_buffer = MagicMock()
         mock_buffer.payload.components = [mock_component]
-        mock_ia.fetch.return_value.__enter__ = MagicMock(return_value=mock_buffer)
-        mock_ia.fetch.return_value.__exit__ = MagicMock(return_value=False)
+        mock_ia.try_fetch.return_value.__enter__ = MagicMock(return_value=mock_buffer)
+        mock_ia.try_fetch.return_value.__exit__ = MagicMock(return_value=False)
 
         try:
             img = cam.get_image(timeout=1.0)

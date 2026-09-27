@@ -247,20 +247,22 @@ class TestHarvesterCameraFallbacks:
         assert cam.is_acquiring is False
 
     def test_default_timeout_tracks_exposure(self):
+        """With no timeout given, a 3 s exposure is waited for for 5 s."""
         cam, mocks = _mock_harvester_camera()
         cam.is_acquiring = True
         cam.exposure_time = 3.0
+        clock = [100.0]
 
-        frame = MagicMock()
-        component = MagicMock()
-        component.width, component.height = 4, 2
-        component.data = np.arange(8, dtype=np.uint8)
-        frame.payload.components = [component]
-        mocks.ia.fetch.return_value.__enter__.return_value = frame
+        def silent(timeout):
+            clock[0] += timeout
+            return None
 
-        cam.get_image()
+        mocks.ia.try_fetch.side_effect = silent
+        with patch("pybeamprofiler.gen_camera.time.monotonic", side_effect=lambda: clock[0]):
+            with pytest.raises(TimeoutError, match="within 5.0 s"):
+                cam.get_image()
 
-        assert mocks.ia.fetch.call_args.kwargs["timeout"] == pytest.approx(5.0)
+        assert clock[0] - 100.0 == pytest.approx(5.0, abs=0.11)
 
     def test_stall_recovery_failure_does_not_escape(self):
         """If the restart itself fails we still try the fetch — the producer
@@ -275,7 +277,7 @@ class TestHarvesterCameraFallbacks:
         component.width, component.height = 2, 2
         component.data = np.arange(4, dtype=np.uint8)
         frame.payload.components = [component]
-        mocks.ia.fetch.return_value.__enter__.return_value = frame
+        mocks.ia.try_fetch.return_value.__enter__.return_value = frame
 
         with (
             patch("pybeamprofiler.gen_camera.time.monotonic", return_value=1_000.0),
@@ -298,7 +300,7 @@ class TestHarvesterCameraFallbacks:
         component.width, component.height = 2, 2
         component.data = np.arange(4, dtype=np.uint8)
         frame.payload.components = [component]
-        mocks.ia.fetch.return_value.__enter__.return_value = frame
+        mocks.ia.try_fetch.return_value.__enter__.return_value = frame
 
         with patch("pybeamprofiler.gen_camera.time.monotonic", return_value=1_000.0):
             cam.get_image(timeout=0.1)
