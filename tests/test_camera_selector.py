@@ -216,6 +216,11 @@ class TestSwitchCamera:
 
         assert "Unknown camera" in result[0]
         assert profiler.camera is old
+        assert result[6] == discovery.describe_open_camera(old).key
+
+    def test_a_successful_switch_leaves_the_selection_alone(self, profiler):
+        result = _callbacks(profiler)["switch_camera"](_other_key(profiler))
+        assert isinstance(result[6], dash._no_update.NoUpdate)
 
     def test_a_camera_that_will_not_open_leaves_the_current_one_running(self, profiler):
         """Opening the new device before releasing the old one means an
@@ -223,14 +228,18 @@ class TestSwitchCamera:
         old = profiler.camera
         old.start_acquisition()
         target = _other_key(profiler)
+        # What discovery.open_camera raises: its message already names the
+        # camera, so the status shows it as is rather than prefixing it again.
+        reason = "Could not open SimulatedCamera Tilted (SIM-002): device in use"
 
-        with patch.object(dash_app, "open_camera", side_effect=RuntimeError("device in use")):
+        with patch.object(dash_app, "open_camera", side_effect=RuntimeError(reason)):
             result = _callbacks(profiler)["switch_camera"](target)
 
-        assert "Could not open" in result[0]
-        assert "device in use" in result[0]
+        assert result[0] == reason
         assert profiler.camera is old
         assert old.is_acquiring is True
+        # The selection goes back to the camera that is still streaming.
+        assert result[6] == discovery.describe_open_camera(old).key
 
 
 class TestUnconditionalCallbackRegistration:

@@ -816,6 +816,7 @@ def _register_callbacks(app: dash.Dash, bp: BeamProfiler) -> None:
         Output("btn-play-pause", "color", allow_duplicate=True),
         Output("settings-container", "children", allow_duplicate=True),
         Output("input-pixel-scale", "value", allow_duplicate=True),
+        Output("dropdown-camera", "value", allow_duplicate=True),
         Input("dropdown-camera", "value"),
         prevent_initial_call=True,
     )
@@ -828,15 +829,25 @@ def _register_callbacks(app: dash.Dash, bp: BeamProfiler) -> None:
 
         Streaming is left paused afterwards: the caller picked a camera, and
         starting it is the next deliberate click.
+
+        When the switch fails, the selection goes back to the camera that is
+        still open. Left on the one that failed, the dropdown named the wrong
+        camera, and picking it again to retry could not fire at all: Dash only
+        calls back when the value changes.
         """
         global _server_paused, _camera_failures  # noqa: PLW0603
+        nothing = (dash.no_update,) * 7
 
         if not key:
-            return (dash.no_update,) * 6
+            return nothing
 
         with _callback_lock:
-            if bp.camera is not None and describe_open_camera(bp.camera).key == key:
-                return (dash.no_update,) * 6
+            current = describe_open_camera(bp.camera).key if bp.camera is not None else ""
+            if key == current:
+                return nothing
+
+            def refuse(message: str) -> tuple[Any, ...]:
+                return (message, *(dash.no_update,) * 5, current or dash.no_update)
 
             # Resolve against what the dropdown last offered. Re-running
             # discovery here would put a multi-second GenTL enumeration on the
@@ -845,13 +856,14 @@ def _register_callbacks(app: dash.Dash, bp: BeamProfiler) -> None:
             if option is None:
                 option = find_option(key, _camera_options(bp)[0])
             if option is None:
-                return (f"Unknown camera: {key}",) + (dash.no_update,) * 5
+                return refuse(f"Unknown camera: {key}")
 
             try:
                 camera = open_camera(option)
             except Exception as e:
                 logger.warning("Could not switch to %s: %s", option.label, e)
-                return (f"Could not open {option.label}: {e}",) + (dash.no_update,) * 5
+                # open_camera's message already names the camera.
+                return refuse(str(e) or f"Could not open {option.label}")
 
             bp.attach_camera(camera)
             _discard_frame_history(bp)
@@ -869,6 +881,7 @@ def _register_callbacks(app: dash.Dash, bp: BeamProfiler) -> None:
             button_color,
             _settings_body(items),
             scale,
+            dash.no_update,
         )
 
     # -- Play / Pause toggle --------------------------------------------------
