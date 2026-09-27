@@ -27,7 +27,7 @@ import pytest
 import requests
 
 from pybeamprofiler import dash_app
-from pybeamprofiler.beamprofiler import BeamProfiler
+from pybeamprofiler.beamprofiler import BeamProfiler, _without_loopback_reverse_dns
 
 SERVER_START_TIMEOUT = 30.0
 REQUEST_TIMEOUT = 60.0
@@ -50,12 +50,19 @@ class DashClient:
         self.session = requests.Session()
 
     def start(self) -> DashClient:
-        threading.Thread(
-            target=lambda: self.app.run(
-                debug=False, port=self.port, use_reloader=False, threaded=True
-            ),
-            daemon=True,
-        ).start()
+        def serve() -> None:
+            # The same stand-in for the loopback reverse lookup the GUI uses;
+            # without it no server came up in time on GitHub's macOS runners.
+            with _without_loopback_reverse_dns():
+                self.app.run(
+                    host="127.0.0.1",
+                    debug=False,
+                    port=self.port,
+                    use_reloader=False,
+                    threaded=True,
+                )
+
+        threading.Thread(target=serve, daemon=True).start()
 
         deadline = time.monotonic() + SERVER_START_TIMEOUT
         while time.monotonic() < deadline:

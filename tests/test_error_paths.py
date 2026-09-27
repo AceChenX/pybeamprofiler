@@ -132,6 +132,42 @@ class TestDashShutdown:
         assert seen == [("close", True, True)]
         assert not bp.camera.is_acquiring
 
+    def test_binding_does_not_wait_on_a_reverse_lookup_of_localhost(self, monkeypatch):
+        """http.server resolves the bound address back to a name. Where that
+        lookup is slow (35 s on some Macs), the server was unreachable for
+        the whole of it."""
+        import socket
+        import time
+
+        from werkzeug.serving import make_server
+
+        from pybeamprofiler.beamprofiler import _without_loopback_reverse_dns
+
+        asked: list[str] = []
+
+        def slow_getfqdn(name: str = "") -> str:
+            asked.append(name)
+            time.sleep(3)
+            return name
+
+        monkeypatch.setattr(socket, "getfqdn", slow_getfqdn)
+        start = time.monotonic()
+        with _without_loopback_reverse_dns():
+            server = make_server("127.0.0.1", 0, lambda environ, start_response: [])
+        server.server_close()
+        assert time.monotonic() - start < 1.0
+        assert asked == []
+        assert socket.getfqdn is slow_getfqdn, "the real function must be put back"
+
+    def test_the_gui_is_served_without_the_lookup(self):
+        import socket
+
+        bp = BeamProfiler(camera="simulated")
+        during: list[str] = []
+        self._serve(bp, run=lambda *a, **k: during.append(socket.getfqdn("127.0.0.1")))
+        assert during == ["localhost"]
+        assert socket.getfqdn.__module__ == "socket"
+
     def test_serving_from_a_worker_thread_works(self):
         """No signal handler is installed any more, so nothing can refuse to
         install off the main thread."""

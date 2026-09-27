@@ -16,13 +16,16 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import logging
 import math
 import os
+import socket
 import sys
 import threading
 import time
 import webbrowser
+from collections.abc import Iterator
 from types import TracebackType
 from typing import Any
 
@@ -53,6 +56,31 @@ _STREAM_FETCH_TIMEOUT = 1.0
 
 # Consecutive failed frames after which the notebook stream gives up.
 _MAX_STREAM_FAILURES = 50
+
+_LOOPBACK_NAMES = frozenset({"127.0.0.1", "::1", "localhost"})
+
+
+@contextlib.contextmanager
+def _without_loopback_reverse_dns() -> Iterator[None]:
+    """Answer ``socket.getfqdn`` for the loopback address without asking DNS.
+
+    ``http.server`` looks the address it binds to back up as a host name,
+    only to keep it in ``server_name``, which nothing here reads. On some
+    Macs that reverse lookup of 127.0.0.1 takes more than 30 s (35 s with
+    Homebrew's Python 3.14; on GitHub's macOS runners, long enough that no
+    test server came up in 30 s), and all of it passes before the server
+    accepts a connection. Any other name still goes to the real lookup.
+    """
+    real_getfqdn = socket.getfqdn
+
+    def getfqdn(name: str = "") -> str:
+        return "localhost" if name in _LOOPBACK_NAMES else real_getfqdn(name)
+
+    socket.getfqdn = getfqdn  # ty: ignore[invalid-assignment]
+    try:
+        yield
+    finally:
+        socket.getfqdn = real_getfqdn
 
 
 class BeamProfiler:
@@ -1347,7 +1375,8 @@ class BeamProfiler:
             # HOST=0.0.0.0 in the environment the GUI -- no authentication,
             # and it writes camera settings -- would be open to the whole
             # network while the line above promises localhost.
-            app.run(host="127.0.0.1", port=DEFAULT_DASH_PORT, debug=False, use_reloader=False)
+            with _without_loopback_reverse_dns():
+                app.run(host="127.0.0.1", port=DEFAULT_DASH_PORT, debug=False, use_reloader=False)
         except KeyboardInterrupt:
             pass
         finally:
