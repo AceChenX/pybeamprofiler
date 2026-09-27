@@ -342,13 +342,13 @@ class TestBeamProfilerContextManager:
             assert bp.width > 0
 
     def test_context_manager_with_exception(self):
-        """Test context manager properly closes camera on exception."""
-        try:
-            with BeamProfiler(camera="simulated") as bp:
-                assert bp.camera is not None
-                raise ValueError("Test exception")
-        except ValueError:
-            pass  # Expected
+        """The camera is closed, and the exception still propagates."""
+        with patch("pybeamprofiler.simulated.SimulatedCamera.close") as close:
+            with pytest.raises(ValueError, match="Test exception"):
+                with BeamProfiler(camera="simulated") as bp:
+                    assert bp.camera is not None
+                    raise ValueError("Test exception")
+        close.assert_called_once()
 
     def test_context_manager_with_file(self, test_image_file):
         """Test context manager with static file (no camera to close)."""
@@ -619,13 +619,34 @@ class TestPlotSingle:
             mock_fig.assert_called_once()
 
     def test_plot_single_camera_mode(self):
-        """Test _plot_single with camera acquires and releases."""
+        """A single shot starts acquisition for its frame and stops it again."""
         bp = BeamProfiler(camera="simulated")
         assert bp.camera is not None
         with patch.object(bp, "_create_figure") as mock_fig:
             mock_fig.return_value = MagicMock()
             bp._plot_single()
             mock_fig.assert_called_once()
+        assert not bp.camera.is_acquiring
+        bp.camera.close()
+
+    def test_plot_single_leaves_a_running_camera_running(self):
+        bp = BeamProfiler(camera="simulated")
+        assert bp.camera is not None
+        bp.camera.start_acquisition()
+        with patch.object(bp, "_create_figure", return_value=MagicMock()):
+            bp._plot_single()
+        assert bp.camera.is_acquiring
+        bp.camera.close()
+
+    def test_plot_single_stops_acquisition_even_if_the_fetch_fails(self):
+        bp = BeamProfiler(camera="simulated")
+        assert bp.camera is not None
+        with (
+            patch.object(bp.camera, "get_image", side_effect=TimeoutError("no frame")),
+            pytest.raises(TimeoutError),
+        ):
+            bp._plot_single()
+        assert not bp.camera.is_acquiring
         bp.camera.close()
 
     def test_plot_single_no_camera_raises(self):
@@ -930,61 +951,6 @@ class TestMeasureMethods:
 class TestCLI:
     """Test CLI argument parser and main block."""
 
-    def test_cli_argparse_defaults(self):
-        """Test CLI argument parser with defaults."""
-        import argparse
-
-        parser = argparse.ArgumentParser()
-        parser.add_argument("--camera", type=str, default="simulated")
-        parser.add_argument("--file", type=str, default=None)
-        parser.add_argument("--fit", type=str, default="1d")
-        parser.add_argument("--definition", type=str, default="gaussian")
-        parser.add_argument("--exposure-time", type=float, default=None)
-        parser.add_argument("--num-img", type=int, default=None)
-        parser.add_argument("--heatmap-only", action="store_true")
-        parser.add_argument("--verbose", "-v", action="store_true")
-
-        args = parser.parse_args([])
-        assert args.camera == "simulated"
-        assert args.fit == "1d"
-        assert args.definition == "gaussian"
-        assert args.num_img is None
-        assert not args.heatmap_only
-
-    def test_cli_argparse_custom(self):
-        """Test CLI argument parser with custom args."""
-        import argparse
-
-        parser = argparse.ArgumentParser()
-        parser.add_argument("--camera", type=str, default="simulated")
-        parser.add_argument("--fit", type=str, default="1d")
-        parser.add_argument("--definition", type=str, default="gaussian")
-        parser.add_argument("--num-img", type=int, default=None)
-        parser.add_argument("--heatmap-only", action="store_true")
-        parser.add_argument("--exposure-time", type=float, default=None)
-
-        args = parser.parse_args(
-            [
-                "--camera",
-                "simulated",
-                "--fit",
-                "2d",
-                "--definition",
-                "fwhm",
-                "--num-img",
-                "1",
-                "--heatmap-only",
-                "--exposure-time",
-                "0.05",
-            ]
-        )
-        assert args.camera == "simulated"
-        assert args.fit == "2d"
-        assert args.definition == "fwhm"
-        assert args.num_img == 1
-        assert args.heatmap_only is True
-        assert args.exposure_time == 0.05
-
     def test_cli_plot_single_shot(self):
         """Test CLI-style single shot execution."""
         bp = BeamProfiler(camera="simulated", fit="1d", definition="gaussian")
@@ -1022,40 +988,90 @@ class TestCLI:
 
 
 class TestCLIMain:
-    """Drive the ``main()`` CLI entry point to exercise the argparse +
-    plot + cleanup glue. ``plot`` is patched in every case because the
-    real one blocks on a Dash server or Jupyter loop.
+    """Drive the real ``main()``: argparse, the profiler it builds, plot, and
+    cleanup. ``plot`` is patched (with autospec, so it sees the profiler)
+    because the real one blocks on a Dash server or a Jupyter loop.
     """
 
-    def _run_main(self, argv: list[str], plot_side_effect: Any = None) -> MagicMock:
-        """Invoke ``main`` with the given argv and a patched ``plot``.
-
-        Returns the plot mock so tests can inspect call args.
-        """
+    @staticmethod
+    def _run_main(argv: list[str], plot_side_effect: Any = None) -> tuple[int, MagicMock]:
+        """Run ``main`` with *argv*; return its exit status and the plot mock."""
         from pybeamprofiler.beamprofiler import main
 
-        plot_mock = MagicMock(side_effect=plot_side_effect)
         with (
             patch("sys.argv", ["pybeamprofiler", *argv]),
-            patch.object(BeamProfiler, "plot", plot_mock),
+            patch.object(
+                BeamProfiler, "plot", autospec=True, side_effect=plot_side_effect
+            ) as plot_mock,
         ):
-            main()
-        return plot_mock
+            status = main()
+        return status, plot_mock
+
+    @staticmethod
+    def _profiler(plot_mock: MagicMock) -> BeamProfiler:
+        return plot_mock.call_args.args[0]
 
     def test_default_args_invokes_plot_continuous(self):
-        plot = self._run_main([])
+        status, plot = self._run_main([])
+        assert status == 0
         plot.assert_called_once()
-        kwargs = plot.call_args.kwargs
-        assert kwargs["num_img"] is None
-        assert kwargs["heatmap_only"] is False
+        assert plot.call_args.kwargs == {"num_img": None, "heatmap_only": False}
+        bp = self._profiler(plot)
+        assert (bp.fit_method, bp.definition) == ("1d", "gaussian")
+        assert type(bp.camera).__name__ == "SimulatedCamera"
+
+    def test_fit_and_definition_reach_the_profiler(self):
+        _, plot = self._run_main(["--fit", "2d", "--definition", "fwhm"])
+        bp = self._profiler(plot)
+        assert (bp.fit_method, bp.definition) == ("2d", "fwhm")
 
     def test_num_img_single_shot(self):
-        plot = self._run_main(["--num-img", "1"])
+        _, plot = self._run_main(["--num-img", "1"])
         assert plot.call_args.kwargs["num_img"] == 1
 
     def test_heatmap_only_flag_propagates(self):
-        plot = self._run_main(["--heatmap-only"])
+        _, plot = self._run_main(["--heatmap-only"])
         assert plot.call_args.kwargs["heatmap_only"] is True
+
+    def test_exposure_time_reaches_the_camera(self):
+        _, plot = self._run_main(["--exposure-time", "0.042"])
+        camera = self._profiler(plot).camera
+        assert camera is not None
+        assert camera.exposure_time == 0.042
+
+    def test_pixel_size_overrides_the_camera(self):
+        _, plot = self._run_main(["--pixel-size", "3.45"])
+        assert self._profiler(plot).pixel_size == 3.45
+
+    def test_file_mode(self, tmp_path):
+        from PIL import Image
+
+        img_path = tmp_path / "beam.png"
+        Image.fromarray(np.full((32, 32), 50, dtype=np.uint8)).save(img_path)
+        status, plot = self._run_main(["--file", str(img_path), "--pixel-size", "5"])
+        assert status == 0
+        bp = self._profiler(plot)
+        assert bp._mode == "static"
+        assert bp.pixel_size == 5.0
+
+    @pytest.mark.parametrize(
+        "argv",
+        [
+            ["--num-img", "5"],
+            ["--num-img", "0"],
+            ["--pixel-size", "nan"],
+            ["--pixel-size", "-1"],
+            ["--file", "beam.png"],
+        ],
+    )
+    def test_bad_arguments_are_usage_errors(self, argv, capsys):
+        """``--num-img 5`` and ``--pixel-size nan`` used to be accepted: one
+        streamed forever, the other made every width NaN."""
+        with pytest.raises(SystemExit) as exit_info:
+            self._run_main(argv)
+        assert exit_info.value.code == 2
+        # prog is set, so the usage line names the command, not __main__.py.
+        assert capsys.readouterr().err.startswith("usage: pybeamprofiler")
 
     def test_verbose_configures_info_log_level(self):
         """``-v`` must request INFO via ``logging.basicConfig`` (the actual
@@ -1063,97 +1079,54 @@ class TestCLIMain:
         configures logging, so we assert on the call rather than the level)."""
         import logging
 
-        from pybeamprofiler.beamprofiler import main
-
-        with (
-            patch("sys.argv", ["pybeamprofiler", "-v"]),
-            patch.object(BeamProfiler, "plot"),
-            patch("logging.basicConfig") as mock_basic,
-        ):
-            main()
+        with patch("logging.basicConfig") as mock_basic:
+            self._run_main(["-v"])
         mock_basic.assert_called_once_with(level=logging.INFO)
 
     def test_default_configures_warning_log_level(self):
         """Without ``-v`` the CLI configures ``logging.WARNING``."""
         import logging
 
-        from pybeamprofiler.beamprofiler import main
-
-        with (
-            patch("sys.argv", ["pybeamprofiler"]),
-            patch.object(BeamProfiler, "plot"),
-            patch("logging.basicConfig") as mock_basic,
-        ):
-            main()
+        with patch("logging.basicConfig") as mock_basic:
+            self._run_main([])
         mock_basic.assert_called_once_with(level=logging.WARNING)
-
-    def test_exposure_time_passed_to_profiler(self):
-        """``--exposure-time`` should reach the simulated camera."""
-        with (
-            patch("sys.argv", ["pybeamprofiler", "--exposure-time", "0.042"]),
-            patch.object(BeamProfiler, "plot") as mock_plot,
-        ):
-            from pybeamprofiler.beamprofiler import main
-
-            main()
-            mock_plot.assert_called_once()
-        # Not strictly asserting on the camera here because ``main`` creates
-        # and cleans up its own BeamProfiler; the important thing is that
-        # argparse accepted the flag and ``plot`` ran without raising.
 
     def test_keyboard_interrupt_swallowed(self):
         """Ctrl+C during ``plot`` must not propagate out of ``main``."""
-        # If KeyboardInterrupt escaped, this call itself would raise.
-        self._run_main([], plot_side_effect=KeyboardInterrupt)
+        status, _ = self._run_main([], plot_side_effect=KeyboardInterrupt)
+        assert status == 0
 
-    def test_plot_exception_logged_not_raised(self, caplog):
-        """Unexpected errors inside ``plot`` are logged, not propagated —
-        otherwise the cleanup ``finally`` would be skipped on CLI exits."""
-        import logging
-
-        with caplog.at_level(logging.ERROR, logger="pybeamprofiler.beamprofiler"):
-            self._run_main([], plot_side_effect=RuntimeError("boom"))
-        assert any("Fatal error" in rec.message for rec in caplog.records)
+    def test_plot_exception_is_reported_not_raised(self, capsys):
+        """Unexpected errors inside ``plot`` become a message and exit status
+        1, and the cleanup ``finally`` still runs."""
+        status, _ = self._run_main([], plot_side_effect=RuntimeError("boom"))
+        assert status == 1
+        assert "pybeamprofiler: error: boom" in capsys.readouterr().err
 
     def test_python_m_entrypoint_invokes_main(self):
-        """Running ``python -m pybeamprofiler`` must end up calling
-        ``beamprofiler.main``. We exercise the tiny ``__main__`` shim via
-        ``runpy`` rather than spawning a subprocess (avoids side effects
-        and keeps the test fast / deterministic)."""
+        """``python -m pybeamprofiler`` runs ``main`` and exits with its
+        status. Exercised through ``runpy`` rather than a subprocess."""
         import runpy
 
         with (
             patch("sys.argv", ["pybeamprofiler"]),
-            patch("pybeamprofiler.beamprofiler.main") as mock_main,
+            patch("pybeamprofiler.beamprofiler.main", return_value=3) as mock_main,
+            pytest.raises(SystemExit) as exit_info,
         ):
             runpy.run_module("pybeamprofiler.__main__", run_name="__main__")
-            mock_main.assert_called_once()
+        mock_main.assert_called_once()
+        assert exit_info.value.code == 3
 
     def test_finally_closes_camera(self):
         """After ``plot`` returns, ``main`` must stop + close the camera."""
-        from pybeamprofiler.beamprofiler import main
+        from pybeamprofiler.simulated import SimulatedCamera
 
-        # Capture the BeamProfiler instance that ``main`` constructs so we
-        # can spy on its camera.
-        created: list[BeamProfiler] = []
-        real_init = BeamProfiler.__init__
-
-        def capturing_init(self, *args, **kwargs):
-            real_init(self, *args, **kwargs)
-            created.append(self)
-
-        with (
-            patch("sys.argv", ["pybeamprofiler"]),
-            patch.object(BeamProfiler, "__init__", capturing_init),
-            patch.object(BeamProfiler, "plot"),
-        ):
-            main()
-
-        assert created, "main should have constructed a BeamProfiler"
-        cam = created[0].camera
-        assert cam is not None
-        # ``main``'s finally block calls close(); acquiring must be False now.
-        assert not cam.is_acquiring
+        with patch.object(SimulatedCamera, "close", autospec=True) as close:
+            _, plot = self._run_main([])
+        camera = self._profiler(plot).camera
+        assert camera is not None
+        close.assert_called_once_with(camera)
+        assert not camera.is_acquiring
 
 
 # ─── _camera_info_html ─────────────────────────────────────────────────────

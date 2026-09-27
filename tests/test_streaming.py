@@ -1,850 +1,287 @@
-"""Tests for beamprofiler streaming and plot methods."""
+"""Tests for the plot() entry points: single shots and the notebook stream.
+
+The Dash GUI's own tick is covered in test_dash_app.py; how plot() starts and
+stops the Dash server is in test_error_paths.py.
+"""
+
+from __future__ import annotations
 
 import asyncio
-import sys
+import logging
+import threading
+import time
+from typing import Any
 from unittest.mock import MagicMock, patch
 
-import dash
 import numpy as np
+import pytest
 
-from pybeamprofiler.beamprofiler import BeamProfiler
+from pybeamprofiler import beamprofiler
+from pybeamprofiler.beamprofiler import BeamProfiler, _in_notebook
 
 
-def test_plot_single():
-    """Test that plot(num_img=1) uses single plot and returns None."""
-    bp = BeamProfiler(camera="simulated")
-
-    with patch.object(bp, "_plot_single") as mock_plot_single:
-        result = bp.plot(num_img=1)
-        mock_plot_single.assert_called_once()
-        assert result is None
-
-
-def test_plot_stream_jupyter_task():
-    """Test that Jupyter streaming creates an asyncio.Task."""
-    bp = BeamProfiler(camera="simulated")
-
-    # Always return a frame so it loops normally without raising StopIteration
-    mock_img = np.ones((10, 10))
-
-    assert bp.camera is not None
-    bp.camera.get_image = MagicMock(return_value=mock_img)
-    bp.analyze = MagicMock(return_value=([0, 0, 1, 0], [0, 0, 1, 0]))
-    bp._create_fast_figure = MagicMock(return_value=MagicMock())
-
-    async def run_test():
-        # Setup mock IPython environment
-        mock_get_ipython = MagicMock(return_value=MagicMock())
-        display_mock = MagicMock()
-        clear_output_mock = MagicMock()
-
-        mock_ipython = MagicMock()
-        mock_ipython.get_ipython = mock_get_ipython
-
-        mock_ipython_display = MagicMock()
-        mock_ipython_display.display = display_mock
-        mock_ipython_display.clear_output = clear_output_mock
-
-        with patch.dict(
-            "sys.modules",
-            {"IPython": mock_ipython, "IPython.display": mock_ipython_display},
-        ):
-            # Run plot_stream
-            task = bp.plot(heatmap_only=True)
-
-            # Should return a task
-            assert isinstance(task, asyncio.Task)
-
-            # Wait for the loop to render at least one frame.  A fixed sleep
-            # is flaky on slow CI because the loop offloads camera/fit/figure
-            # calls to threads via ``asyncio.to_thread``.
-            for _ in range(200):  # up to ~2 s
-                if display_mock.call_count > 0 and clear_output_mock.call_count > 0:
-                    break
-                await asyncio.sleep(0.01)
-
-            # Cancel the task since it now continues on dropped frames
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
-
-            # Check clear_output and display were called for at least 1 successful frame
-            assert clear_output_mock.call_count >= 1
-            assert display_mock.call_count >= 1
-
-    asyncio.run(run_test())
-
-
-def test_plot_stream_jupyter_cancellation():
-    """Test that the Jupyter stream task can be cancelled cleanly."""
-    bp = BeamProfiler(camera="simulated")
-
-    # Always return an image to run indefinitely
-    assert bp.camera is not None
-    bp.camera.get_image = MagicMock(return_value=np.ones((10, 10)))
-    bp.analyze = MagicMock(return_value=([0, 0, 1, 0], [0, 0, 1, 0]))
-    bp._create_fast_figure = MagicMock(return_value=MagicMock())
-
-    async def run_cancel_test():
-        mock_get_ipython = MagicMock(return_value=MagicMock())
-        display_mock = MagicMock()
-        clear_output_mock = MagicMock()
-
-        mock_ipython = MagicMock()
-        mock_ipython.get_ipython = mock_get_ipython
-
-        mock_ipython_display = MagicMock()
-        mock_ipython_display.display = display_mock
-        mock_ipython_display.clear_output = clear_output_mock
-
-        with patch.dict(
-            "sys.modules",
-            {"IPython": mock_ipython, "IPython.display": mock_ipython_display},
-        ):
-            task = bp.plot(heatmap_only=True)
-            assert isinstance(task, asyncio.Task)
-
-            # Wait until the loop has actually rendered at least one frame.
-            # The loop offloads camera/fit/figure calls to threads via
-            # ``asyncio.to_thread``, so a fixed sleep is flaky on slow CI.
-            for _ in range(200):  # up to ~2 s
-                if display_mock.call_count > 0:
-                    break
-                await asyncio.sleep(0.01)
-
-            # Cancel the task
-            task.cancel()
-
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
-
-            # The task should be cleanly finished (since it catches CancelledError internally)
-            assert task.done()
-            # Should have run at least once
-            assert display_mock.call_count > 0
-
-    asyncio.run(run_cancel_test())
-
-
-def test_plot_stream_jupyter_robustness():
-    """Test that the Jupyter stream task survives exceptions and missing frames."""
-    bp = BeamProfiler(camera="simulated")
-
-    assert bp.camera is not None
-
-    mock_img = np.ones((10, 10))
-    # Sequence: 1 exception (timeout), 1 missing frame (None), and then valid frames.
-    # This proves the loop didn't break on errors/Nones
-    sequence = [RuntimeError("Camera timeout"), None, mock_img, mock_img, mock_img]
-
-    def mock_get_image():
-        if not sequence:
-            return mock_img
-        val = sequence.pop(0)
-        if isinstance(val, Exception):
-            raise val
-        return val
-
-    bp.camera.get_image = MagicMock(side_effect=mock_get_image)
-    bp.camera.is_acquiring = True  # Ensure it doesn't gracefully exit on None
-    bp.analyze = MagicMock(return_value=([0, 0, 1, 0], [0, 0, 1, 0]))
-    bp._create_fast_figure = MagicMock(return_value=MagicMock())
-
-    async def run_robustness_test():
-        mock_get_ipython = MagicMock(return_value=MagicMock())
-        display_mock = MagicMock()
-        clear_output_mock = MagicMock()
-
-        mock_ipython = MagicMock()
-        mock_ipython.get_ipython = mock_get_ipython
-
-        mock_ipython_display = MagicMock()
-        mock_ipython_display.display = display_mock
-        mock_ipython_display.clear_output = clear_output_mock
-
-        with patch.dict(
-            "sys.modules",
-            {"IPython": mock_ipython, "IPython.display": mock_ipython_display},
-        ):
-            task = bp.plot(heatmap_only=True)
-            assert isinstance(task, asyncio.Task)
-
-            # Wait for the loop to process the errors and output the valid frames
-            # Note: It sleeps for 0.01s on Exception and 0.01s on None
-            await asyncio.sleep(0.05)
-
-            # Should not be done (loop still running)
-            assert not task.done()
-
-            # Cancel the task
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
-
-            # Should have survived the initial exceptions/Nones and processed the valid frames
-            assert display_mock.call_count >= 1
-
-    asyncio.run(run_robustness_test())
-
-
-def test_plot_stream_dash_robustness():
-    """Test that Dash streaming handles errors gracefully."""
-    bp = BeamProfiler(camera="simulated")
-    assert bp.camera is not None
-    mock_img = np.ones((10, 10))
-
-    mock_ipython = MagicMock()
-    mock_ipython.get_ipython = MagicMock(return_value=None)
-
-    with (
-        patch("dash.Dash") as MockDash,
-        patch.dict("sys.modules", {"IPython": mock_ipython}),
-        patch("threading.Thread"),
-    ):
-        mock_app = MagicMock()
-        MockDash.return_value = mock_app
-        mock_app.run = MagicMock()
-
-        mock_fig = MagicMock()
-        mock_fig.layout.title.text = "Title"
-
-        callback_func = None
-
-        def capture_callback(*args, **kwargs):
-            def decorator(f):
-                nonlocal callback_func
-                callback_func = f
-                return f
-
-            return decorator
-
-        mock_app.callback = MagicMock(side_effect=capture_callback)
-
-        bp.plot(heatmap_only=True)
-        assert callback_func is not None
-
-        bp.camera.is_acquiring = True
-
-        bp.camera.get_image = MagicMock(side_effect=RuntimeError("Camera dead"))
-        result = callback_func(
-            0, False, True, "Hot", True, None, None, 0, "1d", "gaussian", True, 1
-        )
-        assert result[0] is dash.no_update
-
-        bp.camera.get_image = MagicMock(return_value=None)
-        result = callback_func(
-            0, False, True, "Hot", True, None, None, 0, "1d", "gaussian", True, 1
-        )
-        assert result[0] is dash.no_update
-
-        bp.camera.get_image = MagicMock(return_value=mock_img)
-        bp.analyze = MagicMock(return_value=([0, 0, 1, 0], [0, 0, 1, 0]))
-        with patch("pybeamprofiler.dash_app.build_figure", return_value=mock_fig):
-            result = callback_func(
-                0, False, True, "Hot", True, None, None, 0, "1d", "gaussian", True, 1
-            )
-        assert result[0] is mock_fig
-
-
-def test_plot_stream_matplotlib_fallback():
-    """Test fallback to matplotlib when both Jupyter and Dash are unavailable."""
-    bp = BeamProfiler(camera="simulated")
-    assert bp.camera is not None
-
-    mock_fig_plt = MagicMock()
-    mock_axes = MagicMock()
-    mock_axes.flat = [MagicMock() for _ in range(4)]
-
-    mock_plt = MagicMock()
-    mock_plt.subplots.return_value = (mock_fig_plt, mock_axes)
-
-    mock_animation = MagicMock()
-    mock_patches = MagicMock()
-
-    # `import a.b as x` resolves via parent module attribute access,
-    # so matplotlib.pyplot must be an attribute of the matplotlib mock.
-    mock_matplotlib = MagicMock()
-    mock_matplotlib.pyplot = mock_plt
-    mock_matplotlib.animation = mock_animation
-    mock_matplotlib.patches = mock_patches
-
-    mock_ipython = MagicMock()
-    mock_ipython.get_ipython = MagicMock(return_value=None)
-
-    with patch.dict(
-        sys.modules,
-        {
-            "IPython": mock_ipython,
-            "dash": None,
-            "dash.dependencies": None,
-            "matplotlib": mock_matplotlib,
-            "matplotlib.pyplot": mock_plt,
-            "matplotlib.animation": mock_animation,
-            "matplotlib.patches": mock_patches,
-        },
-    ):
-        bp._plot_stream()
-        mock_plt.subplots.assert_called_once()
-        mock_plt.show.assert_called_once()
-
-    bp.camera.close()
-
-
-def test_plot_stream_no_visualization_available():
-    """Test graceful handling when neither Dash nor matplotlib is available."""
-    bp = BeamProfiler(camera="simulated")
-    assert bp.camera is not None
-
-    mock_ipython = MagicMock()
-    mock_ipython.get_ipython = MagicMock(return_value=None)
-
-    with patch.dict(
-        sys.modules,
-        {
-            "IPython": mock_ipython,
-            "dash": None,
-            "dash.dependencies": None,
-            "matplotlib": None,
-            "matplotlib.pyplot": None,
-            "matplotlib.animation": None,
-            "matplotlib.patches": None,
-        },
-    ):
-        result = bp._plot_stream()
-        assert result is None
-
-    bp.camera.close()
-
-
-def test_plot_stream_dash_non_heatmap():
-    """Test Dash streaming in full figure (non-heatmap) mode."""
-    bp = BeamProfiler(camera="simulated")
-    assert bp.camera is not None
-    mock_img = np.ones((10, 10))
-
-    mock_ipython = MagicMock()
-    mock_ipython.get_ipython = MagicMock(return_value=None)
-
-    with (
-        patch("dash.Dash") as MockDash,
-        patch.dict("sys.modules", {"IPython": mock_ipython}),
-        patch("threading.Thread"),
-    ):
-        mock_app = MagicMock()
-        MockDash.return_value = mock_app
-        mock_app.run = MagicMock()
-
-        mock_fig = MagicMock()
-        mock_fig.layout.title.text = "Title"
-
-        callback_func = None
-
-        def capture_callback(*args, **kwargs):
-            def decorator(f):
-                nonlocal callback_func
-                callback_func = f
-                return f
-
-            return decorator
-
-        mock_app.callback = MagicMock(side_effect=capture_callback)
-
-        bp.plot(heatmap_only=False)
-        assert callback_func is not None
-
-        bp.camera.is_acquiring = True
-        bp.camera.get_image = MagicMock(return_value=mock_img)
-        bp.analyze = MagicMock(return_value=([0, 0, 1, 0], [0, 0, 1, 0]))
-        with patch("pybeamprofiler.dash_app.build_figure", return_value=mock_fig):
-            result = callback_func(
-                0, False, True, "Hot", True, None, None, 0, "1d", "gaussian", True, 1
-            )
-        assert result[0] is mock_fig
-
-    bp.camera.close()
-
-
-def test_plot_stream_camera_not_acquiring_restart():
-    """Test Dash callback handles camera not acquiring (proceeds with get_image)."""
-    bp = BeamProfiler(camera="simulated")
-    assert bp.camera is not None
-    mock_img = np.ones((10, 10))
-
-    mock_ipython = MagicMock()
-    mock_ipython.get_ipython = MagicMock(return_value=None)
-
-    with (
-        patch("dash.Dash") as MockDash,
-        patch.dict("sys.modules", {"IPython": mock_ipython}),
-        patch("threading.Thread"),
-    ):
-        mock_app = MagicMock()
-        MockDash.return_value = mock_app
-        mock_app.run = MagicMock()
-
-        mock_fig = MagicMock()
-        mock_fig.layout.title.text = "Title"
-
-        callback_func = None
-
-        def capture_callback(*args, **kwargs):
-            def decorator(f):
-                nonlocal callback_func
-                callback_func = f
-                return f
-
-            return decorator
-
-        mock_app.callback = MagicMock(side_effect=capture_callback)
-
-        bp.plot(heatmap_only=True)
-        assert callback_func is not None
-
-        bp.camera.is_acquiring = False
-        bp.camera.get_image = MagicMock(return_value=mock_img)
-        bp.analyze = MagicMock(return_value=([0, 0, 1, 0], [0, 0, 1, 0]))
-        with patch("pybeamprofiler.dash_app.build_figure", return_value=mock_fig):
-            result = callback_func(
-                0, False, True, "Hot", True, None, None, 0, "1d", "gaussian", True, 1
-            )
-        assert result[0] is mock_fig
-
-    bp.camera.close()
-
-
-def test_plot_stream_static_mode():
-    """Test Dash callback uses last_img for static file mode."""
-    import os
-    import tempfile
-
-    from PIL import Image
-
-    with tempfile.TemporaryDirectory() as tmpdir:
-        img_arr = np.random.randint(50, 200, (64, 64), dtype=np.uint8)
-        img_path = os.path.join(tmpdir, "beam.png")
-        Image.fromarray(img_arr).save(img_path)
-
-        bp = BeamProfiler(file=img_path, pixel_size=5.0)
-
-        mock_ipython = MagicMock()
-        mock_ipython.get_ipython = MagicMock(return_value=None)
-
-        with (
-            patch("dash.Dash") as MockDash,
-            patch.dict("sys.modules", {"IPython": mock_ipython}),
-            patch("threading.Thread"),
-        ):
-            mock_app = MagicMock()
-            MockDash.return_value = mock_app
-            mock_app.run = MagicMock()
-
-            mock_fig = MagicMock()
-            mock_fig.layout.title.text = "Title"
-
-            callback_func = None
-
-            def capture_callback(*args, **kwargs):
-                def decorator(f):
-                    nonlocal callback_func
-                    callback_func = f
-                    return f
-
-                return decorator
-
-            mock_app.callback = MagicMock(side_effect=capture_callback)
-
-            bp._plot_stream()
-            assert callback_func is not None
-
-            bp.analyze = MagicMock(return_value=([0, 0, 1, 0], [0, 0, 1, 0]))
-            with patch("pybeamprofiler.dash_app.build_figure", return_value=mock_fig):
-                result = callback_func(
-                    0, False, True, "Hot", True, None, None, 0, "1d", "gaussian", True, 1
-                )
-            assert result[0] is mock_fig
-
-
-def test_plot_stream_matplotlib_update_frame():
-    """Test the matplotlib update_frame function renders correctly."""
-    bp = BeamProfiler(camera="simulated")
-    assert bp.camera is not None
-
-    mock_fig_plt = MagicMock()
-    mock_ax1 = MagicMock()
-    mock_ax2 = MagicMock()
-    mock_ax3 = MagicMock()
-    mock_ax4 = MagicMock()
-    mock_axes = MagicMock()
-    mock_axes.flat = [mock_ax1, mock_ax2, mock_ax3, mock_ax4]
-    mock_axes.__getitem__ = lambda self, key: {
-        (0, 0): mock_ax1,
-        (1, 0): mock_ax2,
-        (1, 1): mock_ax3,
-        (0, 1): mock_ax4,
-    }.get(key, MagicMock())
-
-    mock_plt = MagicMock()
-    mock_plt.subplots.return_value = (mock_fig_plt, mock_axes)
-
-    mock_animation = MagicMock()
-    mock_patches = MagicMock()
-
-    mock_matplotlib = MagicMock()
-    mock_matplotlib.pyplot = mock_plt
-    mock_matplotlib.animation = mock_animation
-    mock_matplotlib.patches = mock_patches
-
-    update_frame_fn = None
-
-    def capture_update_frame(*args, **kwargs):
-        nonlocal update_frame_fn
-        if len(args) >= 2:
-            update_frame_fn = args[1]
-        return MagicMock()
-
-    mock_animation.FuncAnimation = capture_update_frame
-
-    mock_ipython = MagicMock()
-    mock_ipython.get_ipython = MagicMock(return_value=None)
-
-    with patch.dict(
-        sys.modules,
-        {
-            "IPython": mock_ipython,
-            "dash": None,
-            "dash.dependencies": None,
-            "matplotlib": mock_matplotlib,
-            "matplotlib.pyplot": mock_plt,
-            "matplotlib.animation": mock_animation,
-            "matplotlib.patches": mock_patches,
-        },
-    ):
-        bp._plot_stream()
-
-    assert update_frame_fn is not None
-    # Call update_frame to exercise the rendering code
-    update_frame_fn(0)
-    assert mock_ax2.imshow.called or mock_ax1.clear.called
-
-    bp.camera.close()
-
-
-def test_plot_stream_jupyter_non_heatmap():
-    """Test Jupyter streaming in non-heatmap (full figure) mode."""
-    bp = BeamProfiler(camera="simulated")
-    assert bp.camera is not None
-
-    mock_img = np.ones((10, 10))
-    bp.camera.get_image = MagicMock(return_value=mock_img)
-    bp.analyze = MagicMock(return_value=([0, 0, 1, 0], [0, 0, 1, 0]))
-    bp._create_figure = MagicMock(return_value=MagicMock())
-
-    async def run_test():
-        mock_get_ipython = MagicMock(return_value=MagicMock())
-        display_mock = MagicMock()
-        clear_output_mock = MagicMock()
-
-        mock_ipython = MagicMock()
-        mock_ipython.get_ipython = mock_get_ipython
-
-        mock_ipython_display = MagicMock()
-        mock_ipython_display.display = display_mock
-        mock_ipython_display.clear_output = clear_output_mock
-
-        with patch.dict(
-            "sys.modules",
-            {"IPython": mock_ipython, "IPython.display": mock_ipython_display},
-        ):
-            task = bp.plot(heatmap_only=False)
-
-            assert isinstance(task, asyncio.Task)
-
-            await asyncio.sleep(0.02)
-
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
-
-            assert bp._create_figure.call_count >= 1  # ty: ignore[unresolved-attribute]
-
-    asyncio.run(run_test())
-    bp.camera.close()
-
-
-def test_dash_callback_lock_prevents_reentrance():
-    """Test that the Dash callback returns valid figures across consecutive calls."""
-    bp = BeamProfiler(camera="simulated")
-    assert bp.camera is not None
-    mock_img = np.ones((10, 10))
-
-    mock_ipython = MagicMock()
-    mock_ipython.get_ipython = MagicMock(return_value=None)
-
-    with (
-        patch("dash.Dash") as MockDash,
-        patch.dict("sys.modules", {"IPython": mock_ipython}),
-        patch("threading.Thread"),
-    ):
-        mock_app = MagicMock()
-        MockDash.return_value = mock_app
-        mock_app.run = MagicMock()
-
-        mock_fig = MagicMock()
-        mock_fig.layout.title.text = "Title"
-
-        callback_func = None
-
-        def capture_callback(*args, **kwargs):
-            def decorator(f):
-                nonlocal callback_func
-                callback_func = f
-                return f
-
-            return decorator
-
-        mock_app.callback = MagicMock(side_effect=capture_callback)
-
-        bp.plot(heatmap_only=True)
-        assert callback_func is not None
-
-        bp.camera.is_acquiring = True
-        bp.camera.get_image = MagicMock(return_value=mock_img)
-        bp.analyze = MagicMock(return_value=([0, 0, 1, 0], [0, 0, 1, 0]))
-
-        with patch("pybeamprofiler.dash_app.build_figure", return_value=mock_fig):
-            result1 = callback_func(
-                0, False, True, "Hot", True, None, None, 0, "1d", "gaussian", True, 1
-            )
-            assert result1[0] is mock_fig
-
-            result2 = callback_func(
-                1, False, True, "Hot", True, None, None, 0, "1d", "gaussian", True, 1
-            )
-            assert result2[0] is mock_fig
-
-    bp.camera.close()
-
-
-def test_dash_sigint_handler_restores_original():
-    """Test that SIGINT handler is installed and original is restored."""
-    import signal
-
-    bp = BeamProfiler(camera="simulated")
-    assert bp.camera is not None
-
-    mock_ipython = MagicMock()
-    mock_ipython.get_ipython = MagicMock(return_value=None)
-
-    original_handler = signal.getsignal(signal.SIGINT)
-
-    with (
-        patch("dash.Dash") as MockDash,
-        patch.dict("sys.modules", {"IPython": mock_ipython}),
-        patch("threading.Thread"),
-    ):
-        mock_app = MagicMock()
-        MockDash.return_value = mock_app
-
-        mock_app.callback = MagicMock(side_effect=lambda *a, **k: lambda f: f)
-
-        mock_app.run = MagicMock(side_effect=KeyboardInterrupt)
-
-        bp.plot(heatmap_only=True)
-
-    restored_handler = signal.getsignal(signal.SIGINT)
-    assert restored_handler is original_handler
-
-    bp.camera.close()
-
-
-def test_dash_shutdown_flag_stops_callback():
-    """Test that the callback returns valid figures when shutdown_flag is not set."""
-    bp = BeamProfiler(camera="simulated")
-    assert bp.camera is not None
-    mock_img = np.ones((10, 10))
-
-    mock_ipython = MagicMock()
-    mock_ipython.get_ipython = MagicMock(return_value=None)
-
-    with (
-        patch("dash.Dash") as MockDash,
-        patch.dict("sys.modules", {"IPython": mock_ipython}),
-        patch("threading.Thread"),
-    ):
-        mock_app = MagicMock()
-        MockDash.return_value = mock_app
-        mock_app.run = MagicMock()
-
-        mock_fig = MagicMock()
-        mock_fig.layout.title.text = "Title"
-
-        callback_func = None
-
-        def capture_callback(*args, **kwargs):
-            def decorator(f):
-                nonlocal callback_func
-                callback_func = f
-                return f
-
-            return decorator
-
-        mock_app.callback = MagicMock(side_effect=capture_callback)
-
-        bp.plot(heatmap_only=True)
-        assert callback_func is not None
-
-        bp.camera.is_acquiring = True
-        bp.camera.get_image = MagicMock(return_value=mock_img)
-        bp.analyze = MagicMock(return_value=([0, 0, 1, 0], [0, 0, 1, 0]))
-
-        with patch("pybeamprofiler.dash_app.build_figure", return_value=mock_fig):
-            result = callback_func(
-                0, False, True, "Hot", True, None, None, 0, "1d", "gaussian", True, 1
-            )
-        assert result[0] is mock_fig
-
-    bp.camera.close()
-
-
-# ─── Stream-loop branches that only fire when the camera misbehaves ────────
-
-
-def _jupyter_modules() -> dict[str, MagicMock]:
-    """Mock IPython modules that make ``_plot_stream`` take the Jupyter path."""
+def _kernel_modules() -> dict[str, MagicMock]:
+    """Stand-ins for IPython that look like a running Jupyter kernel."""
     display_module = MagicMock()
-    display_module.display = MagicMock()
-    display_module.clear_output = MagicMock()
-
     ipython = MagicMock()
-    ipython.get_ipython = MagicMock(return_value=MagicMock())
+    shell = MagicMock()
+    shell.kernel = MagicMock()  # a kernel is what makes it a notebook
+    ipython.get_ipython = MagicMock(return_value=shell)
     return {"IPython": ipython, "IPython.display": display_module}
 
 
-def test_jupyter_loop_exits_when_acquisition_stops():
-    """A ``None`` frame from a stopped camera ends the loop rather than
-    spinning forever on a device that will never deliver again."""
-    bp = BeamProfiler(camera="simulated")
-    assert bp.camera is not None
-    bp.camera.get_image = MagicMock(return_value=None)
-    # _plot_stream starts acquisition on entry; keep it a no-op so the camera
-    # stays "stopped" for the duration of the test.
-    bp.camera.start_acquisition = MagicMock()
-    bp.camera.is_acquiring = False
-
-    async def run_test():
-        with patch.dict("sys.modules", _jupyter_modules()):
-            task = bp.plot(heatmap_only=True)
-            assert isinstance(task, asyncio.Task)
-            await asyncio.wait_for(task, timeout=5.0)
-        assert task.done()
-
-    asyncio.run(run_test())
-    bp.camera.close()
+async def _wait_for(condition: Any, timeout: float = 3.0) -> None:
+    """Poll *condition* until true. The loop hands its work to threads, so a
+    fixed sleep would be flaky on a slow machine."""
+    deadline = time.monotonic() + timeout
+    while not condition():
+        if time.monotonic() > deadline:
+            raise AssertionError("timed out waiting for the stream")
+        await asyncio.sleep(0.01)
 
 
-def test_jupyter_loop_waits_out_a_dropped_frame():
-    """A ``None`` frame while still acquiring is a hiccup, not the end."""
-    bp = BeamProfiler(camera="simulated")
-    assert bp.camera is not None
-    bp.camera.start_acquisition()
-
-    frames = [None, None, np.ones((10, 10))]
-    bp.camera.get_image = MagicMock(  # ty: ignore[invalid-assignment]
-        side_effect=lambda *a, **k: frames.pop(0) if frames else np.ones((10, 10))
-    )
-    bp._create_fast_figure = MagicMock(return_value=MagicMock())
-
-    async def run_test():
-        modules = _jupyter_modules()
-        with patch.dict("sys.modules", modules):
-            task = bp.plot(heatmap_only=True)
-            assert isinstance(task, asyncio.Task)
-            display_mock = modules["IPython.display"].display
-            for _ in range(300):
-                if display_mock.call_count > 0:
-                    break
-                await asyncio.sleep(0.01)
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
-            assert display_mock.call_count >= 1
-
-    asyncio.run(run_test())
-    bp.camera.close()
+async def _finish(task: asyncio.Task[None]) -> None:
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
 
 
-def test_plot_stream_runs_the_loop_when_there_is_no_event_loop():
-    """Outside a running loop, ``_plot_stream`` drives it with asyncio.run."""
-    bp = BeamProfiler(camera="simulated")
-    assert bp.camera is not None
-    bp.camera.get_image = MagicMock(return_value=None)
-    bp.camera.start_acquisition = MagicMock()
-    bp.camera.is_acquiring = False
-
-    with patch.dict("sys.modules", _jupyter_modules()):
-        assert bp._plot_stream() is None  # asyncio.run path, returns on break
-
-    bp.camera.close()
+@pytest.fixture
+def bp():
+    profiler = BeamProfiler(camera="simulated")
+    yield profiler
+    profiler.stop()
+    assert profiler.camera is not None
+    profiler.camera.close()
 
 
-def test_matplotlib_frame_update_renders_2d_angle():
-    """The matplotlib info panel shows the rotation angle in 2D mode."""
-    bp = BeamProfiler(camera="simulated", fit="2d")
-    assert bp.camera is not None
+def test_plot_single(bp):
+    with patch.object(bp, "_plot_single") as mock_plot_single:
+        assert bp.plot(num_img=1) is None
+    mock_plot_single.assert_called_once()
 
-    captured = {}
-    mock_fig_plt = MagicMock()
-    mock_axes = MagicMock()
-    mock_axes.flat = [MagicMock() for _ in range(4)]
 
-    mock_plt = MagicMock()
-    mock_plt.subplots.return_value = (mock_fig_plt, mock_axes)
+@pytest.mark.parametrize("num_img", [0, 2, 5, -3])
+def test_unsupported_frame_counts_are_refused(bp, num_img):
+    """Anything but 1 used to stream forever without a word."""
+    with pytest.raises(ValueError, match="num_img"):
+        bp.plot(num_img=num_img)
 
-    def capture_anim(fig, update, **kwargs):
-        captured["update"] = update
-        return MagicMock()
 
-    mock_animation = MagicMock()
-    mock_animation.FuncAnimation = capture_anim
+class TestNotebookDetection:
+    def test_no_ipython_is_not_a_notebook(self):
+        with patch.dict("sys.modules", {"IPython": None}):
+            assert not _in_notebook()
 
-    mock_matplotlib = MagicMock()
-    mock_matplotlib.pyplot = mock_plt
-    mock_matplotlib.animation = mock_animation
+    def test_plain_python_is_not_a_notebook(self):
+        ipython = MagicMock()
+        ipython.get_ipython = MagicMock(return_value=None)
+        with patch.dict("sys.modules", {"IPython": ipython}):
+            assert not _in_notebook()
 
-    mock_ipython = MagicMock()
-    mock_ipython.get_ipython = MagicMock(return_value=None)
+    def test_a_terminal_ipython_session_is_not_a_notebook(self):
+        """It has get_ipython() but no kernel. Treated as a notebook, every
+        frame opened a new browser tab."""
+        ipython = MagicMock()
+        ipython.get_ipython = MagicMock(return_value=object())
+        with patch.dict("sys.modules", {"IPython": ipython}):
+            assert not _in_notebook()
 
-    with patch.dict(
-        sys.modules,
-        {
-            "IPython": mock_ipython,
-            "dash": None,
-            "matplotlib": mock_matplotlib,
-            "matplotlib.pyplot": mock_plt,
-            "matplotlib.animation": mock_animation,
-            "matplotlib.patches": MagicMock(),
-        },
-    ):
-        bp._plot_stream()
+    def test_a_kernel_is_a_notebook(self):
+        with patch.dict("sys.modules", _kernel_modules()):
+            assert _in_notebook()
 
-        update = captured["update"]
-        # A real frame renders the full panel, angle line included.
-        update(1)
-        info_text = mock_axes.__getitem__.return_value.text.call_args
-        assert info_text is not None
+    def test_a_terminal_ipython_session_gets_the_dash_gui(self, bp):
+        ipython = MagicMock()
+        ipython.get_ipython = MagicMock(return_value=object())
+        with (
+            patch.dict("sys.modules", {"IPython": ipython}),
+            patch.object(bp, "_serve_dash") as serve,
+            patch.object(bp, "_start_notebook_stream") as notebook,
+        ):
+            assert bp.plot() is None
+        serve.assert_called_once()
+        notebook.assert_not_called()
 
-        # A dropped frame returns early without touching the axes.
-        bp.camera.get_image = MagicMock(return_value=None)
-        assert update(2) is None
 
-    bp.camera.close()
+class TestNotebookStream:
+    def test_renders_frames(self, bp):
+        bp.camera.get_image = MagicMock(return_value=np.ones((10, 10)))
+        bp.analyze = MagicMock(return_value=(None, None))
+        bp._create_fast_figure = MagicMock(return_value=MagicMock())
+        modules = _kernel_modules()
+        display = modules["IPython.display"]
+
+        async def run() -> None:
+            with patch.dict("sys.modules", modules):
+                task = bp.plot(heatmap_only=True)
+                assert isinstance(task, asyncio.Task)
+                await _wait_for(lambda: display.display.call_count >= 2)
+                await _finish(task)
+            assert display.clear_output.call_count >= 1
+            assert task.done()
+
+        asyncio.run(run())
+
+    def test_full_figure_mode_uses_the_full_figure(self, bp):
+        bp.camera.get_image = MagicMock(return_value=np.ones((10, 10)))
+        bp.analyze = MagicMock(return_value=(None, None))
+        bp._create_figure = MagicMock(return_value=MagicMock())
+        bp._create_fast_figure = MagicMock()
+
+        async def run() -> None:
+            with patch.dict("sys.modules", _kernel_modules()):
+                task = bp.plot(heatmap_only=False)
+                assert isinstance(task, asyncio.Task)
+                await _wait_for(lambda: bp._create_figure.call_count >= 1)
+                await _finish(task)
+            bp._create_fast_figure.assert_not_called()
+
+        asyncio.run(run())
+
+    def test_survives_a_failed_frame_and_a_dropped_one(self, bp):
+        frames: list[Any] = [RuntimeError("camera hiccup"), TimeoutError(), np.ones((10, 10))]
+
+        def get_image(*args, **kwargs):
+            item = frames.pop(0) if frames else np.ones((10, 10))
+            if isinstance(item, BaseException):
+                raise item
+            return item
+
+        bp.camera.get_image = MagicMock(side_effect=get_image)
+        bp.analyze = MagicMock(return_value=(None, None))
+        bp._create_fast_figure = MagicMock(return_value=MagicMock())
+        modules = _kernel_modules()
+
+        async def run() -> None:
+            with patch.dict("sys.modules", modules):
+                task = bp.plot(heatmap_only=True)
+                assert isinstance(task, asyncio.Task)
+                await _wait_for(lambda: modules["IPython.display"].display.call_count >= 1)
+                assert not task.done()
+                await _finish(task)
+
+        asyncio.run(run())
+
+    def test_a_dead_camera_ends_the_stream_with_a_warning(self, bp, caplog):
+        """A camera that has gone away fails every frame. The stream used to
+        retry it forever, logging at debug level only."""
+        bp.camera.get_image = MagicMock(side_effect=RuntimeError("Camera not opened."))
+
+        async def run() -> None:
+            with (
+                patch.dict("sys.modules", _kernel_modules()),
+                patch.object(beamprofiler, "_MAX_STREAM_FAILURES", 3),
+            ):
+                task = bp.plot(heatmap_only=True)
+                assert isinstance(task, asyncio.Task)
+                await asyncio.wait_for(task, timeout=5.0)
+
+        with caplog.at_level(logging.WARNING, logger="pybeamprofiler.beamprofiler"):
+            asyncio.run(run())
+        assert "stopped after 3 failed frames" in caplog.text
+
+    def test_rerunning_plot_replaces_the_previous_stream(self, bp):
+        """Re-running the cell used to leave the first loop fetching from the
+        same camera as the second, out of reach of stop()."""
+        bp.camera.get_image = MagicMock(return_value=np.ones((10, 10)))
+        bp.analyze = MagicMock(return_value=(None, None))
+        bp._create_fast_figure = MagicMock(return_value=MagicMock())
+
+        async def run() -> None:
+            with patch.dict("sys.modules", _kernel_modules()):
+                first = bp.plot(heatmap_only=True)
+                second = bp.plot(heatmap_only=True)
+                assert isinstance(first, asyncio.Task) and isinstance(second, asyncio.Task)
+                await asyncio.sleep(0.05)
+                assert first.done()
+                assert not second.done()
+                assert bp._stream_task is second
+                await _finish(second)
+
+        asyncio.run(run())
+
+    def test_stop_waits_for_the_fetch_in_flight(self, bp):
+        """Cancelling the task doesn't stop its worker thread. A fetch that
+        outlived stop_acquisition() would restart acquisition on a GenICam
+        camera, so stop() must wait for it."""
+        events: list[str] = []
+        entered, release = threading.Event(), threading.Event()
+
+        def slow_get_image(*args, **kwargs):
+            events.append("fetch started")
+            entered.set()
+            release.wait(5.0)
+            events.append("fetch returned")
+            return np.ones((10, 10))
+
+        bp.camera.get_image = MagicMock(side_effect=slow_get_image)
+        real_stop = bp.camera.stop_acquisition
+
+        def recording_stop() -> None:
+            events.append("acquisition stopped")
+            real_stop()
+
+        bp.camera.stop_acquisition = MagicMock(side_effect=recording_stop)
+        bp.analyze = MagicMock(return_value=(None, None))
+        bp._create_fast_figure = MagicMock(return_value=MagicMock())
+
+        async def run() -> None:
+            with patch.dict("sys.modules", _kernel_modules()):
+                task = bp.plot(heatmap_only=True)
+                assert isinstance(task, asyncio.Task)
+                await _wait_for(entered.is_set)
+                stopper = threading.Thread(target=bp.stop)
+                stopper.start()
+                await asyncio.sleep(0.1)
+                assert "acquisition stopped" not in events, "stopped under a live fetch"
+                release.set()
+                await asyncio.to_thread(stopper.join, 5.0)
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+
+        asyncio.run(run())
+        assert events.index("fetch returned") < events.index("acquisition stopped")
+        assert events.count("fetch started") == 1, "no new fetch may start after stop()"
+
+    def test_leaving_the_context_manager_stops_the_stream(self):
+        """``__exit__`` closed the camera but left the stream fetching from
+        it, failing every frame for as long as the kernel lived."""
+
+        async def run() -> None:
+            with patch.dict("sys.modules", _kernel_modules()):
+                with BeamProfiler(camera="simulated") as bp:
+                    assert bp.camera is not None
+                    bp.analyze = MagicMock(return_value=(None, None))
+                    bp._create_fast_figure = MagicMock(return_value=MagicMock())
+                    task = bp.plot(heatmap_only=True)
+                    assert isinstance(task, asyncio.Task)
+                    await asyncio.sleep(0.05)
+                await asyncio.sleep(0.05)
+                assert task is not None and task.done()
+                assert bp.camera is not None and not bp.camera.is_acquiring
+
+        asyncio.run(run())
+
+    def test_without_an_event_loop_the_stream_runs_in_place(self, bp):
+        """No running loop (unusual in a kernel): the stream runs until it
+        ends, here because the camera keeps failing."""
+        bp.camera.get_image = MagicMock(side_effect=RuntimeError("gone"))
+        with (
+            patch.dict("sys.modules", _kernel_modules()),
+            patch.object(beamprofiler, "_MAX_STREAM_FAILURES", 2),
+        ):
+            assert bp._plot_stream() is None
+
+    def test_starts_acquisition_if_the_camera_is_idle(self, bp):
+        assert not bp.camera.is_acquiring
+        with (
+            patch.dict("sys.modules", {"IPython": None}),
+            patch.object(bp, "_serve_dash"),
+        ):
+            bp.plot()
+        assert bp.camera.is_acquiring

@@ -2,4 +2,4 @@
 
 from pybeamprofiler.beamprofiler import main
 
-main()
+raise SystemExit(main())

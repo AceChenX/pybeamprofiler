@@ -181,7 +181,7 @@ class TestStaticImageLoading:
 
     def test_pixel_size_must_be_positive(self, tmp_path):
         gray = np.zeros((16, 16), dtype=np.uint8)
-        with pytest.raises(ValueError, match="greater than zero"):
+        with pytest.raises(ValueError, match="must be a positive number"):
             BeamProfiler(file=self._write(tmp_path, gray), pixel_size=0)
 
 
@@ -220,7 +220,7 @@ class TestCliPixelSize:
         with patch.object(sys, "argv", argv):
             with pytest.raises(SystemExit):
                 main()
-        assert "greater than zero" in capsys.readouterr().err
+        assert "must be a positive number" in capsys.readouterr().err
 
     def test_pixel_size_overrides_the_camera(self):
         """A camera reports its own pitch, but the flag wins when given."""

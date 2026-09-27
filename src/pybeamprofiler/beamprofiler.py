@@ -7,9 +7,9 @@ the state that has to persist between frames — which camera, which fit
 method, and the previous frame's parameters that each new fit warm-starts
 from.
 
-Three display paths hang off :meth:`BeamProfiler.plot`, chosen by
-environment rather than by argument: a live async loop inside Jupyter, the
-Dash app in a terminal, and a matplotlib animation if Dash is missing.
+Two display paths hang off :meth:`BeamProfiler.plot`, chosen by
+environment rather than by argument: a live async loop inside a Jupyter
+kernel, and the Dash GUI everywhere else.
 """
 
 from __future__ import annotations
@@ -19,7 +19,7 @@ import asyncio
 import logging
 import math
 import os
-import signal
+import sys
 import threading
 import time
 import webbrowser
@@ -46,6 +46,13 @@ from .flir import FlirCamera
 from .simulated import SimulatedCamera
 
 logger = logging.getLogger(__name__)
+
+# How long one notebook-stream fetch may wait for a frame. Bounding it is what
+# keeps stop() prompt: stop() waits for the fetch in flight to finish.
+_STREAM_FETCH_TIMEOUT = 1.0
+
+# Consecutive failed frames after which the notebook stream gives up.
+_MAX_STREAM_FAILURES = 50
 
 
 class BeamProfiler:
@@ -119,6 +126,11 @@ class BeamProfiler:
         # Frame geometry the warm starts belong to.
         self._analysis_shape: tuple[int, ...] | None = None
         self._stream_task: asyncio.Task[None] | None = None
+        # See _next_frame and stop(): the lock is held for each notebook-stream
+        # fetch, the event tells the loop and its worker to stand down.
+        self._stream_fetch_lock = threading.Lock()
+        self._stream_stopping = threading.Event()
+        self._heatmap_only = False
 
         # What the last analysed frame produced, for drawing it.
         self.last_img: np.ndarray | None = None
@@ -128,8 +140,8 @@ class BeamProfiler:
         self._linecut_x: int | None = None
         self._linecut_y: int | None = None
 
-        if pixel_size is not None and pixel_size <= 0:
-            raise ValueError(f"pixel_size must be greater than zero, got {pixel_size}")
+        if pixel_size is not None and not (math.isfinite(pixel_size) and pixel_size > 0):
+            raise ValueError(f"pixel_size must be a positive number, got {pixel_size}")
 
         # Kept so :meth:`attach_camera` knows whether the scale was the
         # caller's choice (honour it) or the previous camera's (re-derive it).
@@ -149,12 +161,19 @@ class BeamProfiler:
             self._mode = "camera"
 
         if self.camera:
-            self.width_pixels = self.camera.width
-            self.height_pixels = self.camera.height
-            # An explicit pixel_size wins over whatever the camera reports.
-            self.pixel_size = pixel_size if pixel_size is not None else self.camera.pixel_size
-            if exposure_time is not None:
-                self.camera.set_exposure(exposure_time)
+            try:
+                self.width_pixels = self.camera.width
+                self.height_pixels = self.camera.height
+                # An explicit pixel_size wins over whatever the camera reports.
+                self.pixel_size = pixel_size if pixel_size is not None else self.camera.pixel_size
+                if exposure_time is not None:
+                    self.camera.set_exposure(exposure_time)
+            except Exception:
+                # The camera is open by now. A GenICam device stays claimed
+                # until closed, so raising without releasing it would keep it
+                # busy -- in a notebook, until the kernel restarts.
+                self._release_camera()
+                raise
         elif file and self.last_img is not None:
             pass
         else:
@@ -189,6 +208,12 @@ class BeamProfiler:
             self.camera.open()
             self._mode = "camera"
         except Exception as e:
+            # A half-finished open() can still hold the device or its
+            # producer; close() is safe to call on it either way.
+            try:
+                self.camera.close()
+            except Exception:
+                logger.debug("Error closing a camera that failed to open", exc_info=True)
             # Don't fallback to simulated for physical cameras
             if camera_lower in ["flir", "basler"]:
                 logger.error(f"Failed to open {camera} camera: {e}")
@@ -243,12 +268,17 @@ class BeamProfiler:
         exc_val: BaseException | None,
         exc_tb: TracebackType | None,
     ) -> bool:
-        """Context manager exit — ensures camera is closed."""
-        if self.camera:
-            try:
-                self.camera.close()
-            except Exception as e:
-                logger.warning(f"Error closing camera: {e}")
+        """Context manager exit: stop any live stream, then release the camera.
+
+        The stream has to go first. Left running, a notebook stream kept
+        fetching from the closed camera, failing every frame, for as long as
+        the kernel lived.
+        """
+        try:
+            self.stop()
+        except Exception:
+            logger.warning("Error stopping the stream", exc_info=True)
+        self._release_camera()
         return False
 
     def __getattr__(self, name: str) -> object:
@@ -649,13 +679,20 @@ class BeamProfiler:
         self._last_popt_2d = None
 
     def stop(self) -> None:
-        """Stop any active continuous streams and stop camera acquisition."""
-        if hasattr(self, "_stream_task") and self._stream_task is not None:
-            self._stream_task.cancel()
-            self._stream_task = None
+        """Stop the notebook live stream, if one is running, and stop acquisition.
 
-        if self._mode == "camera" and self.camera is not None and self.camera.is_acquiring:
-            self.camera.stop_acquisition()
+        Safe to call from another cell while the stream runs. It waits for a
+        fetch already in flight to finish before stopping the camera (at most
+        ``_STREAM_FETCH_TIMEOUT``), so the stream can't restart acquisition
+        behind its back.
+        """
+        self._stream_stopping.set()
+        task, self._stream_task = self._stream_task, None
+        if task is not None:
+            task.cancel()
+        with self._stream_fetch_lock:
+            if self._mode == "camera" and self.camera is not None and self.camera.is_acquiring:
+                self.camera.stop_acquisition()
 
     def plot(
         self,
@@ -665,16 +702,23 @@ class BeamProfiler:
         """Display beam profile with Gaussian fitting visualization.
 
         Args:
-            num_img: Number of images (1 for single shot, None for continuous streaming)
-            heatmap_only: Show only heatmap for faster rendering
+            num_img: ``1`` for a single shot, ``None`` to stream continuously.
+            heatmap_only: Draw only the heatmap, without the profile curves.
 
         Returns:
             In single-shot or static mode, returns `None`.
-            In streaming mode within a Jupyter environment, returns the background `asyncio.Task`
-            powering the live visualization. This allows calling `.cancel()` on the task to stop
-            the loop programmatically. Outside of Jupyter (terminal Dash/matplotlib), returns `None`
-            as it inherently binds to the main process until interrupted (e.g. Ctrl-C).
+            In streaming mode within a Jupyter kernel, returns the background
+            `asyncio.Task` powering the live visualization; :meth:`stop` ends
+            it. Anywhere else the Dash GUI is served and this blocks until
+            Ctrl+C, returning `None`.
+
+        Raises:
+            ValueError: For any *num_img* other than 1 or None. Nothing
+                captures a fixed number of frames, and quietly streaming
+                forever instead is worse than saying so.
         """
+        if num_img is not None and num_img != 1:
+            raise ValueError(f"num_img must be 1 (a single shot) or None (stream), got {num_img}")
 
         self._heatmap_only = heatmap_only  # Store for _plot_stream to use
 
@@ -827,12 +871,13 @@ class BeamProfiler:
         title = "<b>Beam Profile</b><br>"
         title += self._camera_info_html()
         title += (
-            f"<span style='font-size:14px'>Width: X={self.width_x:.1f}μm, Y={self.width_y:.1f}μm | "
+            f"<span style='font-size:14px'>Width: X={_fmt(self.width_x)}μm, "
+            f"Y={_fmt(self.width_y)}μm | "
         )
-        title += f"Center: ({center_x_um:.1f}, {center_y_um:.1f})μm</span><br>"
+        title += f"Center: ({_fmt(center_x_um)}, {_fmt(center_y_um)})μm</span><br>"
         title += f"<span style='font-size:12px'>Peak={self.peak_value:.0f}"
         if self.fit_method == "2d":
-            title += f" | Angle={self.angle_deg:.1f}°"
+            title += f" | Angle={_fmt(self.angle_deg)}°"
         title += "</span>"
 
         h, w = image.shape
@@ -1040,12 +1085,13 @@ class BeamProfiler:
         title = f"<b>Beam Profile Analysis - {self.definition.upper()}</b><br>"
         title += self._camera_info_html()
         title += (
-            f"<span style='font-size:14px'>Width: X={self.width_x:.1f}μm, Y={self.width_y:.1f}μm | "
+            f"<span style='font-size:14px'>Width: X={_fmt(self.width_x)}μm, "
+            f"Y={_fmt(self.width_y)}μm | "
         )
-        title += f"Center: ({center_x_um:.1f}, {center_y_um:.1f})μm | "
+        title += f"Center: ({_fmt(center_x_um)}, {_fmt(center_y_um)})μm | "
         title += f"Peak: {self.peak_value:.0f}"
         if self.fit_method == "2d":
-            title += f" | Angle: {self.angle_deg:.1f}°"
+            title += f" | Angle: {_fmt(self.angle_deg)}°"
         title += "</span>"
 
         fig.update_layout(
@@ -1117,13 +1163,20 @@ class BeamProfiler:
         return fig
 
     def _plot_single(self) -> None:
-        """Capture and plot single image."""
+        """Capture one frame (or take the loaded file), analyse it, and show it."""
         if self._mode == "camera":
-            if self.camera is None:
+            camera = self.camera
+            if camera is None:
                 raise RuntimeError("Camera is not initialized")
-            self.camera.start_acquisition()
-            img = self.camera.get_image()
-            self.camera.stop_acquisition()
+            # Leave acquisition as it was found, even if the fetch fails.
+            was_acquiring = camera.is_acquiring
+            if not was_acquiring:
+                camera.start_acquisition()
+            try:
+                img = camera.get_image()
+            finally:
+                if not was_acquiring:
+                    camera.stop_acquisition()
         else:
             img = self.last_img
 
@@ -1137,9 +1190,10 @@ class BeamProfiler:
     def _plot_stream(self) -> asyncio.Task[None] | None:
         """Start continuous streaming with live updates.
 
-        In a Jupyter environment, returns a background ``asyncio.Task`` driving
-        the live loop.  Outside Jupyter, falls back to Dash or matplotlib and
-        returns ``None`` (blocks until interrupted).
+        Inside a Jupyter kernel this starts a background ``asyncio.Task``
+        that redraws the figure in the cell, and returns it. Anywhere else --
+        a terminal, a script, a terminal IPython session -- it serves the
+        Dash GUI and blocks until Ctrl+C, returning ``None``.
         """
         if self._mode == "camera":
             if self.camera is None:
@@ -1147,270 +1201,209 @@ class BeamProfiler:
             if not self.camera.is_acquiring:
                 self.camera.start_acquisition()
 
-        heatmap_only = getattr(self, "_heatmap_only", False)
+        if _in_notebook():
+            return self._start_notebook_stream()
+        self._serve_dash()
+        return None
 
-        try:
-            from IPython import get_ipython
-            from IPython.display import clear_output, display
+    def _next_frame(self) -> np.ndarray | None:
+        """The next frame for the notebook stream, or ``None`` if there isn't one yet.
 
-            if get_ipython() is None:
-                raise ImportError("Not in IPython")
-
-            if heatmap_only:
-                logger.info("Starting live stream (heatmap only)...")
-            else:
-                logger.info("Starting live stream...")
-            logger.info("Call profiler.stop() or cancel the returned task to stop\n")
-
-            async def jupyter_stream_loop():
-                frame_count = 0
-                start_time = time.time()
+        Runs in a worker thread. It holds ``_stream_fetch_lock`` for the whole
+        fetch, which is what lets :meth:`stop` wait out a fetch already in
+        flight: cancelling the asyncio task does not stop its thread, and a
+        fetch that began after ``stop_acquisition()`` would quietly start
+        acquisition again (GenICam cameras restart on demand).
+        """
+        with self._stream_fetch_lock:
+            if self._stream_stopping.is_set():
+                return None
+            if self._mode == "camera" and self.camera is not None:
                 try:
-                    while True:
-                        try:
-                            # Yield to the kernel event loop so interrupts and
-                            # other callbacks can fire promptly.
-                            await asyncio.sleep(0)
+                    return self.camera.get_image(timeout=_STREAM_FETCH_TIMEOUT)
+                except TimeoutError:
+                    return None
+            return self.last_img
 
-                            if self._mode == "camera" and self.camera is not None:
-                                # Camera fetch can block on the producer; run
-                                # it in a thread so the event loop stays free.
-                                img = await asyncio.to_thread(self.camera.get_image)
-                            else:
-                                img = self.last_img
-                            if img is None:
-                                if (
-                                    self._mode == "camera"
-                                    and self.camera is not None
-                                    and not self.camera.is_acquiring
-                                ):
-                                    break
-                                await asyncio.sleep(0.01)
-                                continue
+    def _start_notebook_stream(self) -> asyncio.Task[None] | None:
+        """Run the live figure in the current notebook cell."""
+        from IPython.display import clear_output, display
 
-                            popt_x, popt_y = await asyncio.to_thread(self.analyze, img)
+        heatmap_only = self._heatmap_only
+        # Re-running the cell must not leave the previous loop fetching from
+        # the same camera behind a new one.
+        previous, self._stream_task = self._stream_task, None
+        if previous is not None and not previous.done():
+            previous.cancel()
+        self._stream_stopping.clear()
 
-                            if heatmap_only:
-                                fig = await asyncio.to_thread(
-                                    self._create_fast_figure, img, popt_x, popt_y
-                                )
-                            else:
-                                fig = await asyncio.to_thread(
-                                    self._create_figure, img, popt_x, popt_y
-                                )
+        logger.info("Starting live stream%s...", " (heatmap only)" if heatmap_only else "")
+        logger.info("Call profiler.stop() or cancel the returned task to stop\n")
 
-                            frame_count += 1
-                            elapsed = time.time() - start_time
-                            fps = frame_count / elapsed if elapsed > 0 else 0
-
-                            current_title = fig.layout.title.text if fig.layout.title else ""
-                            fig.update_layout(
-                                title_text=(
-                                    f"{current_title}<br>"
-                                    f"<span style='font-size:11px; color:#666'>"
-                                    f"Frame #{frame_count} | FPS: {fps:.1f}</span>"
-                                )
-                            )
-
-                            clear_output(wait=True)
-                            display(fig)
-
-                        except Exception as e:
-                            # Keep the stream alive across transient frame
-                            # errors (timeouts, malformed frames, etc.).
-                            logger.debug(f"Frame error in stream loop: {e}")
+        async def stream() -> None:
+            frame_count = 0
+            failures = 0
+            start_time = time.time()
+            try:
+                while not self._stream_stopping.is_set():
+                    # Yield to the kernel's event loop so interrupts and other
+                    # callbacks get their turn between frames.
+                    await asyncio.sleep(0)
+                    try:
+                        img = await asyncio.to_thread(self._next_frame)
+                        if img is None:
                             await asyncio.sleep(0.01)
                             continue
-
-                except asyncio.CancelledError:
-                    pass
-                except KeyboardInterrupt:
-                    pass
-                finally:
+                        popt_x, popt_y = await asyncio.to_thread(self.analyze, img)
+                        build = self._create_fast_figure if heatmap_only else self._create_figure
+                        fig = await asyncio.to_thread(build, img, popt_x, popt_y)
+                    except Exception as e:
+                        # One bad frame shouldn't end the stream, but a camera
+                        # that has gone away fails every frame, and would
+                        # otherwise retry forever without a word.
+                        failures += 1
+                        if failures >= _MAX_STREAM_FAILURES:
+                            logger.warning(
+                                "Live stream stopped after %d failed frames in a row: %s",
+                                failures,
+                                e,
+                            )
+                            break
+                        logger.log(
+                            logging.WARNING if failures == 1 else logging.DEBUG,
+                            "Live stream frame failed: %s",
+                            e,
+                        )
+                        await asyncio.sleep(0.05)
+                        continue
+                    failures = 0
+                    frame_count += 1
                     elapsed = time.time() - start_time
                     fps = frame_count / elapsed if elapsed > 0 else 0
-                    logger.info(
-                        f"\nStream stopped: {frame_count} frames in {elapsed:.1f}s ({fps:.1f} fps)"
-                    )
-
-            try:
-                loop = asyncio.get_running_loop()
-                task = loop.create_task(jupyter_stream_loop())
-                self._stream_task = task
-                return task
-            except RuntimeError:
-                asyncio.run(jupyter_stream_loop())
-
-        except (NameError, ImportError):
-            try:
-                import dash  # noqa: F401
-            except ImportError:
-                logger.info("\nDash not available. Using matplotlib fallback.")
-                logger.info("Install dash for better performance: pip install dash\n")
-
-                try:
-                    import matplotlib.pyplot as plt  # ty: ignore[unresolved-import]
-                    from matplotlib.animation import FuncAnimation  # ty: ignore[unresolved-import]
-                    from matplotlib.patches import Ellipse  # ty: ignore[unresolved-import]
-
-                    fig_plt, axes = plt.subplots(2, 2, figsize=(10, 8))
-                    fig_plt.tight_layout(pad=3.0)
-
-                    def update_frame(frame_num):
-                        img = (
-                            self.camera.get_image()
-                            if self._mode == "camera" and self.camera is not None
-                            else self.last_img
+                    current_title = fig.layout.title.text if fig.layout.title else ""
+                    fig.update_layout(
+                        title_text=(
+                            f"{current_title}<br>"
+                            f"<span style='font-size:11px; color:#666'>"
+                            f"Frame #{frame_count} | FPS: {fps:.1f}</span>"
                         )
-                        if img is None:
-                            return
-
-                        popt_x, popt_y = self.analyze(img)
-
-                        # Clear all axes
-                        for ax in axes.flat:
-                            ax.clear()
-
-                        # Beam image
-                        axes[1, 0].imshow(img, cmap="viridis")
-                        axes[1, 0].set_title("Beam Image")
-                        axes[1, 0].set_xlabel("X (pixels)")
-                        axes[1, 0].set_ylabel("Y (pixels)")
-
-                        # Add ellipse overlay
-                        if popt_x is not None and popt_y is not None:
-                            cx, cy = popt_x[1], popt_y[1]
-                            width_px, height_px = 4 * abs(popt_x[2]), 4 * abs(popt_y[2])
-                            ellipse = Ellipse(
-                                (cx, cy),
-                                width_px,
-                                height_px,
-                                fill=False,
-                                edgecolor="red",
-                                linewidth=2,
-                                linestyle="--",
-                            )
-                            axes[1, 0].add_patch(ellipse)
-
-                        # X profile
-                        x = np.arange(img.shape[1])
-                        proj_x = np.sum(img, axis=0)
-                        axes[0, 0].plot(x, proj_x, "o", markersize=2, label="Data")
-                        if popt_x is not None:
-                            fitted_x = BeamProfiler.gaussian(x, *popt_x)
-                            axes[0, 0].plot(x, fitted_x, "r-", label="Fit")
-                        axes[0, 0].set_title("X Profile")
-                        axes[0, 0].set_xlabel("X (pixels)")
-                        axes[0, 0].legend()
-
-                        # Y profile
-                        y = np.arange(img.shape[0])
-                        proj_y = np.sum(img, axis=1)
-                        axes[1, 1].plot(proj_y, y, "o", markersize=2, label="Data")
-                        if popt_y is not None:
-                            fitted_y = BeamProfiler.gaussian(y, *popt_y)
-                            axes[1, 1].plot(fitted_y, y, "r-", label="Fit")
-                        axes[1, 1].set_title("Y Profile")
-                        axes[1, 1].set_ylabel("Y (pixels)")
-                        axes[1, 1].invert_xaxis()
-                        axes[1, 1].legend()
-
-                        # Info panel
-                        axes[0, 1].axis("off")
-                        info_text = f"Frame: {frame_num}\n\n"
-                        info_text += f"Width X: {self.width_x:.1f} μm\n"
-                        info_text += f"Width Y: {self.width_y:.1f} μm\n"
-                        info_text += f"Center: ({self.center_x:.1f}, {self.center_y:.1f})\n"
-                        if self.fit_method == "2d":
-                            info_text += f"Angle: {self.angle_deg:.1f}°\n"
-                        info_text += f"Peak: {self.peak_value:.0f}"
-                        axes[0, 1].text(
-                            0.1,
-                            0.5,
-                            info_text,
-                            fontsize=12,
-                            verticalalignment="center",
-                            family="monospace",
-                        )
-
-                    print("\nStarting matplotlib animation. Press Ctrl+C to stop.\n", flush=True)
-                    _anim = FuncAnimation(
-                        fig_plt, update_frame, interval=50, cache_frame_data=False
                     )
-                    plt.show()
-
-                except ImportError:
-                    logger.error("ERROR: Neither dash nor matplotlib is installed.")
-                    logger.error("   Install one of them:")
-                    logger.error("   - pip install dash (recommended for streaming)")
-                    logger.error("   - pip install matplotlib")
-                    return
-
-                return
-
-            from .dash_app import create_app
-
-            app = create_app(self)
-
-            url = f"http://127.0.0.1:{DEFAULT_DASH_PORT}"
-            print(f"\npyBeamprofiler running at {url}")
-            print("Press Ctrl+C to stop.\n", flush=True)
-            logger.info(f"Starting Dash server at {url}")
-            logger.info("Opening browser automatically...")
-
-            # Suppress dev-server chatter so the only startup output users see
-            # is the two lines above. Werkzeug/Flask still print errors.
-            logging.getLogger("werkzeug").setLevel(logging.ERROR)
-            logging.getLogger("dash").setLevel(logging.WARNING)
-            logging.getLogger("dash.dash").setLevel(logging.WARNING)
-            try:
-                import flask.cli as _flask_cli
-
-                _flask_cli.show_server_banner = lambda *a, **kw: None  # ty: ignore[invalid-assignment]
-            except ImportError:
+                    clear_output(wait=True)
+                    display(fig)
+            except (asyncio.CancelledError, KeyboardInterrupt):
                 pass
-
-            if os.environ.get("PYBEAMPROFILER_NO_BROWSER") != "1":
-
-                def open_browser() -> None:
-                    time.sleep(0.5)
-                    webbrowser.open(f"http://127.0.0.1:{DEFAULT_DASH_PORT}")
-
-                threading.Thread(target=open_browser, daemon=True).start()
-
-            def _sigint_handler(signum: int, frame: Any) -> None:
-                if self._mode == "camera" and self.camera is not None:
-                    try:
-                        if self.camera.is_acquiring:
-                            self.camera.stop_acquisition()
-                        self.camera.close()
-                    except Exception:
-                        pass
-                raise KeyboardInterrupt
-
-            # Signal handlers can only be installed from the main thread; when
-            # plot() is driven from a worker thread we just skip the tidy
-            # shutdown rather than failing outright.
-            prev_handler: Any = None
-            try:
-                prev_handler = signal.getsignal(signal.SIGINT)
-                signal.signal(signal.SIGINT, _sigint_handler)
-            except ValueError:
-                logger.debug("Not on the main thread; skipping SIGINT handler")
-                prev_handler = None
-
-            try:
-                app.run(debug=False, port=DEFAULT_DASH_PORT, use_reloader=False)
-            except KeyboardInterrupt:
-                logger.info("\nStopping Dash server...")
             finally:
-                if prev_handler is not None:
-                    signal.signal(signal.SIGINT, prev_handler)
+                elapsed = time.time() - start_time
+                fps = frame_count / elapsed if elapsed > 0 else 0
+                logger.info(
+                    f"\nStream stopped: {frame_count} frames in {elapsed:.1f}s ({fps:.1f} fps)"
+                )
+
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            # A kernel normally runs cells inside its event loop. Without one
+            # there is nothing to schedule a task on, so run the stream here
+            # until it is interrupted.
+            asyncio.run(stream())
+            return None
+        task = loop.create_task(stream())
+        self._stream_task = task
+        return task
+
+    def _serve_dash(self) -> None:
+        """Serve the Dash GUI on localhost and block until Ctrl+C."""
+        from . import dash_app
+
+        app = dash_app.create_app(self)
+
+        url = f"http://127.0.0.1:{DEFAULT_DASH_PORT}"
+        print(f"\npyBeamprofiler running at {url}")
+        print("Press Ctrl+C to stop.\n", flush=True)
+        logger.info(f"Starting Dash server at {url}")
+
+        # Suppress dev-server chatter so the only startup output users see
+        # is the two lines above. Werkzeug/Flask still print errors.
+        logging.getLogger("werkzeug").setLevel(logging.ERROR)
+        logging.getLogger("dash").setLevel(logging.WARNING)
+        logging.getLogger("dash.dash").setLevel(logging.WARNING)
+        try:
+            import flask.cli as _flask_cli
+
+            _flask_cli.show_server_banner = lambda *a, **kw: None  # ty: ignore[invalid-assignment]
+        except ImportError:
+            pass
+
+        if os.environ.get("PYBEAMPROFILER_NO_BROWSER") != "1":
+
+            def open_browser() -> None:
+                time.sleep(0.5)
+                webbrowser.open(url)
+
+            threading.Thread(target=open_browser, daemon=True).start()
+
+        try:
+            # The host is pinned. Left out, Dash takes it from $HOST, and with
+            # HOST=0.0.0.0 in the environment the GUI -- no authentication,
+            # and it writes camera settings -- would be open to the whole
+            # network while the line above promises localhost.
+            app.run(host="127.0.0.1", port=DEFAULT_DASH_PORT, debug=False, use_reloader=False)
+        except KeyboardInterrupt:
+            pass
+        finally:
+            # werkzeug swallows the Ctrl+C that stops it, so shutdown happens
+            # here rather than in a signal handler. Its request threads can
+            # still be in the middle of a tick: pausing the ticks first and
+            # then taking their lock means none of them is mid-fetch when the
+            # camera closes, and none starts another fetch afterwards.
+            logger.info("Stopping Dash server...")
+            dash_app._server_paused = True
+            with dash_app._callback_lock:
+                self._release_camera()
+
+    def _release_camera(self) -> None:
+        """Stop acquisition and close the camera, logging rather than raising."""
+        camera = self.camera
+        if camera is None:
+            return
+        try:
+            if camera.is_acquiring:
+                camera.stop_acquisition()
+            camera.close()
+        except Exception:
+            logger.warning("Error releasing the camera", exc_info=True)
 
 
-def main() -> None:
-    """CLI entry point for pyBeamprofiler."""
+def _fmt(value: float, spec: str = ".1f") -> str:
+    """Format a measured value for a title, with a dash for "no measurement"."""
+    return format(value, spec) if math.isfinite(value) else "—"
+
+
+def _in_notebook() -> bool:
+    """Whether this is running inside a Jupyter kernel.
+
+    ``get_ipython()`` alone can't tell: a terminal IPython session has one
+    too, but no kernel and nothing to draw into. Sent down the notebook path,
+    it ran the loop with ``asyncio.run`` and plotly opened a browser tab for
+    every single frame.
+    """
+    try:
+        from IPython import get_ipython
+    except ImportError:
+        return False
+    shell = get_ipython()
+    return shell is not None and getattr(shell, "kernel", None) is not None
+
+
+def main() -> int:
+    """CLI entry point for pyBeamprofiler.
+
+    Returns:
+        The process exit status: 0, or 1 if the profiler could not start.
+    """
     parser = argparse.ArgumentParser(
+        # Without this, ``python -m pybeamprofiler`` calls itself __main__.py.
+        prog="pybeamprofiler",
         description="pyBeamprofiler - Laser beam profiler with Gaussian fitting",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
@@ -1426,9 +1419,6 @@ def main() -> None:
 
         # Basler camera with 2D fitting and FWHM definition
         pybeamprofiler --camera basler --fit 2d --definition fwhm
-
-        # Fast mode (heatmap only)
-        pybeamprofiler --heatmap-only
         """,
     )
 
@@ -1480,12 +1470,12 @@ def main() -> None:
         "--num-img",
         type=int,
         default=None,
-        help="Number of images: 1 for single shot, None for continuous (default: continuous)",
+        help="1 for a single shot; omit to stream continuously",
     )
     parser.add_argument(
         "--heatmap-only",
         action="store_true",
-        help="Show only heatmap for faster display (~8-12 Hz in Jupyter)",
+        help="Draw only the heatmap, without the profile curves",
     )
 
     parser.add_argument(
@@ -1504,46 +1494,44 @@ def main() -> None:
 
     if args.file and args.pixel_size is None:
         parser.error("--pixel-size is required with --file (e.g. --pixel-size 5.86)")
-    if args.pixel_size is not None and args.pixel_size <= 0:
-        parser.error("--pixel-size must be greater than zero")
+    if args.pixel_size is not None and not (math.isfinite(args.pixel_size) and args.pixel_size > 0):
+        parser.error("--pixel-size must be a positive number")
+    if args.num_img is not None and args.num_img != 1:
+        parser.error("--num-img only supports 1 (a single shot); omit it to stream")
 
     logger.info("Initializing pyBeamprofiler...")
     logger.info(f"   Camera: {args.file if args.file else args.camera}")
     logger.info(f"   Fitting: {args.fit} ({args.definition})")
 
-    bp = BeamProfiler(
-        camera=None if args.file else args.camera,
-        file=args.file,
-        fit=args.fit,
-        definition=args.definition,
-        exposure_time=args.exposure_time,
-        pixel_size=args.pixel_size,
-    )
-
-    logger.info(f"   Sensor: {bp.width_pixels}×{bp.height_pixels} pixels")
-    logger.info(f"   Pixel size: {bp.pixel_size:.2f} μm")
-
-    if args.num_img == 1:
-        logger.info("Single shot acquisition...")
-    else:
-        logger.info("Starting continuous streaming...")
-
+    bp: BeamProfiler | None = None
     try:
+        bp = BeamProfiler(
+            camera=None if args.file else args.camera,
+            file=args.file,
+            fit=args.fit,
+            definition=args.definition,
+            exposure_time=args.exposure_time,
+            pixel_size=args.pixel_size,
+        )
+
+        logger.info(f"   Sensor: {bp.width_pixels}×{bp.height_pixels} pixels")
+        logger.info(f"   Pixel size: {bp.pixel_size:.2f} μm")
+        logger.info("Single shot acquisition..." if args.num_img == 1 else "Streaming...")
+
         bp.plot(num_img=args.num_img, heatmap_only=args.heatmap_only)
     except KeyboardInterrupt:
         print("\nStopped by user (Ctrl+C).")
-    except Exception:
-        logger.error("Fatal error during plotting", exc_info=True)
+    except Exception as e:
+        # A camera that isn't plugged in is the common case here; it deserves
+        # a one-line message rather than a traceback, unless asked for one.
+        logger.debug("Fatal error", exc_info=True)
+        print(f"pybeamprofiler: error: {e}", file=sys.stderr)
+        return 1
     finally:
-        if hasattr(bp, "camera") and bp.camera:
-            try:
-                if bp.camera.is_acquiring:
-                    bp.camera.stop_acquisition()
-                bp.camera.close()
-                logger.info("Camera closed")
-            except Exception:
-                logger.debug("Camera cleanup error (already released)", exc_info=True)
+        if bp is not None:
+            bp._release_camera()
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
