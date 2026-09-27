@@ -699,7 +699,8 @@ class BeamProfiler:
         self._ellipse = None
         self._linecut_x = None
         self._linecut_y = None
-        self.last_img = None
+        if getattr(self, "_mode", None) != "static":
+            self.last_img = None
         self.width_x = math.nan
         self.width_y = math.nan
         self.center_x = math.nan

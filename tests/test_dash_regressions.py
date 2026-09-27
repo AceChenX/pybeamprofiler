@@ -1190,3 +1190,29 @@ class TestHeatmapOnlyModeIsHonoured:
         bp = _profiler()
         fig = _tick(_callbacks(bp))[0]
         assert len(self._curves(fig)) == 4
+
+
+class TestFileModeSurvivesARestartOfTheFits:
+    """A static file's frame lives in ``bp.last_img``, and nothing can fetch
+    it again. Resetting the analysis on a definition or fit-method change
+    used to clear it, and the view froze on the old figure for good."""
+
+    @staticmethod
+    def _file_profiler(tmp_path: Any) -> BeamProfiler:
+        from PIL import Image
+
+        y, x = np.mgrid[0:64, 0:80]
+        img = (200 * np.exp(-((x - 40) ** 2 + (y - 30) ** 2) / (2 * 6.0**2)) + 10).astype(np.uint8)
+        path = tmp_path / "beam.png"
+        Image.fromarray(img).save(path)
+        return BeamProfiler(file=str(path), pixel_size=5.0)
+
+    @pytest.mark.parametrize("change", [{"definition": "fwhm"}, {"analysis": "2d"}])
+    def test_the_image_is_still_drawn_after_the_change(self, tmp_path, change):
+        bp = self._file_profiler(tmp_path)
+        cbs = _callbacks(bp)
+        assert isinstance(_tick(cbs)[0], go.Figure)
+        figure = _tick(cbs, **change)[0]
+        assert isinstance(figure, go.Figure), "the tick found no image to draw"
+        assert bp.last_img is not None
+        assert np.isfinite(bp.width_x)
