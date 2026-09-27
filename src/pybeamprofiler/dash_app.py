@@ -68,31 +68,42 @@ logger = logging.getLogger(__name__)
 _PROFILE_FRACTION = 0.15
 
 # Saturation warning thresholds.
-_SATURATION_PIXEL_FRACTION = 0.001  # 0.1% of pixels at the dtype max ⇒ warn.
+_SATURATION_PIXEL_FRACTION = 0.001  # 0.1% of pixels at the saturation level ⇒ warn.
 
 
-def _saturation_max(image: np.ndarray) -> float:
-    """Return the saturation level for *image* given its dtype.
+def _saturation_max(image: np.ndarray, bit_depth: int | None = None) -> float:
+    """Return the saturation level for *image*.
 
-    For integer images this is the dtype's largest representable value
-    (e.g. 255 for ``uint8``, 65535 for ``uint16``, 4095 for a 12-bit
-    sensor packed in ``uint16`` is reported as 65535 — we cannot tell
-    "real" bit depth from the dtype alone, so the warning is conservative).
-    For floating-point images we assume normalised ``[0, 1]`` data when the
-    observed max is ≤ 1, otherwise use the observed max as a heuristic.
+    For integer images this is ``2**bit_depth - 1`` when the camera reports
+    its bit depth, and otherwise the dtype's largest value. The dtype alone
+    cannot tell a 12-bit sensor packed in ``uint16`` from a 16-bit one, so
+    without the bit depth the level there is 65535 and a clipped 12-bit
+    frame is never flagged. For floating-point images we assume normalised
+    ``[0, 1]`` data when the observed max is ≤ 1, otherwise use the observed
+    max as a heuristic.
     """
     if np.issubdtype(image.dtype, np.integer):
-        return float(np.iinfo(image.dtype).max)
+        dtype_max = float(np.iinfo(image.dtype).max)
+        if bit_depth:
+            # A Mono8 stream from a 12-bit sensor still clips at 255.
+            return min(float(2**bit_depth - 1), dtype_max)
+        return dtype_max
     obs_max = float(image.max()) if image.size else 1.0
     return 1.0 if obs_max <= 1.0 else obs_max
 
 
-def _saturation_fraction(image: np.ndarray) -> float:
-    """Fraction of pixels at or above the dtype's saturation level."""
+def _saturation_fraction(image: np.ndarray, level: float | None = None) -> float:
+    """Fraction of pixels at or above the saturation level.
+
+    Args:
+        image: The frame to check.
+        level: The saturation level, from :func:`_saturation_max`; derived
+            from the dtype when not given.
+    """
     if image.size == 0:
         return 0.0
-    sat = _saturation_max(image)
-    # For integer images, only the exact dtype max counts as saturated.
+    sat = _saturation_max(image) if level is None else level
+    # For integer images, only the exact saturation value counts.
     # For floating-point images, allow a small epsilon near the inferred max.
     threshold = sat if np.issubdtype(image.dtype, np.integer) else sat - 1e-6
     # A plain max() reduction is several times cheaper than the comparison
@@ -101,6 +112,15 @@ def _saturation_fraction(image: np.ndarray) -> float:
     if float(image.max()) < threshold:
         return 0.0
     return float(np.count_nonzero(image >= threshold)) / image.size
+
+
+def _camera_bit_depth(bp: BeamProfiler) -> int | None:
+    """The attached camera's reported bit depth, or ``None`` if unknown."""
+    depth = getattr(bp.camera, "bit_depth", None) if bp.camera is not None else None
+    # Anything but a plausible int (a mock's attribute, a bool) means unknown.
+    if isinstance(depth, bool) or not isinstance(depth, int) or not 1 <= depth <= 32:
+        return None
+    return depth
 
 
 # ---------------------------------------------------------------------------
@@ -554,8 +574,20 @@ def _measured_fps() -> float:
     return (len(_recent_frame_times) - 1) / span
 
 
-def _build_status(bp: BeamProfiler, img: np.ndarray, frame_count: int) -> Any:
-    """Build the status bar contents (frame, fps, exposure, gain, saturation)."""
+def _build_status(
+    bp: BeamProfiler, img: np.ndarray, frame_count: int, raw: np.ndarray | None = None
+) -> Any:
+    """Build the status bar contents (frame, fps, exposure, gain, saturation).
+
+    Args:
+        bp: The profiler, read for the camera's exposure, gain and bit depth.
+        img: The frame as displayed.
+        frame_count: Frames shown so far.
+        raw: The frame as the camera delivered it, if *img* is an average.
+            Saturation is judged on this one: the beam jitters, so a core
+            clipped in every raw frame rarely stays at the maximum in all of
+            them, and the averaged frame hid the clipping entirely.
+    """
     pieces: list[Any] = [f"Frame #{frame_count}"]
 
     fps = _measured_fps()
@@ -577,7 +609,9 @@ def _build_status(bp: BeamProfiler, img: np.ndarray, frame_count: int) -> Any:
             children.append(html.Span(" · ", className="text-muted mx-1"))
         children.append(html.Span(p))
 
-    sat = _saturation_fraction(img)
+    frame = img if raw is None else raw
+    level = _saturation_max(frame, _camera_bit_depth(bp))
+    sat = _saturation_fraction(frame, level)
     if sat >= _SATURATION_PIXEL_FRACTION:
         children.append(html.Span(" · ", className="text-muted mx-1"))
         children.append(
@@ -589,7 +623,7 @@ def _build_status(bp: BeamProfiler, img: np.ndarray, frame_count: int) -> Any:
                 className="text-danger fw-bold",
                 title=(
                     f"{sat * 100:.2f}% of pixels reached the saturation level "
-                    f"({_saturation_max(img):.0f}). Reduce exposure or gain."
+                    f"({level:.0f}). Reduce exposure or gain."
                 ),
             )
         )
@@ -1374,13 +1408,14 @@ def _register_callbacks(app: dash.Dash, bp: BeamProfiler) -> None:
             if img is None:
                 return (dash.no_update,) * 4
 
+            raw = img
             img = _averaged_image(img, avg_n or 1)
             bp.last_img = img
             popt_x, popt_y = bp.analyze(img)
 
             cs = cs_name if color_on else GRAY_COLORSCALE
             zmin = None if auto_range else (zmin_val if zmin_val is not None else 0)
-            zmax_default = _saturation_max(img)
+            zmax_default = _saturation_max(raw, _camera_bit_depth(bp))
             zmax = None if auto_range else (zmax_val if zmax_val is not None else zmax_default)
             # Read the live source of truth (mutated by Auto-fit, Reset and
             # mouse zooms under ``_callback_lock``) instead of capturing it as
@@ -1406,7 +1441,7 @@ def _register_callbacks(app: dash.Dash, bp: BeamProfiler) -> None:
             return (
                 fig,
                 _format_results(bp),
-                _build_status(bp, img, frame_count),
+                _build_status(bp, img, frame_count, raw=raw),
                 frame_count,
             )
         except Exception:

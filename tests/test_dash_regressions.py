@@ -16,6 +16,7 @@ from unittest.mock import patch
 
 import dash
 import numpy as np
+import plotly.graph_objs as go
 import pytest
 from dash import html
 from dash.development.base_component import Component
@@ -610,3 +611,79 @@ class TestOverlaysStayLiveUnderModelFreeDefinitions:
         cbs = _callbacks(bp)
         assert "Angle" in str(_tick(cbs, analysis="2d")[1])
         assert "Angle" not in str(_tick(cbs, analysis="2d", definition="fwhm")[1])
+
+
+def _feed(bp: BeamProfiler, frames: list[np.ndarray]) -> None:
+    """Make the attached camera deliver *frames*, round and round."""
+    import itertools
+
+    assert bp.camera is not None
+    source = itertools.cycle(frames)
+    bp.camera.get_image = lambda timeout=None: next(source)  # ty: ignore[invalid-assignment]
+
+
+def _saturated(status: Any) -> bool:
+    return "saturated" in str(status)
+
+
+class TestAveragingDoesNotHideSaturation:
+    """The saturation warning was computed on the averaged frame. A jittering
+    beam's clipped core rarely sits at the maximum in every frame of the
+    window, so with averaging on the warning vanished: on the simulator at 14
+    ms it showed in 0 of 20 ticks at N=4 and N=16, while 13-14 of the 20 raw
+    frames were clipped."""
+
+    def test_a_clipped_raw_frame_is_flagged_through_the_average(self):
+        bp = BeamProfiler(camera="simulated")
+        # Two frames clipped in different places: no pixel is at 255 in both,
+        # so their average never reaches it.
+        left = np.full((64, 64), 20, dtype=np.uint8)
+        left[:, :8] = 255
+        right = np.full((64, 64), 20, dtype=np.uint8)
+        right[:, -8:] = 255
+        _feed(bp, [left, right])
+        cbs = _callbacks(bp)
+
+        statuses = [_tick(cbs, avg_n=4)[2] for _ in range(4)]
+
+        assert bp.last_img is not None and bp.last_img.max() < 255
+        assert all(_saturated(s) for s in statuses)
+
+
+class TestSaturationUsesTheSensorsBitDepth:
+    """With only the dtype to go on, a 12-bit sensor packed in uint16 was
+    judged against 65535 and never flagged, however clipped. The camera's
+    reported bit depth now sets the level."""
+
+    @staticmethod
+    def _twelve_bit() -> BeamProfiler:
+        bp = BeamProfiler(camera="simulated")
+        assert bp.camera is not None
+        bp.camera.bit_depth = 12  # ty: ignore[unresolved-attribute]
+        frame = np.full((64, 64), 300, dtype=np.uint16)
+        frame[:4, :] = 4095  # 6% of the sensor clipped
+        _feed(bp, [frame])
+        return bp
+
+    def test_a_clipped_12_bit_frame_is_flagged(self):
+        status = _tick(_callbacks(self._twelve_bit()))[2]
+        assert _saturated(status)
+        assert "(4095)" in str(status)
+
+    def test_the_manual_colour_range_tops_out_at_the_sensor_maximum(self):
+        cbs = _callbacks(self._twelve_bit())
+        with patch("pybeamprofiler.dash_app.build_figure", return_value=go.Figure()) as build:
+            _tick(cbs, auto_range=False)
+        assert build.call_args.kwargs["zmax"] == 4095
+
+    def test_a_narrower_stream_still_clips_at_its_own_maximum(self):
+        """Mono8 from a 12-bit sensor clips at 255, not 4095."""
+        frame = np.full((8, 8), 255, dtype=np.uint8)
+        assert dash_app._saturation_max(frame, 12) == 255
+
+    @pytest.mark.parametrize("depth", [None, True, 0, 64, "12", 12.0])
+    def test_anything_but_a_plausible_integer_is_ignored(self, depth):
+        bp = BeamProfiler(camera="simulated")
+        assert bp.camera is not None
+        bp.camera.bit_depth = depth  # ty: ignore[unresolved-attribute]
+        assert dash_app._camera_bit_depth(bp) is None
