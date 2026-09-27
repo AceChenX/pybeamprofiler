@@ -564,6 +564,49 @@ class TestFitFailures:
         bp.camera.close()
 
 
+class TestAttachCamera:
+    def test_attaching_the_camera_already_in_use_changes_nothing(self):
+        """No close (which would release the device mid-use), no reset."""
+        bp = BeamProfiler(camera="simulated")
+        camera = bp.camera
+        assert camera is not None
+        bp.analyze(camera.get_image())
+        cached = bp._last_popt_x
+        with patch.object(type(camera), "close") as close:
+            bp.attach_camera(camera)
+        close.assert_not_called()
+        assert bp.camera is camera
+        assert bp._last_popt_x is cached
+
+    def test_a_new_camera_replaces_and_closes_the_old_one(self):
+        from pybeamprofiler.simulated import SimulatedCamera, profile_for
+
+        bp = BeamProfiler(camera="simulated")
+        old = bp.camera
+        assert old is not None
+        bp.analyze(old.get_image())
+        new = SimulatedCamera(profile_for("sim-2"))
+        new.open()
+        with patch.object(SimulatedCamera, "close", autospec=True) as close:
+            bp.attach_camera(new)
+        close.assert_called_once_with(old)
+        assert bp.camera is new
+        assert bp._last_popt_x is None and math.isnan(bp.width_x)
+        assert (bp.width_pixels, bp.height_pixels) == (1280, 1024)
+        assert bp.pixel_size == 3.45
+        new.close()
+
+    def test_a_pixel_size_given_at_construction_survives_the_swap(self):
+        from pybeamprofiler.simulated import SimulatedCamera, profile_for
+
+        bp = BeamProfiler(camera="simulated", pixel_size=2.0)
+        new = SimulatedCamera(profile_for("sim-2"))
+        new.open()
+        bp.attach_camera(new)
+        assert bp.pixel_size == 2.0
+        new.close()
+
+
 class TestStopMethod:
     """Test the stop() method."""
 
