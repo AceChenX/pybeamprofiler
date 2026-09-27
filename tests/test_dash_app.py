@@ -307,6 +307,114 @@ class TestBuildFigure:
         assert len(scatter_traces) >= 4  # x-profile, y-profile + 2 crosshairs
 
 
+class TestBuildFigureGeometry:
+    """Where things land, checked against the image rather than against the
+    code that put them there.
+
+    Counting traces cannot catch an overlay drawn in the wrong place -- the
+    mirrored ellipse went unnoticed through two releases -- so these read the
+    drawn coordinates back out of the figure and check them against the
+    pixels. Swapping the ellipse's x and y, flipping the heatmap, or swapping
+    the crosshair's lines each fails one of them.
+    """
+
+    PIXEL = 2.5  # not 1, so a forgotten conversion shows
+
+    @staticmethod
+    def _beam(theta_deg: float) -> np.ndarray:
+        """A noise-free elongated beam, off-centre so x and y differ."""
+        from pybeamprofiler import fitting
+
+        y, x = np.mgrid[0:120, 0:160]
+        flat = fitting.gaussian_2d(
+            (x, y), 1000.0, 95.0, 50.0, 24.0, 8.0, np.deg2rad(theta_deg), 50.0
+        )
+        return np.rint(flat.reshape(120, 160)).astype(np.uint16)
+
+    def _figure(self, method: str, theta_deg: float) -> tuple[go.Figure, np.ndarray]:
+        bp = BeamProfiler(camera="simulated", fit=method)
+        bp.pixel_size = self.PIXEL
+        img = self._beam(theta_deg)
+        popt_x, popt_y = bp.analyze(img)
+        return build_figure(bp, img, popt_x, popt_y), img
+
+    @staticmethod
+    def _ellipse(fig: go.Figure) -> tuple[np.ndarray, np.ndarray]:
+        trace = next(t for t in fig.data if t.type == "scatter" and t.line.dash == "dash")
+        return np.asarray(trace.x, float), np.asarray(trace.y, float)
+
+    @staticmethod
+    def _relative(samples: np.ndarray) -> np.ndarray:
+        """Intensity as a fraction of the beam's amplitude above background."""
+        return (samples - 50.0) / 1000.0
+
+    @pytest.mark.parametrize(("method", "theta_deg"), [("2d", 30.0), ("1d", 0.0)])
+    def test_the_ellipse_traces_the_1_over_e2_contour_of_the_image(self, method, theta_deg):
+        from scipy.ndimage import map_coordinates
+
+        fig, img = self._figure(method, theta_deg)
+        x_um, y_um = self._ellipse(fig)
+        cols, rows = x_um / self.PIXEL, y_um / self.PIXEL
+
+        samples = map_coordinates(img.astype(float), [rows, cols], order=1)
+
+        # Every sample, not the mean: a mirrored ellipse swings between the
+        # core and the background while its mean still looks plausible.
+        assert np.abs(self._relative(samples) - np.exp(-2)).max() < 0.02
+
+    def test_the_ellipse_sits_on_the_beam_as_the_heatmap_draws_it(self):
+        """The same contour, sampled from the heatmap through its own axis
+        coordinates -- so a heatmap drawn flipped or shifted relative to the
+        overlay fails even when both agree with the raw array."""
+        from scipy.ndimage import map_coordinates
+
+        fig, _ = self._figure("2d", 30.0)
+        heat = fig.data[0]
+        hx, hy = np.asarray(heat.x, float), np.asarray(heat.y, float)
+        assert np.all(np.diff(hx) > 0) and np.all(np.diff(hy) > 0)
+        x_um, y_um = self._ellipse(fig)
+        cols = np.interp(x_um, hx, np.arange(len(hx)))
+        rows = np.interp(y_um, hy, np.arange(len(hy)))
+
+        samples = map_coordinates(np.asarray(heat.z, float), [rows, cols], order=1)
+
+        assert np.abs(self._relative(samples) - np.exp(-2)).max() < 0.02
+
+    def test_row_0_of_the_array_is_drawn_at_the_bottom(self):
+        """Deliberate, and different from SpinView / pylon Viewer (see the
+        knowledge base): y ascends from row 0. Flipping it would change what
+        every user sees, so it should take a deliberate edit of this test."""
+        bp = BeamProfiler(camera="simulated")
+        bp.pixel_size = self.PIXEL
+        # Each row holds its own index, so a flip cannot go unnoticed.
+        img = np.repeat(np.arange(60, dtype=np.uint16)[:, None], 80, axis=1)
+
+        fig = build_figure(bp, img, None, None)
+
+        heat = fig.data[0]
+        assert np.array_equal(np.asarray(heat.z), img)
+        assert heat.y[0] == 0 and heat.y[-1] == pytest.approx((img.shape[0] - 1) * self.PIXEL)
+        assert fig.layout.yaxis.autorange != "reversed"
+        low, high = fig.layout.yaxis.range
+        assert low < high
+
+    def test_the_crosshair_crosses_at_the_linecut(self):
+        bp = BeamProfiler(camera="simulated")
+        bp.pixel_size = self.PIXEL
+        bp.fit_method = "linecut"
+        bp._linecut_x = np.intp(20)  # column
+        bp._linecut_y = np.intp(45)  # row
+        img = np.zeros((60, 80), dtype=np.uint8)
+
+        fig = build_figure(bp, img, None, None)
+
+        vertical, horizontal = [t for t in fig.data if t.type == "scatter" and t.line.dash == "dot"]
+        assert list(vertical.x) == [20 * self.PIXEL] * 2
+        assert list(vertical.y) == [0, 60 * self.PIXEL]
+        assert list(horizontal.y) == [45 * self.PIXEL] * 2
+        assert list(horizontal.x) == [0, 80 * self.PIXEL]
+
+
 # ─── _format_results ────────────────────────────────────────────────────────
 
 
@@ -2261,6 +2369,13 @@ class TestUpdateLiveCallback:
         assert fn is not None
         result = fn(1, False, False, "Hot", True, None, None, 0, "1d", "gaussian", True, 1)
         assert len(result) == 7
+        # Colour off must actually draw in grey, whatever scale is selected;
+        # the tuple length alone passed with the switch ignored.
+        from pybeamprofiler.dash_layout import GRAY_COLORSCALE
+
+        drawn = result[0].data[0].colorscale
+        assert drawn == go.Heatmap(colorscale=GRAY_COLORSCALE).colorscale
+        assert drawn != go.Heatmap(colorscale="Hot").colorscale
 
     def test_live_update_averages_frames(self):
         """N>1 averaging returns valid figure and populates the buffer."""
