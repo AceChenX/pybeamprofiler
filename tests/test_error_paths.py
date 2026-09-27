@@ -168,6 +168,16 @@ class TestDashShutdown:
         assert during == ["localhost"]
         assert socket.getfqdn.__module__ == "socket"
 
+    def test_ctrl_c_is_acknowledged(self, capsys):
+        """werkzeug swallows the interrupt, so nothing else would say so."""
+        self._serve(BeamProfiler(camera="simulated"), run=KeyboardInterrupt)
+        assert "Stopped." in capsys.readouterr().out
+
+    def test_a_server_that_fails_to_start_is_not_reported_as_stopped(self, capsys):
+        with pytest.raises(OSError, match="in use"):
+            self._serve(BeamProfiler(camera="simulated"), run=OSError("Address already in use"))
+        assert "Stopped." not in capsys.readouterr().out
+
     def test_serving_from_a_worker_thread_works(self):
         """No signal handler is installed any more, so nothing can refuse to
         install off the main thread."""

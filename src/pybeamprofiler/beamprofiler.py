@@ -1396,6 +1396,9 @@ class BeamProfiler:
             dash_app._server_paused = True
             with dash_app._callback_lock:
                 self._release_camera()
+        # Reached only when the server stopped cleanly, which means Ctrl+C:
+        # werkzeug swallows the interrupt, so main() never sees it to report.
+        print("\nStopped.", flush=True)
 
     def _release_camera(self) -> None:
         """Stop acquisition and close the camera, logging rather than raising."""
