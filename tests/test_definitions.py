@@ -436,23 +436,18 @@ class TestHarvesterIntegration:
         assert bp.camera is not None
         bp.camera.close()
 
-        # FLIR/Basler will fall back to simulated if hardware not available
-        # But should not crash
-        try:
-            bp_flir = BeamProfiler(camera="flir")
-            if bp_flir.camera:
-                bp_flir.camera.close()
-        except Exception:
-            # Camera initialization fails without hardware or drivers
-            pass
+        # A physical camera that cannot be opened is an error, never a quiet
+        # fall-back to simulated data that would pass for a measurement.
+        # Harvester is patched to a bus with no devices, so this holds on any
+        # machine, with or without an SDK or the binary bindings installed.
+        from unittest.mock import MagicMock, patch
 
-        try:
-            bp_basler = BeamProfiler(camera="basler")
-            if bp_basler.camera:
-                bp_basler.camera.close()
-        except Exception:
-            # Camera initialization fails without hardware or drivers
-            pass
+        empty_bus = MagicMock()
+        empty_bus.return_value.device_info_list = []
+        with patch("pybeamprofiler.gen_camera.Harvester", empty_bus):
+            for kind in ("flir", "basler"):
+                with pytest.raises(RuntimeError, match=f"Failed to open {kind} camera"):
+                    BeamProfiler(camera=kind)
 
 
 class TestEdgeCases:

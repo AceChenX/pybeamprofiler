@@ -929,25 +929,29 @@ class TestFlirCameraInit:
 
     @patch("pybeamprofiler.flir.os.environ", {})
     @patch("pybeamprofiler.flir.FlirCamera._find_flir_cti")
-    def test_flir_init_no_cti_found(self, mock_find):
+    def test_flir_init_no_cti_found(self, mock_find, caplog):
         """Test FlirCamera warns when no CTI found."""
         from pybeamprofiler.flir import FlirCamera
 
         mock_find.return_value = None
         mock_harvester = MagicMock()
         with patch("pybeamprofiler.gen_camera.Harvester", mock_harvester):
-            FlirCamera()
+            with caplog.at_level("WARNING"):
+                FlirCamera()
+        assert "FLIR Spinnaker CTI not found" in caplog.text
 
     @patch("pybeamprofiler.basler.os.environ", {})
     @patch("pybeamprofiler.basler.BaslerCamera._find_basler_cti")
-    def test_basler_init_no_cti_found(self, mock_find):
+    def test_basler_init_no_cti_found(self, mock_find, caplog):
         """Test BaslerCamera warns when no CTI found."""
         from pybeamprofiler.basler import BaslerCamera
 
         mock_find.return_value = None
         mock_harvester = MagicMock()
         with patch("pybeamprofiler.gen_camera.Harvester", mock_harvester):
-            BaslerCamera()
+            with caplog.at_level("WARNING"):
+                BaslerCamera()
+        assert "Basler Pylon CTI not found" in caplog.text
 
     @patch("pybeamprofiler.basler.os.environ", {})
     @patch("pybeamprofiler.basler.BaslerCamera._find_basler_cti")

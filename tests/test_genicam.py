@@ -129,13 +129,20 @@ class TestFlirCamera:
         # Verify parent class initialization was called
         assert mock_super_init.called
 
-    def test_find_flir_cti(self):
-        """Test FLIR CTI path search."""
+    def test_find_flir_cti(self, tmp_path, monkeypatch):
+        """None with no SDK installed; otherwise the first Spinnaker producer."""
+        from pybeamprofiler import cti
         from pybeamprofiler.flir import FlirCamera
 
-        # Returns None when CTI files are not found, or path string if available
-        cti_path = FlirCamera._find_flir_cti()
-        assert cti_path is None or isinstance(cti_path, str)
+        assert FlirCamera._find_flir_cti() is None  # the suite blanks the SDK tables
+
+        (tmp_path / "FLIR_GenTL.cti").write_bytes(b"")
+        monkeypatch.setattr(
+            cti, "_VENDOR_DIRS", {"TestOS": {cti.SPINNAKER: (cti._SearchDir(str(tmp_path)),)}}
+        )
+        monkeypatch.setattr(cti.platform, "system", lambda: "TestOS")
+        found = FlirCamera._find_flir_cti()
+        assert isinstance(found, str) and found.endswith("FLIR_GenTL.cti")
 
 
 class TestBaslerCamera:
@@ -155,13 +162,25 @@ class TestBaslerCamera:
         # Verify parent class initialization was called
         assert mock_super_init.called
 
-    def test_find_basler_cti(self):
-        """Test Basler CTI path search."""
+    def test_find_basler_cti(self, tmp_path, monkeypatch):
+        """None with no SDK installed; otherwise every Pylon producer."""
+        from pybeamprofiler import cti
         from pybeamprofiler.basler import BaslerCamera
 
-        # Returns None when CTI files are not found, or list of paths if available
-        cti_path = BaslerCamera._find_basler_cti()
-        assert cti_path is None or isinstance(cti_path, list)
+        assert BaslerCamera._find_basler_cti() is None  # the suite blanks the SDK tables
+
+        for name in ("ProducerGEV.cti", "ProducerU3V.cti"):
+            (tmp_path / name).write_bytes(b"")
+        monkeypatch.setattr(
+            cti, "_VENDOR_DIRS", {"TestOS": {cti.PYLON: (cti._SearchDir(str(tmp_path)),)}}
+        )
+        monkeypatch.setattr(cti.platform, "system", lambda: "TestOS")
+        found = BaslerCamera._find_basler_cti()
+        assert isinstance(found, list)
+        assert [p.rsplit("/", 1)[-1].rsplit("\\", 1)[-1] for p in found] == [
+            "ProducerGEV.cti",
+            "ProducerU3V.cti",
+        ]
 
     def test_pylon_producers_constant(self):
         """Test that PYLON_PRODUCERS constant is defined and contains expected producers."""

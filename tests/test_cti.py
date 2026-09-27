@@ -9,7 +9,6 @@ bug that prompted this module was the tables drifting apart between vendors.
 from __future__ import annotations
 
 import os
-import platform
 from unittest.mock import patch
 
 import pytest
@@ -224,9 +223,12 @@ class TestFindCtiFiles:
         assert cti.find_cti_files() == []
 
     def test_real_platform_call_does_not_raise(self):
-        """Whatever this machine has installed, discovery must stay quiet."""
-        assert isinstance(cti.find_cti_files(), list)
-        assert platform.system() in {"Windows", "Linux", "Darwin"} or True
+        """Whatever this machine has installed, discovery must stay quiet and
+        return only producers that exist."""
+        found = cti.find_cti_files()
+        assert isinstance(found, list)
+        assert all(path.endswith(".cti") and os.path.isfile(path) for path in found)
+        assert len(found) == len({os.path.realpath(path) for path in found})
 
 
 class TestParseGentlPath:
