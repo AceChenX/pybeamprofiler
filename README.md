@@ -44,6 +44,11 @@ Switching releases the previous device, so nothing stays claimed. If the camera
 you pick cannot be opened — unplugged, or held by Spinnaker/pylon Viewer — the
 current stream keeps running and the reason is shown under the dropdown.
 
+A camera plugged in *while a real camera is open* shows up only after that
+camera is closed: listing new devices means re-enumerating the GenTL producer,
+which would tear down the open one. Switch to a simulator, press ⟳, and the new
+camera is offered.
+
 Two simulated cameras are always offered. They have different sensor sizes,
 pixel pitches and beam shapes (the second is tilted 35°), so the selector and
 the 2D fit can both be exercised with no hardware attached.
