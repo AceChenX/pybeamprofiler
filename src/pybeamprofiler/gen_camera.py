@@ -44,6 +44,7 @@ except ImportError:
     _HarvestersTimeout = None  # ty:ignore[invalid-assignment]
 
 from .camera import Camera, _align_down, _Axis, _fit_axis, _roi_pixels
+from .constants import DEFAULT_PIXEL_SIZE
 from .cti import find_cti_files, parse_gentl_path
 
 logger = logging.getLogger(__name__)
@@ -819,12 +820,14 @@ class HarvesterCamera(Camera):
                 self.pixel_size = float(pixel_size)
                 logger.info(f"Pixel size: {self.pixel_size:.2f} μm")
             else:
-                self.pixel_size = 1.0
-                logger.warning("Pixel size not available from camera, using default 1.0 μm")
+                self.pixel_size = DEFAULT_PIXEL_SIZE
+                logger.warning(
+                    f"Pixel size not available from camera, using default {DEFAULT_PIXEL_SIZE} μm"
+                )
 
         except Exception as e:
             logger.warning(f"Could not detect pixel size: {e}")
-            self.pixel_size = 1.0
+            self.pixel_size = DEFAULT_PIXEL_SIZE
 
     def _lookup_sensor_pixel_size(self) -> float | None:
         """Look up pixel size from known sensor models.

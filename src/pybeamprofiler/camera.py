@@ -27,6 +27,8 @@ from typing import Any, cast
 
 import numpy as np
 
+from .constants import DEFAULT_EXPOSURE_TIME, DEFAULT_GAIN, DEFAULT_PIXEL_SIZE
+
 # Optional GenICam enums — only present when a real GenTL backend is
 # installed. We tolerate the import failure so the package still works
 # with the simulated camera on machines without the SDK.
@@ -251,12 +253,12 @@ class Camera(ABC):
     """
 
     def __init__(self) -> None:
-        self.exposure_time: float = 0.01
-        self.gain: float = 0.0
+        self.exposure_time: float = DEFAULT_EXPOSURE_TIME
+        self.gain: float = DEFAULT_GAIN
         self.is_acquiring: bool = False
         self.width: int = 0
         self.height: int = 0
-        self.pixel_size: float = 1.0
+        self.pixel_size: float = DEFAULT_PIXEL_SIZE
         self.image_buffer: np.ndarray | None = None
         # Bits per sample the sensor actually delivers (8, 10, 12, 16), or
         # None if unknown. A 12-bit frame arrives in uint16 and tops out at
