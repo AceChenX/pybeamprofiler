@@ -49,7 +49,7 @@ requires-python = ">=3.10"
 "Bug Tracker" = "https://github.com/acechenx/pybeamprofiler/issues"
 
 [project.scripts]
-pybeamprofiler = "pybeamprofiler.beamprofiler:main"
+pybeamprofiler = "pybeamprofiler.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/pybeamprofiler"]

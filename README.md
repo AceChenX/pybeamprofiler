@@ -183,7 +183,8 @@ uv run pytest tests/test_profiler.py   # single file
 - `fitting.py` — Gaussian models, direct width measurements, curve fits, decimation (pure functions over arrays; no camera or plotting state)
 - `cti.py` — one table of GenTL producer (`.cti`) search paths, shared by every vendor
 - `discovery.py` — enumerating cameras and opening the selected one (`utils.py` re-exports it)
-- `beamprofiler.py` — `BeamProfiler` class, figure building, streaming, CLI entry point
+- `beamprofiler.py` — `BeamProfiler` class: analysis state, the Jupyter figures and stream, serving the GUI
+- `cli.py` — the `pybeamprofiler` command (also `python -m pybeamprofiler`)
 - `camera.py` — abstract `Camera` base class + Jupyter widget builder
 - `gen_camera.py` — `HarvesterCamera` for GenICam devices
 - `flir.py` / `basler.py` — vendor-specific subclasses

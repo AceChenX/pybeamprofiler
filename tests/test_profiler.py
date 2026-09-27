@@ -1039,7 +1039,7 @@ class TestCLIMain:
     @staticmethod
     def _run_main(argv: list[str], plot_side_effect: Any = None) -> tuple[int, MagicMock]:
         """Run ``main`` with *argv*; return its exit status and the plot mock."""
-        from pybeamprofiler.beamprofiler import main
+        from pybeamprofiler.cli import main
 
         with (
             patch("sys.argv", ["pybeamprofiler", *argv]),
@@ -1153,7 +1153,7 @@ class TestCLIMain:
 
         with (
             patch("sys.argv", ["pybeamprofiler"]),
-            patch("pybeamprofiler.beamprofiler.main", return_value=3) as mock_main,
+            patch("pybeamprofiler.cli.main", return_value=3) as mock_main,
             pytest.raises(SystemExit) as exit_info,
         ):
             runpy.run_module("pybeamprofiler.__main__", run_name="__main__")

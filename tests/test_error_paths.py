@@ -497,7 +497,7 @@ class TestCliCleanup:
     """``main()`` must release the camera even when plotting blows up."""
 
     def test_camera_is_closed_after_a_plot_failure(self, capsys):
-        from pybeamprofiler.beamprofiler import main
+        from pybeamprofiler.cli import main
 
         def start_then_fail(self, *args, **kwargs):
             self.camera.is_acquiring = True
@@ -516,7 +516,7 @@ class TestCliCleanup:
         assert "pybeamprofiler: error: render died" in capsys.readouterr().err
 
     def test_cleanup_errors_are_swallowed(self):
-        from pybeamprofiler.beamprofiler import main
+        from pybeamprofiler.cli import main
 
         argv = ["pybeamprofiler", "--camera", "simulated"]
         with (
@@ -527,7 +527,7 @@ class TestCliCleanup:
             assert main() == 0
 
     def test_keyboard_interrupt_is_reported_cleanly(self, capsys):
-        from pybeamprofiler.beamprofiler import main
+        from pybeamprofiler.cli import main
 
         argv = ["pybeamprofiler", "--camera", "simulated"]
         with (
@@ -538,7 +538,7 @@ class TestCliCleanup:
         assert "Stopped by user" in capsys.readouterr().out
 
     def test_a_camera_that_will_not_open_is_one_line_not_a_traceback(self, capsys):
-        from pybeamprofiler.beamprofiler import main
+        from pybeamprofiler.cli import main
 
         argv = ["pybeamprofiler", "--camera", "flir"]
         with (

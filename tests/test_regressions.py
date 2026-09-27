@@ -17,7 +17,8 @@ import pytest
 from PIL import Image
 
 from pybeamprofiler import fitting
-from pybeamprofiler.beamprofiler import BeamProfiler, main
+from pybeamprofiler.beamprofiler import BeamProfiler
+from pybeamprofiler.cli import main
 from pybeamprofiler.dash_app import _averaged_image, _reset_avg_state, _saturation_fraction
 from pybeamprofiler.simulated import SimulatedCamera
 
