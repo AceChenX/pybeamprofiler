@@ -28,6 +28,7 @@ import importlib
 import logging
 import os
 import platform
+import re
 import threading
 import time
 from dataclasses import dataclass
@@ -231,20 +232,63 @@ SENSOR_PIXEL_SIZES: dict[str, float] = {
 }
 
 
+def _samples_per_pixel(fmt: str) -> float | None:
+    """Samples of ``component.data`` per pixel, from the PFNC format name.
+
+    Harvesters unpacks packed formats (Mono12p and the like) before handing
+    the data over, so this is about colour layout, not bit packing. ``None``
+    for a name not recognised here.
+    """
+    if fmt.startswith(("Mono", "Bayer", "Coord3D_C")):
+        return 1
+    if fmt.startswith(("RGBa", "BGRa")):
+        return 4
+    if fmt.startswith(("RGB", "BGR")):
+        return 3
+    if fmt.startswith(("YUV", "YCbCr")):
+        if "411" in fmt:
+            return 1.5
+        if "422" in fmt:
+            return 2
+        return 3
+    return None
+
+
+def _bit_depth_of(fmt: Any) -> int | None:
+    """Bits per sample of a PFNC pixel format name, or ``None`` if unknown.
+
+    "Mono12p" is 12, "BayerRG10" 10, "BGRa8" 8. In "YUV422_8" the 422 is
+    the chroma sampling, not a depth, so only numbers up to 32 count.
+    """
+    if not isinstance(fmt, str) or not fmt:
+        return None
+    for number in re.findall(r"\d+", fmt.removeprefix("Coord3D_")):
+        depth = int(number)
+        if 0 < depth <= 32:
+            return depth
+    return None
+
+
 def _to_mono(component: Any) -> np.ndarray:
-    """Reshape one payload component into a 2D intensity array.
+    """Turn one payload component into a 2D intensity array.
 
-    Mono formats arrive as exactly ``height * width`` samples and only need a
-    reshape. Colour formats (RGB8, BGR8, YUV...) carry several samples per
-    pixel; a beam profiler wants one intensity per pixel, so those are
-    collapsed with the usual luminance weights for three channels and a plain
-    mean otherwise. Blindly reshaping them — which is what this used to do —
-    raises "cannot reshape array of size N" the moment a camera is left in a
-    colour pixel format.
+    The layout is taken from the pixel format name, not guessed from the
+    payload size:
 
-    Packed mono formats (Mono10p, Mono12p) do not have a whole number of
-    samples per pixel and are rejected with a message that says so, rather
-    than producing a silently corrupt image.
+    * Mono and Bayer formats are one sample per pixel. Bayer data is the raw
+      colour-filter mosaic -- the camera's actual counts, clipping included
+      -- and is returned as it is; the caller warns about it.
+    * RGB/BGR(a) formats become the brightest colour channel of each pixel,
+      alpha ignored. A luminance weighting hid clipping (a red channel at
+      full scale came out at 30% of it, so the saturation check never
+      fired), gave BGR the weights meant for RGB, and averaged alpha into
+      the image as an offset.
+    * YUV/YCbCr formats give their luma plane; averaging chroma in added
+      half of full scale to a black frame.
+
+    Harvesters 1.4 does not strip line padding (it discards the result of
+    its own ``numpy.delete``), so padded rows are cropped here using the
+    component's ``x_padding``.
 
     Args:
         component: A Harvesters ``Component2DImage``.
@@ -254,31 +298,55 @@ def _to_mono(component: Any) -> np.ndarray:
         as the ``fetch`` context exits, so the copy is not optional.
 
     Raises:
-        ValueError: If the payload size is not a whole multiple of the frame.
+        ValueError: If the payload cannot be read as the frame it claims to be.
     """
-    height, width = component.height, component.width
+    height, width = int(component.height), int(component.width)
     data = component.data
     pixels = height * width
     if pixels == 0:
         raise ValueError("Camera reported a zero-sized frame")
 
-    if data.size == pixels:
-        return data.reshape(height, width).copy()
-
-    channels, remainder = divmod(data.size, pixels)
-    if remainder or channels < 1:
-        fmt = getattr(component, "data_format", "unknown")
+    raw_format = getattr(component, "data_format", None)
+    fmt = raw_format if isinstance(raw_format, str) else ""
+    per_pixel = _samples_per_pixel(fmt)
+    if per_pixel is None:
+        # A format not named above: infer the layout from the size.
+        per_pixel = data.size / pixels
+    if per_pixel != int(per_pixel) or per_pixel < 1:
         raise ValueError(
-            f"Cannot interpret a {data.size}-sample payload as a "
-            f"{width}x{height} frame (pixel format {fmt!r}). Packed formats "
-            "such as Mono10p/Mono12p are not supported; select Mono8, Mono12 "
-            "or Mono16 on the camera."
+            f"Cannot interpret a {data.size}-sample payload as a {width}x{height} "
+            f"frame (pixel format {fmt or 'unknown'!r}): it does not hold a whole "
+            "number of samples per pixel. Select Mono8, Mono12 or Mono16 on the camera."
         )
+    channels = int(per_pixel)
+    row = width * channels
 
+    if data.size != pixels * channels:
+        padding = _numeric(getattr(component, "x_padding", None)) or 0
+        per_row, remainder = divmod(data.size, height)
+        if padding > 0 and not remainder and per_row > row:
+            data = data.reshape(height, per_row)[:, :row]
+        else:
+            packed = fmt.endswith("p") or "Packed" in fmt
+            hint = (
+                "The payload is still packed (Mono10p/Mono12p style), which this "
+                "version of Harvesters did not unpack. "
+                if packed
+                else ""
+            )
+            raise ValueError(
+                f"Cannot interpret a {data.size}-sample payload as a {width}x{height} "
+                f"frame (pixel format {fmt or 'unknown'!r}). {hint}"
+                "Select Mono8, Mono12 or Mono16 on the camera."
+            )
+
+    if channels == 1:
+        return data.reshape(height, width).copy()
     planes = data.reshape(height, width, channels)
-    if channels == 3:
-        return (planes.astype(np.float64) @ [0.299, 0.587, 0.114]).astype(data.dtype)
-    return planes.mean(axis=2).astype(data.dtype)
+    if fmt.startswith(("YUV", "YCbCr")):
+        luma = 1 if any(order in fmt for order in ("UYV", "CbYCr")) else 0
+        return planes[:, :, luma].copy()
+    return planes[:, :, :3].max(axis=2)
 
 
 def _device_field(device: Any, name: str) -> str:
@@ -590,6 +658,8 @@ class HarvesterCamera(Camera):
         # stop/start recovery instead of timing out forever.
         self._last_successful_fetch: float = 0.0
         self._stall_recovery_attempted: bool = False
+        # Pixel format of the most recent frame (or of the camera at open).
+        self._pixel_format: str | None = None
         # Seconds between the last two frames. A camera delivering a frame
         # every 8 s is not stalled after 5 s of silence, whatever
         # exposure_time says.
@@ -667,6 +737,12 @@ class HarvesterCamera(Camera):
         self._detect_gain_range()
         self._detect_roi_range()
         self._sync_exposure_and_gain()
+        pixel_format = _node(self.node_map, "PixelFormat")
+        try:
+            fmt = pixel_format.value if pixel_format is not None else None
+        except Exception:
+            fmt = None
+        self._note_pixel_format(fmt if isinstance(fmt, str) else None)
 
     def _harvester_files(self) -> list[str]:
         """Producers to load: this camera's own first, then every other one found.
@@ -1210,6 +1286,9 @@ class HarvesterCamera(Camera):
                 component = held.payload.components[0]
                 self.width_pixels = component.width
                 self.height_pixels = component.height
+                fmt = getattr(component, "data_format", None)
+                if isinstance(fmt, str) and fmt != self._pixel_format:
+                    self._note_pixel_format(fmt)
                 img = _to_mono(component)
             now = time.monotonic()
             if self._last_successful_fetch:
@@ -1217,6 +1296,18 @@ class HarvesterCamera(Camera):
             self._last_successful_fetch = now
             self._stall_recovery_attempted = False
             return img
+
+    def _note_pixel_format(self, fmt: str | None) -> None:
+        """Track the pixel format frames arrive in: its bit depth, and Bayer."""
+        self._pixel_format = fmt
+        self.bit_depth = _bit_depth_of(fmt)
+        if fmt and fmt.startswith("Bayer"):
+            logger.warning(
+                "Frames are %s: a colour-filter mosaic, in which neighbouring pixels "
+                "see different colours, so a beam shows a 2x2 checkerboard. Select a "
+                "Mono pixel format on the camera for beam profiling.",
+                fmt,
+            )
 
     def _recover_if_stalled(self) -> None:
         """Restart acquisition once if the producer has gone quiet.

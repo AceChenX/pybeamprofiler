@@ -657,7 +657,10 @@ class TestNonMonoPayloads:
         img = _to_mono(self._component(4, 6, channels, fmt))
         assert img.shape == (4, 6)
 
-    def test_rgb_uses_luminance_weights(self):
+    def test_rgb_takes_the_brightest_channel(self):
+        """Luminance weights hid clipping -- a red channel at 255 came out
+        at 76, so the saturation check never fired -- and applied RGB
+        weights to BGR data. The brightest channel keeps full scale."""
         from unittest.mock import MagicMock
 
         from pybeamprofiler.gen_camera import _to_mono
@@ -666,8 +669,7 @@ class TestNonMonoPayloads:
         component.height, component.width = 1, 1
         component.data_format = "RGB8"
         component.data = np.array([10, 200, 30], dtype=np.uint8)
-        expected = int(0.299 * 10 + 0.587 * 200 + 0.114 * 30)
-        assert int(_to_mono(component)[0, 0]) == expected
+        assert int(_to_mono(component)[0, 0]) == 200
 
     def test_packed_format_is_rejected_with_a_useful_message(self):
         from unittest.mock import MagicMock

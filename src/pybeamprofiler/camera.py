@@ -186,6 +186,7 @@ class Camera(ABC):
     Attributes:
         exposure_time: Current exposure time in seconds.
         gain: Current gain value.
+        bit_depth: Bits per sample the sensor delivers, or ``None`` if unknown.
         is_acquiring: Whether the camera is actively acquiring images.
         width: Sensor width in pixels.
         height: Sensor height in pixels.
@@ -201,6 +202,10 @@ class Camera(ABC):
         self.height: int = 0
         self.pixel_size: float = 1.0
         self.image_buffer: np.ndarray | None = None
+        # Bits per sample the sensor actually delivers (8, 10, 12, 16), or
+        # None if unknown. A 12-bit frame arrives in uint16 and tops out at
+        # 4095, so the dtype's maximum is the wrong saturation level for it.
+        self.bit_depth: int | None = None
         # Serialises everything that touches the device. Harvesters is a C
         # library: stopping acquisition while another thread still holds a
         # fetched buffer frees that buffer under it, which segfaults rather

@@ -228,6 +228,7 @@ class SimulatedCamera(Camera):
         self.width_pixels = self.profile.width
         self.height_pixels = self.profile.height
         self.pixel_size = self.profile.pixel_size
+        self.bit_depth = 8  # frames are uint8, full scale 255
         self.exposure_time = DEFAULT_EXPOSURE_TIME
         self.gain = DEFAULT_GAIN
         # Presented like a real device so the selector and the Camera Info

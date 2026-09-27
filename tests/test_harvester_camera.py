@@ -587,3 +587,166 @@ class TestExposurePanel:
         with caplog.at_level("ERROR"):
             slider.value = 0.02
         assert "refused an exposure" in caplog.text
+
+
+def _component(fmt: str, samples: Any, width: int, height: int, padding_x: int = 0) -> Any:
+    """A real Harvesters ``Component2DImage`` over the given raw samples."""
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+
+    import numpy as np
+    from harvesters.core import Component2DImage
+    from harvesters.util.pfnc import dict_by_names
+
+    raw = np.asarray(samples).tobytes()
+    buffer = SimpleNamespace(
+        width=width,
+        height=height,
+        padding_x=padding_x,
+        raw_buffer=raw,
+        pixel_format=dict_by_names[fmt],
+        delivered_image_height=height,
+    )
+    return Component2DImage(buffer=buffer, part=None, node_map=MagicMock())
+
+
+class TestPixelFormats:
+    """Colour payloads were collapsed with luminance weights in RGB order
+    whatever the format, a plain mean otherwise, and Bayer passed as mono.
+    Checked with Harvesters' own Component2DImage, so the layouts are the
+    ones a camera delivers."""
+
+    W, H = 8, 4
+
+    def test_clipping_in_one_colour_channel_stays_visible(self):
+        import numpy as np
+
+        rgb = np.zeros((self.H, self.W, 3), np.uint8)
+        rgb[..., 0] = 255  # a red laser saturating the red channel
+        img = gen_camera._to_mono(_component("RGB8", rgb, self.W, self.H))
+        assert img.max() == 255  # was 76: the saturation check never fired
+
+    def test_bgr_and_rgb_of_the_same_scene_agree(self):
+        import numpy as np
+
+        rgb = np.zeros((self.H, self.W, 3), np.uint8)
+        rgb[..., 0] = 200
+        from_rgb = gen_camera._to_mono(_component("RGB8", rgb, self.W, self.H))
+        from_bgr = gen_camera._to_mono(_component("BGR8", rgb[..., ::-1].copy(), self.W, self.H))
+        assert np.array_equal(from_rgb, from_bgr)  # was 59 vs 22
+
+    def test_alpha_is_not_part_of_the_image(self):
+        import numpy as np
+
+        rgba = np.zeros((self.H, self.W, 4), np.uint8)
+        rgba[..., 3] = 255
+        img = gen_camera._to_mono(_component("RGBa8", rgba, self.W, self.H))
+        assert img.max() == 0  # was 63 everywhere
+
+    def test_yuv_gives_its_luma(self):
+        import numpy as np
+
+        yuyv = np.tile(np.array([100, 128], np.uint8), self.W * self.H)  # Y=100, neutral chroma
+        img = gen_camera._to_mono(_component("YUV422_8", yuyv, self.W, self.H))
+        assert (img == 100).all()  # was 114: chroma averaged in
+
+    def test_uyvy_carries_luma_second(self):
+        import numpy as np
+
+        uyvy = np.tile(np.array([128, 100], np.uint8), self.W * self.H)
+        img = gen_camera._to_mono(_component("YUV422_8_UYVY", uyvy, self.W, self.H))
+        assert (img == 100).all()
+
+    def test_bayer_is_returned_as_the_raw_mosaic(self):
+        import numpy as np
+
+        mosaic = np.full((self.H, self.W), 100, np.uint8)
+        mosaic[0::2, 0::2] = 200
+        img = gen_camera._to_mono(_component("BayerRG8", mosaic, self.W, self.H))
+        assert np.array_equal(img, mosaic)
+
+    @pytest.mark.parametrize("padding", [8, 3])
+    def test_line_padding_is_cropped(self, padding):
+        """Harvesters leaves the padding in (it discards its own numpy.delete)."""
+        import numpy as np
+
+        rows = np.zeros((self.H, self.W + padding), np.uint8)
+        rows[:, : self.W] = np.arange(self.W, dtype=np.uint8) + 1
+        img = gen_camera._to_mono(_component("Mono8", rows, self.W, self.H, padding_x=padding))
+        assert img.shape == (self.H, self.W)
+        assert (img == np.arange(self.W) + 1).all()
+
+    def test_packed_mono_arrives_unpacked(self):
+        """Harvesters 1.4 unpacks Mono12p itself; nothing to reject."""
+        import numpy as np
+
+        packed = bytearray()
+        for _ in range(self.W * self.H // 2):  # two 12-bit pixels, both 0xABC, per 3 bytes
+            packed += bytes([0xBC, 0xCA, 0xAB])
+        img = gen_camera._to_mono(
+            _component("Mono12p", np.frombuffer(bytes(packed), np.uint8), self.W, self.H)
+        )
+        assert img.dtype == np.uint16 and (img == 0xABC).all()
+
+    def test_chroma_subsampled_yuv_is_refused_clearly(self):
+        import numpy as np
+
+        data = np.zeros(int(self.W * self.H * 1.5), np.uint8)
+        with pytest.raises(ValueError, match="whole number of samples per pixel"):
+            gen_camera._to_mono(_component("YCbCr411_8", data, self.W, self.H))
+
+
+class TestBitDepth:
+    """get_image() gave a Mono12 frame as uint16 with nothing saying it was
+    12-bit, so the dtype-based saturation check waited for 65535 and a frame
+    with 9% of its pixels clipped at 4095 raised no warning."""
+
+    @pytest.mark.parametrize(
+        ("fmt", "bits"),
+        [
+            ("Mono8", 8),
+            ("Mono10", 10),
+            ("Mono10p", 10),
+            ("Mono12", 12),
+            ("Mono12Packed", 12),
+            ("Mono16", 16),
+            ("BayerRG12", 12),
+            ("RGB8", 8),
+            ("BGRa8", 8),
+            ("YUV422_8", 8),
+            ("YCbCr411_8", 8),
+            ("Coord3D_C16", 16),
+            ("", None),
+            ("Custom", None),
+        ],
+    )
+    def test_from_the_format_name(self, fmt, bits):
+        assert gen_camera._bit_depth_of(fmt) == bits
+
+    def test_a_mono12_camera_reports_12_bits(self, bus):
+        bus.devices[0].node_map.PixelFormat.value = "Mono12"
+        cam = HarvesterCamera(cti_file=bus.cti)
+        cam.open()
+        try:
+            assert cam.bit_depth == 12
+            assert cam.get_image(timeout=1.0).dtype.name == "uint16"
+            assert cam.bit_depth == 12
+        finally:
+            cam.close()
+
+    def test_bit_depth_follows_a_format_change(self, camera):
+        assert camera.bit_depth == 8
+        camera.node_map.PixelFormat.value = "Mono12"
+        camera.get_image(timeout=1.0)
+        assert camera.bit_depth == 12
+
+    def test_a_bayer_format_is_flagged(self, camera, caplog):
+        with caplog.at_level("WARNING"):
+            camera._note_pixel_format("BayerRG8")
+        assert camera.bit_depth == 8
+        assert "Mono pixel format" in caplog.text
+
+    def test_the_simulator_is_8_bit(self):
+        from pybeamprofiler.simulated import SimulatedCamera
+
+        assert SimulatedCamera().bit_depth == 8
