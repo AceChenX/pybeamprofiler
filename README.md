@@ -188,7 +188,8 @@ uv run pytest tests/test_profiler.py   # single file
 - `gen_camera.py` — `HarvesterCamera` for GenICam devices
 - `flir.py` / `basler.py` — vendor-specific subclasses
 - `simulated.py` — `SimulatedCamera` and its beam profiles (no hardware)
-- `dash_app.py` — browser GUI with live updates, settings panel, pattern-matching callbacks
+- `dash_layout.py` — what the browser GUI looks like: the page and its component builders
+- `dash_app.py` — what it does: the live figure, the app factory, and every callback
 - `constants.py` — shared constants and conversion factors
 
 ### Contributing
@@ -200,7 +201,8 @@ uv run pytest tests/test_profiler.py   # single file
 
 ### Performance notes
 
-- 2D fits downsample to 256 px on the longest edge and warm-start Levenberg-Marquardt from the previous frame; a failed fit is retried from a fresh estimate rather than left stuck on stale parameters
+- 2D fits run on at most 128 px along the longest edge: a large beam is downsampled, a small one is cropped out of the sensor instead. They warm-start Levenberg-Marquardt from the previous frame, and a fit that fails or lands on something that is not a beam is retried from a fresh estimate rather than left stuck on stale parameters
+- FWHM and D4σ are computed from row and column sums of the raw frame inside the ISO 11146 integration window, never from a full-frame floating-point copy
 - Display decimation is nearest-neighbour fancy indexing (~4× faster than interpolated zoom at 1024 px, and it shows real sensor counts rather than blended ones)
 - Projection profiles are cached between `analyze()` and figure rendering
 - GenICam feature discovery is memoised per node map — the `.value` probe it relies on is a register read per node, which costs hundreds of round trips on a GigE camera
