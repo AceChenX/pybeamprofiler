@@ -156,6 +156,23 @@ class TestMeasureD4s:
         assert np.isnan(center)
         assert np.isnan(d4s)
 
+    @pytest.mark.parametrize("bad", [np.nan, np.inf])
+    def test_non_finite_samples_report_nan_instead_of_raising(self, bad):
+        """A NaN in the profile used to reach int() in the window arithmetic
+        and raise ValueError out of analyze()."""
+        profile = _gaussian_profile()
+        profile[17] = bad
+        assert all(np.isnan(v) for v in fitting.measure_d4s(profile))
+        center, width, _ = fitting.measure_fwhm(profile)
+        assert np.isnan(center) and np.isnan(width)
+
+    def test_a_non_finite_pixel_reports_nan_for_the_frame(self):
+        y, x = np.mgrid[0:64, 0:64]
+        img = fitting.gaussian_2d((x, y), 200.0, 32.0, 30.0, 6.0, 5.0, 0.0, 5.0).reshape(64, 64)
+        img[3, 3] = np.nan
+        assert all(np.isnan(v) for v in fitting.measure_d4s_2d(img))
+        assert all(np.isnan(v) for v in fitting.measure_fwhm_2d(img))
+
     def test_flat_top_is_wider_than_its_gaussian_fit_would_suggest(self):
         """D4σ is shape-free, which is the whole point of offering it."""
         profile = np.zeros(200)

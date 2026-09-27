@@ -392,14 +392,17 @@ class TestFrameAveraging:
         _reset_avg_state()
 
     def test_mean_is_rounded_not_truncated(self):
-        # Alternating 10 / 11 averages to 10.5, which must round to 10 or 11
-        # rather than always flooring to 10.
-        a = np.full((4, 4), 10, dtype=np.uint8)
-        b = np.full((4, 4), 11, dtype=np.uint8)
-        _averaged_image(a, 2)
-        out = _averaged_image(b, 2)
-        assert out.max() >= 10
-        assert np.rint(10.5) == out[0, 0]
+        # 11 and 12 average to 11.5, which rounds to 12 under either rounding
+        # convention and truncates to 11. (10 and 11 would not tell them apart:
+        # 10.5 rounds half-to-even to 10, which is also the truncated value.)
+        _averaged_image(np.full((4, 4), 11, dtype=np.uint8), 2)
+        out = _averaged_image(np.full((4, 4), 12, dtype=np.uint8), 2)
+        np.testing.assert_array_equal(out, 12)
+
+    def test_a_mean_below_one_half_rounds_down(self):
+        for value in (10, 10, 11):
+            out = _averaged_image(np.full((4, 4), value, dtype=np.uint8), 3)
+        np.testing.assert_array_equal(out, 10)  # 10.33
 
     def test_constant_input_is_preserved_exactly(self):
         """Truncation used to shave a count off a perfectly steady signal."""

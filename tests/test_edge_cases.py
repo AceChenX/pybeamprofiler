@@ -1,9 +1,11 @@
 """Additional tests for camera error handling and edge cases."""
 
+from unittest.mock import patch
+
 import numpy as np
 import pytest
 
-from pybeamprofiler import BeamProfiler
+from pybeamprofiler import BeamProfiler, fitting
 from pybeamprofiler.simulated import SimulatedCamera
 
 
@@ -278,10 +280,20 @@ class TestBeamProfilerIntegration:
         assert bp._last_popt_y is not None
 
         # Second fit should use cached values as initial guess
+        cached = np.asarray(bp._last_popt_x, dtype=float).copy()
         img2 = bp.camera.get_image()
-        popt_x2, popt_y2 = bp.analyze(img2)
+        starts: list[np.ndarray] = []
+        real_curve_fit = fitting.curve_fit
+
+        def spy(*args, **kwargs):
+            starts.append(np.asarray(kwargs["p0"], dtype=float))
+            return real_curve_fit(*args, **kwargs)
+
+        with patch("pybeamprofiler.fitting.curve_fit", side_effect=spy):
+            popt_x2, popt_y2 = bp.analyze(img2)
 
         assert popt_x2 is not None
         assert popt_y2 is not None
+        np.testing.assert_allclose(starts[0], cached)
 
         bp.camera.stop_acquisition()

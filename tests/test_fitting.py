@@ -1,8 +1,17 @@
 """Tests for Gaussian fitting methods (1D, 2D, linecut)."""
 
+from unittest.mock import patch
+
 import numpy as np
 
-from pybeamprofiler import BeamProfiler
+from pybeamprofiler import BeamProfiler, fitting
+from pybeamprofiler.simulated import SimulatedCamera
+
+
+def _seeded_camera(seed: int) -> SimulatedCamera:
+    camera = SimulatedCamera(seed=seed)
+    camera.open()
+    return camera
 
 
 class TestOneDimensionalFitting:
@@ -61,10 +70,20 @@ class TestOneDimensionalFitting:
         img2 = bp.camera.get_image()
         bp.camera.stop_acquisition()
 
-        popt_x2, _ = bp.analyze(img2)
-        # Sigma can converge to either sign (Gaussian is symmetric in sigma);
-        # production code uses abs(popt[2]), so compare widths the same way.
-        assert abs(abs(popt_x2[2]) - abs(popt_x1[2])) < 100
+        # The second frame must start the solver from the first frame's
+        # result. Checked on the solver itself: the fit converging either
+        # way would hide a warm start that was never used.
+        cached = np.asarray(bp._last_popt_x, dtype=float).copy()
+        starts: list[np.ndarray] = []
+        real_curve_fit = fitting.curve_fit
+
+        def spy(*args, **kwargs):
+            starts.append(np.asarray(kwargs["p0"], dtype=float))
+            return real_curve_fit(*args, **kwargs)
+
+        with patch("pybeamprofiler.fitting.curve_fit", side_effect=spy):
+            bp.analyze(img2)
+        np.testing.assert_allclose(starts[0], cached)
 
 
 class TestTwoDimensionalFitting:
@@ -91,6 +110,8 @@ class TestTwoDimensionalFitting:
     def test_2d_vs_1d_comparison(self, beam_profiler):
         """Compare 2D and 1D fitting results on same image."""
         bp = beam_profiler
+        # Seeded, so a failure reproduces instead of showing up once in 400 runs.
+        bp.attach_camera(_seeded_camera(7))
         assert bp.camera is not None
 
         bp.camera.start_acquisition()
