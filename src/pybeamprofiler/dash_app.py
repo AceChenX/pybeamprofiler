@@ -398,9 +398,7 @@ window.addEventListener('load', function() {
     # One enumeration at start-up, shared by the dropdown and the cache the
     # switch callback resolves against. Scanning twice would double a
     # multi-second GenTL walk on a machine with hardware attached.
-    global _known_options  # noqa: PLW0603
     camera_options, current_camera = _camera_options(bp)
-    _known_options = camera_options
 
     # The two-column split is implemented with explicit pixel widths so a
     # draggable divider (``#col-divider``) can resize them on the client.
@@ -473,6 +471,11 @@ window.addEventListener('load', function() {
     )
 
     _register_callbacks(app, bp)
+    # Seeded only now: _register_callbacks clears the module state, this
+    # cache included, so filling it any earlier leaves it empty and every
+    # camera switch falls back to a full rescan with the lock held.
+    global _known_options  # noqa: PLW0603
+    _known_options = camera_options
     return app
 
 
@@ -640,11 +643,19 @@ def _discard_frame_history(bp: BeamProfiler) -> None:
 
 
 def _register_callbacks(app: dash.Dash, bp: BeamProfiler) -> None:
-    """Wire up all Dash callbacks."""
+    """Wire up all Dash callbacks, and reset the state they share.
+
+    The state is module-level, so every app built in this process sees it.
+    Without the reset a second ``create_app`` -- a test, or a notebook that
+    relaunches the GUI -- would inherit the previous session's pause flag,
+    zoom, fps window and averaged frames.
+    """
     global _known_options, _server_paused, _zoom_range  # noqa: PLW0603
     _server_paused = False
     _zoom_range = None
     _known_options = []
+    _reset_avg_state()
+    _recent_frame_times.clear()
 
     # -- Camera selection -----------------------------------------------------
     # Rescanning and switching both take ``_callback_lock``: swapping the
@@ -675,8 +686,11 @@ def _register_callbacks(app: dash.Dash, bp: BeamProfiler) -> None:
         is unhappy about. A rescan is an explicit click, so a brief pause is
         the right trade against a crash.
         """
+        global _known_options  # noqa: PLW0603
         with _callback_lock:
             options, current = _camera_options(bp)
+            # What the dropdown now offers is what a switch resolves against.
+            _known_options = options
         listed = [{"label": o.label, "value": o.key} for o in options]
         real = sum(1 for o in options if not o.is_simulated)
         if real:

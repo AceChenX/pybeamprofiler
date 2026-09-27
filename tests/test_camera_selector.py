@@ -14,6 +14,7 @@ from typing import Any
 from unittest.mock import patch
 
 import dash
+import numpy as np
 import pytest
 from dash import html
 
@@ -176,13 +177,19 @@ class TestSwitchCamera:
         assert math.isnan(profiler.width_x)
 
     def test_zoom_and_frame_buffers_are_cleared(self, profiler):
+        callbacks = _callbacks(profiler)
+        # Set only after registering: _register_callbacks resets this state
+        # itself, so priming it first would pass whether or not the switch
+        # does its own reset.
         dash_app._zoom_range = {"x": [0, 1], "y": [0, 1]}
         dash_app._recent_frame_times.append(1.0)
+        dash_app._averaged_image(np.zeros((4, 4), dtype=np.uint8), 4)
 
-        _callbacks(profiler)["switch_camera"](_other_key(profiler))
+        callbacks["switch_camera"](_other_key(profiler))
 
         assert dash_app._zoom_range is None
         assert len(dash_app._recent_frame_times) == 0
+        assert len(dash_app._avg_buffer) == 0
 
     def test_settings_panel_is_rebuilt(self, profiler):
         import dash_bootstrap_components as dbc

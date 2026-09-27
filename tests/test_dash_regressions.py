@@ -15,10 +15,11 @@ from typing import Any
 from unittest.mock import patch
 
 import dash
+import numpy as np
 import pytest
 from dash import html
 
-from pybeamprofiler import dash_app
+from pybeamprofiler import dash_app, dash_layout, discovery
 from pybeamprofiler.beamprofiler import BeamProfiler
 from pybeamprofiler.simulated import SimulatedCamera, profile_for
 
@@ -40,6 +41,15 @@ def _callbacks(bp: BeamProfiler) -> dict[str, Any]:
     app.callback = tracking  # ty: ignore[invalid-assignment]
     dash_app._register_callbacks(app, bp)
     return captured
+
+
+def _registered(app: dash.Dash, name: str) -> Any:
+    """The undecorated function behind one of a real app's callbacks."""
+    for spec in app.callback_map.values():
+        fn = spec.get("callback")
+        if fn is not None and getattr(fn, "__wrapped__", fn).__name__ == name:
+            return fn.__wrapped__
+    raise KeyError(name)
 
 
 def _tick(
@@ -176,3 +186,70 @@ class TestRoiChangeForgetsTheOldFrames:
         assert boxes_and_status[4] == reason
         # Half-applied or not, the old frames are no longer trusted.
         assert bp._last_popt_x is None
+
+
+class TestTheCameraListIsCachedForSwitching:
+    """The cache the camera switch resolves against was always empty.
+
+    ``create_app`` filled it and ``_register_callbacks`` emptied it again
+    straight afterwards, and the rescan button never refilled it. Every
+    switch therefore fell back to a full GenTL enumeration with the lock
+    held -- seconds of frozen stream on a GigE setup, the stall an earlier
+    commit had fixed.
+    """
+
+    def test_the_startup_scan_survives_create_app(self):
+        bp = BeamProfiler(camera="simulated")
+        dash_app.create_app(bp)
+        expected = [o.key for o in dash_layout._camera_options(bp)[0]]
+        assert [o.key for o in dash_app._known_options] == expected
+
+    def test_a_switch_resolves_without_rescanning(self):
+        bp = BeamProfiler(camera="simulated")
+        app = dash_app.create_app(bp)
+        assert bp.camera is not None
+        current = discovery.describe_open_camera(bp.camera).key
+        target = next(o.key for o in dash_app._known_options if o.key != current)
+
+        with patch.object(dash_layout, "discover_cameras", side_effect=AssertionError("rescan")):
+            status = _registered(app, "switch_camera")(target)[0]
+
+        assert "ready" in status
+
+    def test_a_rescan_refreshes_what_a_switch_can_find(self):
+        bp = BeamProfiler(camera="simulated")
+        app = dash_app.create_app(bp)
+        new = discovery.CameraOption(key="genicam:4242", label="Acme 4242", kind="genicam")
+        found = [new, *discovery.simulated_options()]
+        with patch.object(dash_layout, "discover_cameras", return_value=found):
+            _registered(app, "refresh_cameras")(1)
+        assert new in dash_app._known_options
+
+        opened = SimulatedCamera(profile_for("sim-2"))
+        opened.open()
+        with (
+            patch.object(dash_layout, "discover_cameras", side_effect=AssertionError("rescan")),
+            patch.object(dash_app, "open_camera", return_value=opened) as open_camera,
+        ):
+            _registered(app, "switch_camera")(new.key)
+        open_camera.assert_called_once_with(new)
+
+
+class TestANewAppStartsFromScratch:
+    """Building a second app in one process kept the first one's frames.
+
+    ``_register_callbacks`` reset the pause flag and the zoom but not the
+    averaging buffer or the fps window, so a relaunched GUI averaged its
+    first frames with the previous session's and reported a frame rate
+    measured across the gap.
+    """
+
+    def test_the_previous_sessions_frames_are_gone(self):
+        dash_app._averaged_image(np.zeros((4, 4), dtype=np.uint8), 4)
+        dash_app._recent_frame_times.extend([1.0, 2.0])
+
+        _callbacks(BeamProfiler(camera="simulated"))
+
+        assert len(dash_app._avg_buffer) == 0
+        assert dash_app._avg_running_sum is None
+        assert len(dash_app._recent_frame_times) == 0
