@@ -1,6 +1,7 @@
 """Shared pytest fixtures for pybeamprofiler tests."""
 
 import os
+import sys
 from collections.abc import Iterator
 
 import numpy as np
@@ -97,3 +98,25 @@ def test_image_file(tmp_path, simulated_image) -> str:
     img_path = tmp_path / "test_beam.png"
     Image.fromarray(simulated_image).save(img_path)
     return str(img_path)
+
+
+def pytest_runtest_logreport(report: pytest.TestReport) -> None:
+    """On GitHub Actions, turn each failure into an annotation.
+
+    A job's log can only be downloaded with admin rights on the repository,
+    so a failure that only happens on CI is otherwise invisible to everyone
+    else. Annotations appear on the pull request and in the public checks API.
+    """
+    if os.environ.get("GITHUB_ACTIONS") != "true" or not report.failed or not report.location:
+        return
+    path, line, _ = report.location
+    crash = getattr(report.longrepr, "reprcrash", None)
+    message = getattr(crash, "message", None) or str(report.longrepr).splitlines()[-1]
+    text = f"{report.nodeid} [{report.when}]: {message}"
+    # A workflow command is one line, so %, CR and LF are escaped.
+    text = text.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+    # sys.__stdout__ rather than print(): pytest may still be capturing.
+    stream = sys.__stdout__
+    if stream is not None:
+        stream.write(f"\n::error file={path},line={(line or 0) + 1}::{text}\n")
+        stream.flush()
