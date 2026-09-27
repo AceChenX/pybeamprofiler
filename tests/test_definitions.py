@@ -298,7 +298,11 @@ class TestWidthDefinitions:
 
             assert bp.width_x > 0, f"Failed for definition={definition}"
             assert bp.width_y > 0, f"Failed for definition={definition}"
-            assert hasattr(bp, "angle_deg"), f"No angle for definition={definition}"
+            # Only the 2D Gaussian fit measures an angle; FWHM and D4σ skip it.
+            if definition == "gaussian":
+                assert 0 <= bp.angle_deg < 180, f"angle {bp.angle_deg} for {definition}"
+            else:
+                assert bp.angle_deg == 0.0, f"angle {bp.angle_deg} for {definition}"
 
             bp.camera.close()
 
