@@ -10,31 +10,38 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
-    # Allow the 3.14 prerelease job to fail without blocking the overall status
-    continue-on-error: ${{ matrix.experimental == true }}
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.10", "3.11", "3.12", "3.13"]
-        experimental: [false]
+        os: [ubuntu-latest]
+        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+        # One run each on macOS and Windows, where the GenTL search paths and
+        # the path-separator handling in cti.py differ from Linux.
         include:
-          - python-version: "3.14"
-            experimental: true
+          - os: macos-latest
+            python-version: "3.13"
+          - os: windows-latest
+            python-version: "3.13"
 
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v7
 
-    - name: Install uv
-      uses: astral-sh/setup-uv@v7
+    # ``python-version`` makes setup-uv export UV_PYTHON, and that is what
+    # selects the interpreter. Installing one with ``uv python install`` does
+    # not: ``uv sync`` would still follow .python-version, so every job in the
+    # matrix used to test 3.13.
+    - name: Install uv and Python ${{ matrix.python-version }}
+      uses: astral-sh/setup-uv@v10.2.0
       with:
+        python-version: ${{ matrix.python-version }}
         enable-cache: true
-
-    - name: Set up Python ${{ matrix.python-version }}
-      run: uv python install ${{ matrix.python-version }}
 
     - name: Install dependencies
       run: uv sync --locked --extra dev
+
+    - name: Check the interpreter
+      run: uv run python -c "import sys; assert sys.version.startswith('${{ matrix.python-version }}'), sys.version"
 
     - name: Lint with ruff
       run: uv run ruff check src tests
@@ -59,10 +66,10 @@ jobs:
       contents: read   # required for actions/checkout
 
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v7
 
     - name: Install uv
-      uses: astral-sh/setup-uv@v7
+      uses: astral-sh/setup-uv@v10.2.0
 
     - name: Build package
       run: uv build

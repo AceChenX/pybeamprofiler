@@ -140,6 +140,7 @@ to draw the overlay.
 - **Access denied** — close other camera software (Spinnaker GUI, Pylon Viewer).
 - **Jupyter camera stuck** — restart the kernel to release the hardware lock.
 - **Basler USB3** — pass the USB3 CTI explicitly: `BaslerCamera(cti_file="/path/to/ProducerU3V.cti")`.
+- **`GenTL producer does not implement DS…` in the terminal** — harmless. genicam 1.6 prints these lines whenever it scans a producer that predates the newest GenTL functions; the camera still works.
 
 ---
 
