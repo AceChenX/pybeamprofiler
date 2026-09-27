@@ -227,11 +227,23 @@ def build_figure(
         bg_paper = "#ffffff"
         fg = "#333"
 
+    # ── Where the profiles go ───────────────────────────────────
+    # Each profile hugs an edge of whatever is in view -- the X projection
+    # the bottom, the Y projection the left -- and takes a fraction of the
+    # view, not of the sensor. Pinned to the sensor's own edges, as they
+    # used to be, they were left behind by any zoom: after Auto-fit none of
+    # either curve was on screen. When the view extends past the sensor the
+    # profile stays on the sensor's edge, where its fill ends.
+    view_x = xrange if xrange is not None else [0.0, x_max]
+    view_y = yrange if yrange is not None else [0.0, y_max]
+    x_base, x_span = max(view_y[0], 0.0), view_y[1] - view_y[0]
+    y_base, y_span = max(view_x[0], 0.0), view_x[1] - view_x[0]
+
     # ── X profile (bottom edge) ─────────────────────────────────
     x_ax = np.arange(w)
     cached_proj_x = getattr(bp, "_last_proj_x", None)
     proj_x = (cached_proj_x if cached_proj_x is not None else np.sum(image, axis=0)).astype(float)
-    norm_x = _normalize_profile(proj_x, y_max)
+    norm_x = x_base + _normalize_profile(proj_x, x_span)
 
     traces.append(
         go.Scatter(
@@ -247,7 +259,7 @@ def build_figure(
     )
     if popt_x is not None:
         fit_x = bp.gaussian(x_ax, *popt_x).astype(float)
-        norm_fit_x = _normalize_profile(fit_x, y_max)
+        norm_fit_x = x_base + _normalize_profile(fit_x, x_span)
         traces.append(
             go.Scatter(
                 x=x_ax * ps,
@@ -263,7 +275,7 @@ def build_figure(
     y_ax = np.arange(h)
     cached_proj_y = getattr(bp, "_last_proj_y", None)
     proj_y = (cached_proj_y if cached_proj_y is not None else np.sum(image, axis=1)).astype(float)
-    norm_y = _normalize_profile(proj_y, x_max)
+    norm_y = y_base + _normalize_profile(proj_y, y_span)
 
     traces.append(
         go.Scatter(
@@ -279,7 +291,7 @@ def build_figure(
     )
     if popt_y is not None:
         fit_y = bp.gaussian(y_ax, *popt_y).astype(float)
-        norm_fit_y = _normalize_profile(fit_y, x_max)
+        norm_fit_y = y_base + _normalize_profile(fit_y, y_span)
         traces.append(
             go.Scatter(
                 x=norm_fit_y,

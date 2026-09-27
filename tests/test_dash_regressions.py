@@ -500,3 +500,49 @@ class TestAutoFitReadsTheFitUnderTheLock:
         assert bp.camera is not None
         assert discovery.describe_open_camera(bp.camera).key == target
         assert dash_app._zoom_range is None
+
+
+def _profiles(fig: Any) -> dict[str, Any]:
+    """The four profile traces, told apart from the dashed/dotted overlays."""
+    plain = [t for t in fig.data if t.type == "scatter" and t.line.dash is None]
+    return dict(zip(["x_data", "x_fit", "y_data", "y_fit"], plain, strict=True))
+
+
+class TestTheProfilesFollowTheZoom:
+    """The projections and their fits were drawn at the sensor's edges, in
+    data coordinates. Any zoom away from those edges -- Auto-fit, a mouse
+    zoom -- left them off screen: after Auto-fit, 0% of either projection or
+    fit curve was inside the view."""
+
+    def test_after_auto_fit_every_profile_hugs_the_view(self):
+        bp = _profiler()
+        cbs = _callbacks(bp)
+        _tick(cbs)
+        cbs["auto_fit_zoom"](1)
+
+        fig = _tick(cbs)[0]
+        (x0, x1), (y0, y1) = fig.layout.xaxis.range, fig.layout.yaxis.range
+        assert x0 > 0 and y0 > 0  # genuinely zoomed away from both edges
+
+        for name in ("x_data", "x_fit"):
+            trace = _profiles(fig)[name]
+            y = np.asarray(trace.y)
+            assert y.min() == pytest.approx(y0, abs=0.01 * (y1 - y0)), name
+            assert y.max() == pytest.approx(y0 + 0.15 * (y1 - y0), rel=0.05), name
+        for name in ("y_data", "y_fit"):
+            trace = _profiles(fig)[name]
+            x = np.asarray(trace.x)
+            assert x.min() == pytest.approx(x0, abs=0.01 * (x1 - x0)), name
+            assert x.max() == pytest.approx(x0 + 0.15 * (x1 - x0), rel=0.05), name
+
+    def test_the_full_view_is_unchanged(self):
+        bp = _profiler()
+        cbs = _callbacks(bp)
+        fig = _tick(cbs)[0]
+        full = 1024 * bp.pixel_size
+        x_data = np.asarray(_profiles(fig)["x_data"].y)
+        y_data = np.asarray(_profiles(fig)["y_data"].x)
+        assert x_data.min() == pytest.approx(0.0)
+        assert x_data.max() == pytest.approx(0.15 * full)
+        assert y_data.min() == pytest.approx(0.0)
+        assert y_data.max() == pytest.approx(0.15 * full)
