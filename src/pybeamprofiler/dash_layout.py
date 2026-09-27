@@ -977,7 +977,8 @@ def _format_results(bp: BeamProfiler) -> list[Any]:
                 className="mb-1",
             )
         )
-        if bp.fit_method == "2d":
+        # Only the 2D Gaussian fit measures a rotation; FWHM and D4σ skip it.
+        if bp.fit_method == "2d" and bp.definition == "gaussian":
             rows.append(
                 html.Div(
                     [

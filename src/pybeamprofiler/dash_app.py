@@ -181,10 +181,13 @@ def build_figure(
     traces.append(go.Heatmap(**heat_kwargs))
 
     # ── Linecut crosshairs ──────────────────────────────────────
-    linecut_x = getattr(bp, "_linecut_x", None)
-    linecut_y = getattr(bp, "_linecut_y", None)
-    if bp.fit_method == "linecut" and linecut_x is not None and linecut_y is not None:
-        lx, ly = linecut_x * ps, linecut_y * ps
+    # Only where the last frame was actually cut: the coordinates are absent
+    # or None before the first linecut, and after any frame that was not one
+    # (another fit method, or FWHM/D4σ, which skip the fit altogether).
+    cut_x = getattr(bp, "_linecut_x", None)
+    cut_y = getattr(bp, "_linecut_y", None)
+    if bp.fit_method == "linecut" and cut_x is not None and cut_y is not None:
+        lx, ly = cut_x * ps, cut_y * ps
         for xs, ys in [([lx, lx], [0, y_max]), ([0, x_max], [ly, ly])]:
             traces.append(
                 go.Scatter(
@@ -1344,13 +1347,17 @@ def _register_callbacks(app: dash.Dash, bp: BeamProfiler) -> None:
             return (dash.no_update,) * 4
 
         try:
+            # Either change starts the fits from scratch. A new fit method
+            # fits different data, so the old warm start is meaningless; a
+            # model-free definition (FWHM, D4σ) skips the 2D fit and the
+            # linecut altogether, so without the reset their last results
+            # stayed on screen, frozen, as the ellipse and the crosshair.
             if analysis and bp.fit_method != analysis:
                 bp.fit_method = analysis
-                bp._last_popt_x = None
-                bp._last_popt_y = None
-                bp._last_popt_2d = None
+                bp.reset_analysis()
             if definition and bp.definition != definition:
                 bp.definition = definition
+                bp.reset_analysis()
 
             if bp._mode == "camera" and bp.camera is not None:
                 # Cap fetch at one tick so sliders/buttons (which share

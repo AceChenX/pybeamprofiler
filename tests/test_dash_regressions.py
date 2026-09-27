@@ -546,3 +546,67 @@ class TestTheProfilesFollowTheZoom:
         assert x_data.max() == pytest.approx(0.15 * full)
         assert y_data.min() == pytest.approx(0.0)
         assert y_data.max() == pytest.approx(0.15 * full)
+
+
+def _ellipse_centre(fig: Any) -> tuple[float, float] | None:
+    """Centre of the drawn beam ellipse, or ``None`` if none is drawn."""
+    traces = [t for t in fig.data if t.type == "scatter" and t.line.dash == "dash"]
+    if not traces:
+        return None
+    x, y = np.asarray(traces[0].x), np.asarray(traces[0].y)
+    return (float(x.max() + x.min()) / 2, float(y.max() + y.min()) / 2)
+
+
+def _crosshair(fig: Any) -> tuple[float, float] | None:
+    """``(x, y)`` of the linecut crosshair, or ``None`` if none is drawn."""
+    lines = [t for t in fig.data if t.type == "scatter" and t.line.dash == "dot"]
+    if not lines:
+        return None
+    vertical, horizontal = lines
+    return float(vertical.x[0]), float(horizontal.y[0])
+
+
+class TestOverlaysStayLiveUnderModelFreeDefinitions:
+    """FWHM and D4σ are read straight off the profiles, so analyze() skips
+    the 2D fit and the linecut. Their last results stayed on screen anyway:
+    on the tilted simulator the 2D ellipse sat at one point for as long as
+    FWHM was selected while the measured centre moved ~100 um a frame, drawn
+    tilted beside "Angle 0.0°", and the crosshair stayed on a peak the beam
+    had left."""
+
+    def test_the_ellipse_does_not_freeze_after_switching_to_fwhm(self):
+        bp = _profiler("sim-2", seed=7)
+        cbs = _callbacks(bp)
+        for _ in range(3):
+            fig = _tick(cbs, analysis="2d")[0]
+        last_2d = _ellipse_centre(fig)
+        assert last_2d is not None
+
+        centres = [
+            _ellipse_centre(_tick(cbs, analysis="2d", definition="fwhm")[0]) for _ in range(4)
+        ]
+
+        drawn = [c for c in centres if c is not None]
+        assert last_2d not in drawn
+        assert len(set(drawn)) == len(drawn), "the ellipse froze"
+
+    def test_the_crosshair_is_only_drawn_through_this_frames_peak(self):
+        bp = _profiler("sim-2", seed=7)
+        cbs = _callbacks(bp)
+        for _ in range(2):
+            fig = _tick(cbs, analysis="linecut")[0]
+        assert _crosshair(fig) is not None
+
+        for _ in range(3):
+            fig = _tick(cbs, analysis="linecut", definition="d4s")[0]
+            cross = _crosshair(fig)
+            if cross is not None:
+                assert bp.last_img is not None
+                py, px = np.unravel_index(int(np.argmax(bp.last_img)), bp.last_img.shape)
+                assert cross == pytest.approx((px * bp.pixel_size, py * bp.pixel_size))
+
+    def test_no_angle_is_reported_unless_the_2d_fit_ran(self):
+        bp = _profiler("sim-2", seed=7)
+        cbs = _callbacks(bp)
+        assert "Angle" in str(_tick(cbs, analysis="2d")[1])
+        assert "Angle" not in str(_tick(cbs, analysis="2d", definition="fwhm")[1])
