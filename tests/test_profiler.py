@@ -945,9 +945,11 @@ class TestAnalyzeMethod:
         img = bp.camera.get_image()
         bp.camera.stop_acquisition()
 
+        assert bp._linecut_x is None and bp._linecut_y is None
         bp.analyze(img)
-        assert hasattr(bp, "_linecut_x")
-        assert hasattr(bp, "_linecut_y")
+        # The row and column through the brightest pixel.
+        peak_y, peak_x = np.unravel_index(int(np.argmax(img)), img.shape)
+        assert (bp._linecut_x, bp._linecut_y) == (peak_x, peak_y)
         bp.camera.close()
 
     def test_analyze_2d_returns_projections(self):
