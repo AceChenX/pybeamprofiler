@@ -33,10 +33,17 @@ class _SearchDir:
     Spinnaker on Windows installs into a per-toolchain subdirectory
     (``cti64\\vs2015``), so that root needs one level of recursion; every
     other location holds the ``.cti`` files directly.
+
+    ``root`` is the SDK installation the directory belongs to. A ``.cti``
+    that is a symlink is followed only if it stays inside it -- a versioned
+    SDK may link ``gtl/Producer.cti`` to ``../Producer-7.4.cti`` -- and one
+    pointing anywhere else is ignored. Without a root, the scanned directory
+    itself is the limit.
     """
 
     path: str
     recurse: bool = False
+    root: str | None = None
 
 
 # Ordered most- to least-specific: a hit in a versioned SDK directory should
@@ -44,36 +51,56 @@ class _SearchDir:
 _VENDOR_DIRS: dict[str, dict[str, tuple[_SearchDir, ...]]] = {
     "Windows": {
         SPINNAKER: (
-            _SearchDir(r"C:\Program Files\Teledyne\Spinnaker\cti64", recurse=True),
-            _SearchDir(r"C:\Program Files\FLIR Systems\Spinnaker\cti64", recurse=True),
+            _SearchDir(
+                r"C:\Program Files\Teledyne\Spinnaker\cti64",
+                recurse=True,
+                root=r"C:\Program Files\Teledyne\Spinnaker",
+            ),
+            _SearchDir(
+                r"C:\Program Files\FLIR Systems\Spinnaker\cti64",
+                recurse=True,
+                root=r"C:\Program Files\FLIR Systems\Spinnaker",
+            ),
         ),
         PYLON: tuple(
-            _SearchDir(rf"C:\Program Files\Basler\pylon {v}\Runtime\x64")
+            _SearchDir(
+                rf"C:\Program Files\Basler\pylon {v}\Runtime\x64",
+                root=rf"C:\Program Files\Basler\pylon {v}",
+            )
             for v in ("8", "7", "6", "5")
         ),
     },
     "Linux": {
-        SPINNAKER: (_SearchDir("/opt/spinnaker/lib/flir-gentl"),),
+        SPINNAKER: (_SearchDir("/opt/spinnaker/lib/flir-gentl", root="/opt/spinnaker"),),
         PYLON: (
             # ``/opt/pylon`` is a symlink to the newest install; both lib and
             # lib64 layouts exist in the wild depending on SDK vintage.
-            _SearchDir("/opt/pylon/lib/gentlproducer/gtl"),
-            _SearchDir("/opt/pylon/lib64/gentlproducer/gtl"),
-            _SearchDir("/opt/pylon5/lib/gentlproducer/gtl"),
-            _SearchDir("/opt/pylon5/lib64/gentlproducer/gtl"),
+            _SearchDir("/opt/pylon/lib/gentlproducer/gtl", root="/opt/pylon"),
+            _SearchDir("/opt/pylon/lib64/gentlproducer/gtl", root="/opt/pylon"),
+            _SearchDir("/opt/pylon5/lib/gentlproducer/gtl", root="/opt/pylon5"),
+            _SearchDir("/opt/pylon5/lib64/gentlproducer/gtl", root="/opt/pylon5"),
         ),
     },
     "Darwin": {
         SPINNAKER: (
-            _SearchDir("/usr/local/lib/spinnaker-gentl"),
-            _SearchDir("/Library/Application Support/FLIR/Spinnaker/lib"),
+            _SearchDir("/usr/local/lib/spinnaker-gentl", root="/usr/local/lib"),
+            _SearchDir(
+                "/Library/Application Support/FLIR/Spinnaker/lib",
+                root="/Library/Application Support/FLIR/Spinnaker",
+            ),
             # Broad fallback for hand-installed producers. Last, so a real SDK
             # directory always wins.
             _SearchDir("/usr/local/lib"),
         ),
         PYLON: (
-            _SearchDir("/Library/Frameworks/pylon.framework/Libraries/gentlproducer/gtl"),
-            _SearchDir("/Library/Frameworks/pylon.framework/Libraries"),
+            _SearchDir(
+                "/Library/Frameworks/pylon.framework/Libraries/gentlproducer/gtl",
+                root="/Library/Frameworks/pylon.framework",
+            ),
+            _SearchDir(
+                "/Library/Frameworks/pylon.framework/Libraries",
+                root="/Library/Frameworks/pylon.framework",
+            ),
         ),
     },
 }
@@ -99,9 +126,12 @@ def _scan(entry: _SearchDir) -> list[str]:
         return []
     try:
         base = os.path.realpath(base)
+        limit = os.path.realpath(entry.root) if entry.root else base
     except (OSError, ValueError) as e:
         logger.debug("Could not resolve path %s: %s", base, e)
         return []
+    if not _contains(limit, base):
+        limit = base  # a root that does not contain the directory is a table mistake
 
     roots = [base]
     if entry.recurse:
@@ -125,8 +155,10 @@ def _scan(entry: _SearchDir) -> list[str]:
             if not name.endswith(".cti"):
                 continue
             full = os.path.join(root, name)
-            if _contains(base, full):
+            if _contains(limit, full):
                 found.append(full)
+            else:
+                logger.debug("Ignoring %s: it links outside %s", full, limit)
     return found
 
 
@@ -175,10 +207,18 @@ def cti_files_for(vendor: str | None = None, *, system: str | None = None) -> li
 def find_cti_files() -> list[str]:
     """Find every GenTL producer installed on this machine.
 
+    The vendor SDK locations come first, then whatever
+    ``GENICAM_GENTL64_PATH`` lists. The variable is the GenTL standard's way
+    of announcing a producer, and a camera opened through it by
+    :class:`~pybeamprofiler.flir.FlirCamera` or
+    :class:`~pybeamprofiler.basler.BaslerCamera` has to be found again by
+    discovery -- otherwise switching away from it in the GUI is a one-way
+    trip.
+
     Returns:
         Absolute ``.cti`` file paths (empty if no SDK is installed).
     """
-    return cti_files_for()
+    return _dedupe(cti_files_for() + parse_gentl_path(os.environ.get("GENICAM_GENTL64_PATH", "")))
 
 
 def parse_gentl_path(gentl_path: str) -> list[str]:
@@ -198,6 +238,9 @@ def parse_gentl_path(gentl_path: str) -> list[str]:
 
     for raw in gentl_path.split(separator):
         path = raw.strip()
+        # Quotes around an entry are part of how it was typed, not of the path.
+        if len(path) >= 2 and path[0] == path[-1] and path[0] in "\"'":
+            path = path[1:-1].strip()
         if not path or not os.path.exists(path):
             continue
         if os.path.isdir(path):

@@ -30,7 +30,6 @@ def bus(tmp_path, monkeypatch) -> FakeBus:
     cti = tmp_path / "FakeProducer.cti"
     cti.touch()
     fake = FakeBus([FakeDevice("SN-A", id_="dev-a", cti=str(cti))])
-    fake.cti = str(cti)  # ty: ignore[unresolved-attribute]
     monkeypatch.setattr(gen_camera, "Harvester", fake.harvester_class)
     return fake
 
@@ -202,7 +201,6 @@ def two_cameras(tmp_path, monkeypatch) -> FakeBus:
             FakeDevice("SN-B", id_="dev-b", cti=str(cti)),
         ]
     )
-    fake.cti = str(cti)  # ty: ignore[unresolved-attribute]
     monkeypatch.setattr(gen_camera, "Harvester", fake.harvester_class)
     monkeypatch.setattr(discovery, "find_cti_files", lambda: [str(cti)])
     return fake
@@ -750,3 +748,104 @@ class TestBitDepth:
         from pybeamprofiler.simulated import SimulatedCamera
 
         assert SimulatedCamera().bit_depth == 8
+
+
+class _SerialNotImplemented:
+    """A DeviceInfo whose producer does not implement DEVICE_INFO_SERIAL_NUMBER.
+
+    Harvesters' property_dict has ``None`` for it; the live attribute raises.
+    """
+
+    def __init__(self, base: FakeDevice) -> None:
+        self.cti, self.id_, self.model, self.vendor = base.cti, base.id_, base.model, base.vendor
+        self.node_map, self.parent = base.node_map, base.parent
+        self.property_dict = {
+            "serial_number": None,
+            "id_": base.id_,
+            "model": base.model,
+            "vendor": base.vendor,
+        }
+
+    @property
+    def serial_number(self) -> str:
+        from genicam.gentl import NotImplementedException
+
+        raise NotImplementedException("DEVICE_INFO_SERIAL_NUMBER")
+
+
+class TestDiscoveryFindsWhatWasPicked:
+    def _bus(self, tmp_path, monkeypatch, devices: list[Any]) -> FakeBus:
+        cti = tmp_path / "FakeProducer.cti"
+        cti.touch()
+        for device in devices:
+            device.cti = str(cti)
+            device.__post_init__()
+        fake = FakeBus(devices)
+        monkeypatch.setattr(gen_camera, "Harvester", fake.harvester_class)
+        monkeypatch.setattr(discovery, "find_cti_files", lambda: [str(cti)])
+        return fake
+
+    def test_a_serial_less_camera_opens_the_one_picked(self, tmp_path, monkeypatch):
+        self._bus(tmp_path, monkeypatch, [FakeDevice("", id_="devA"), FakeDevice("", id_="devB")])
+        options = discovery.discover_cameras(include_simulated=False)
+        assert [o.key for o in options] == ["genicam:devA", "genicam:devB"]
+
+        cam = discovery.open_camera(options[1])
+        try:
+            assert isinstance(cam, HarvesterCamera)
+            assert cam.device_id == "devB"  # used to be devA, the first enumerated
+        finally:
+            cam.close()
+
+    def test_serials_match_exactly(self, tmp_path, monkeypatch):
+        bus = self._bus(tmp_path, monkeypatch, [FakeDevice("24001234"), FakeDevice("4001234")])
+        cam = HarvesterCamera(cti_file=bus.cti, serial_number="4001234")
+        cam.open()
+        try:
+            assert cam.serial_number == "4001234"  # a substring match took 24001234
+        finally:
+            cam.close()
+
+    def test_one_device_without_a_serial_field_hides_nothing(self, tmp_path, monkeypatch):
+        good = FakeDevice("SN-GOOD", id_="good")
+        odd = FakeDevice("ignored", id_="odd")
+        bus = self._bus(tmp_path, monkeypatch, [odd, good])
+        bus.devices[0] = _SerialNotImplemented(odd)
+
+        found = discovery.list_cameras()
+        assert [(c["serial_number"], c["id"]) for c in found] == [("", "odd"), ("SN-GOOD", "good")]
+
+        cam = HarvesterCamera(cti_file=bus.cti, serial_number="SN-GOOD")
+        cam.open()
+        try:
+            assert cam.device_id == "good"
+        finally:
+            cam.close()
+
+    def test_a_camera_found_through_the_env_var_can_be_reopened(self, tmp_path, monkeypatch):
+        """FlirCamera/BaslerCamera fall back to GENICAM_GENTL64_PATH, but
+        discovery never read it: the camera was missing from the dropdown,
+        and switching away from it could not be undone."""
+        from pybeamprofiler.basler import BaslerCamera
+
+        producer_dir = tmp_path / "gentl"
+        producer_dir.mkdir()
+        cti = producer_dir / "Producer.cti"
+        cti.touch()
+        fake = FakeBus([FakeDevice("SN-ENV", cti=str(cti))])
+        monkeypatch.setattr(gen_camera, "Harvester", fake.harvester_class)
+        monkeypatch.setenv("GENICAM_GENTL64_PATH", str(producer_dir))
+
+        assert [c["serial_number"] for c in discovery.list_cameras()] == ["SN-ENV"]
+
+        cam = BaslerCamera()
+        cam.open()
+        option = discovery.describe_open_camera(cam)
+        cam.close()  # e.g. the user switched to the simulator
+
+        again = discovery.open_camera(option)
+        try:
+            assert isinstance(again, HarvesterCamera)
+            assert again.serial_number == "SN-ENV"
+        finally:
+            again.close()

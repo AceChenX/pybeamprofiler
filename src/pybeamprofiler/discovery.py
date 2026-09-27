@@ -134,6 +134,9 @@ class CameraOption:
     vendor: str = ""
     model: str = ""
     serial_number: str = ""
+    #: The GenTL device id, used to open a camera that reports no serial.
+    #: It stays out of the key when a serial exists, so keys do not change.
+    device_id: str = ""
 
     @property
     def is_simulated(self) -> bool:
@@ -190,6 +193,7 @@ def _describe(info: dict[str, str | int]) -> CameraOption:
         vendor=vendor,
         model=model,
         serial_number=serial,
+        device_id=device_id,
     )
 
 
@@ -259,7 +263,8 @@ def open_camera(option: CameraOption) -> Camera:
 
     Raises:
         RuntimeError: If the device cannot be opened — most often because
-            another application already holds it.
+            another application already holds it. The message names the
+            camera, so it can be shown to the user as it is.
     """
     if option.is_simulated:
         from .simulated import SimulatedCamera, profile_for
@@ -270,10 +275,19 @@ def open_camera(option: CameraOption) -> Camera:
 
     from .gen_camera import HarvesterCamera
 
+    if not option.serial_number and not option.device_id:
+        # Opening "whichever device comes first" is how picking one
+        # serial-less camera used to open a different one.
+        raise RuntimeError(
+            f"Could not open {option.label}: the producer reports neither a serial "
+            "number nor a device id for it, so it cannot be told apart from other cameras."
+        )
+
     cti_files = find_cti_files()
     camera = HarvesterCamera(
         cti_file=cti_files or None,
         serial_number=option.serial_number or None,
+        device_id=None if option.serial_number else option.device_id or None,
     )
     try:
         camera.open()
@@ -323,7 +337,7 @@ def describe_open_camera(camera: Camera) -> CameraOption:
             "vendor": getattr(camera, "device_vendor", "") or "",
             "model": getattr(camera, "device_model", "") or "",
             "serial_number": getattr(camera, "serial_number", "") or "",
-            "id": "",
+            "id": getattr(camera, "device_id", "") or "",
             "index": 0,
         }
     )

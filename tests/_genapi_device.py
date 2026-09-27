@@ -282,9 +282,11 @@ class FakeBus:
     that broke switching between two cameras on the same producer.
     """
 
-    def __init__(self, devices: list[FakeDevice]) -> None:
-        self.devices = devices
+    def __init__(self, devices: list[Any]) -> None:
+        self.devices: list[Any] = devices
         self.harvesters: list[FakeHarvester] = []
+        # The producer the (first) device is on, for tests to pass as cti_file.
+        self.cti: str = devices[0].cti if devices else ""
 
     def harvester_class(self) -> FakeHarvester:
         h = FakeHarvester(self)

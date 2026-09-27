@@ -396,7 +396,9 @@ class TestOpenCamera:
         ):
             discovery.open_camera(option)
 
-        mock_cls.assert_called_once_with(cti_file=["/x/a.cti"], serial_number="12345678")
+        mock_cls.assert_called_once_with(
+            cti_file=["/x/a.cti"], serial_number="12345678", device_id=None
+        )
         mock_cls.return_value.open.assert_called_once()
 
     def test_no_cti_files_passes_none_rather_than_an_empty_list(self):
@@ -451,3 +453,51 @@ class TestOpenCamera:
             mock_cls.return_value.close.side_effect = RuntimeError("close also broken")
             with pytest.raises(RuntimeError, match="in use"):
                 discovery.open_camera(option)
+
+
+class TestOpeningTheCameraThatWasPicked:
+    """Options fell back to the device id as their key, but open_camera()
+    passed only the serial -- so a serial-less option opened whichever
+    device enumerated first -- and serials matched as substrings."""
+
+    def test_a_serial_less_camera_opens_by_device_id(self):
+        option = discovery._describe(
+            {"vendor": "V", "model": "CamB", "serial_number": "", "id": "devB", "index": 1}
+        )
+        assert option.key == "genicam:devB"
+        assert option.device_id == "devB"
+        with (
+            patch("pybeamprofiler.discovery.find_cti_files", return_value=["/x/a.cti"]),
+            patch("pybeamprofiler.gen_camera.HarvesterCamera") as mock_cls,
+        ):
+            discovery.open_camera(option)
+        assert mock_cls.call_args.kwargs["device_id"] == "devB"
+        assert mock_cls.call_args.kwargs["serial_number"] is None
+
+    def test_the_serial_wins_when_there_is_one(self):
+        option = discovery._describe(
+            {"vendor": "V", "model": "M", "serial_number": "123", "id": "dev", "index": 0}
+        )
+        assert option.key == "genicam:123"  # keys unchanged by carrying the id
+        with (
+            patch("pybeamprofiler.discovery.find_cti_files", return_value=[]),
+            patch("pybeamprofiler.gen_camera.HarvesterCamera") as mock_cls,
+        ):
+            discovery.open_camera(option)
+        assert mock_cls.call_args.kwargs["serial_number"] == "123"
+        assert mock_cls.call_args.kwargs["device_id"] is None
+
+    def test_an_option_that_identifies_nothing_is_refused(self):
+        option = discovery._describe({"vendor": "V", "model": "M", "index": 3})
+        with patch("pybeamprofiler.gen_camera.HarvesterCamera") as mock_cls:
+            with pytest.raises(RuntimeError, match="Could not open V M: .*neither a serial"):
+                discovery.open_camera(option)
+        mock_cls.assert_not_called()
+
+    def test_describing_an_open_camera_keeps_its_device_id(self):
+        from types import SimpleNamespace
+
+        camera = SimpleNamespace(
+            device_vendor="V", device_model="M", serial_number="", device_id="devB"
+        )
+        assert discovery.describe_open_camera(camera).key == "genicam:devB"  # ty: ignore[invalid-argument-type]

@@ -372,3 +372,47 @@ class TestFilesystemFailures:
     def test_dedupe_falls_back_to_the_raw_path(self):
         with patch("pybeamprofiler.cti.os.path.realpath", side_effect=OSError("gone")):
             assert cti._dedupe(["/a.cti", "/a.cti", "/b.cti"]) == ["/a.cti", "/b.cti"]
+
+
+class TestEnvironmentAndLinks:
+    def test_find_cti_files_includes_the_env_var(self, tmp_path, monkeypatch, fake_sdk):
+        install, _, _ = fake_sdk
+        install()
+        (made,) = _make_cti(tmp_path, "Custom.cti")
+        monkeypatch.setenv("GENICAM_GENTL64_PATH", str(tmp_path))
+        assert cti.find_cti_files() == [made]
+
+    def test_sdk_producers_come_before_env_ones_and_are_not_repeated(
+        self, tmp_path, monkeypatch, fake_sdk
+    ):
+        install, spin, _ = fake_sdk
+        (sdk_cti,) = _make_cti(spin, "FLIR_GenTL.cti")
+        install(spin_dirs=[cti._SearchDir(str(spin))])
+        other = tmp_path / "other"
+        (env_cti,) = _make_cti(other, "Other.cti")
+        sep = ";" if os.name == "nt" else ":"
+        monkeypatch.setenv("GENICAM_GENTL64_PATH", f"{other}{sep}{spin}")
+        assert cti.find_cti_files() == [sdk_cti, env_cti]
+
+    def test_quoted_entries_are_read(self, tmp_path):
+        (made,) = _make_cti(tmp_path, "Quoted.cti")
+        assert cti.parse_gentl_path(f'"{tmp_path}"') == [made]
+        assert cti.parse_gentl_path(f"'{made}'") == [made]
+
+    def test_a_link_to_a_sibling_inside_the_sdk_is_followed(self, tmp_path):
+        """A versioned install may link gtl/Producer.cti to ../Producer-7.4.cti."""
+        sdk = tmp_path / "sdk"
+        gtl = sdk / "lib" / "gtl"
+        gtl.mkdir(parents=True)
+        (real,) = _make_cti(sdk / "lib", "Producer-7.4.cti")
+        os.symlink(real, gtl / "Producer.cti")
+        found = cti._scan(cti._SearchDir(str(gtl), root=str(sdk)))
+        assert [os.path.basename(p) for p in found] == ["Producer.cti"]
+
+    def test_a_link_out_of_the_sdk_is_still_ignored(self, tmp_path):
+        sdk = tmp_path / "sdk"
+        gtl = sdk / "gtl"
+        gtl.mkdir(parents=True)
+        (elsewhere,) = _make_cti(tmp_path / "elsewhere", "Planted.cti")
+        os.symlink(elsewhere, gtl / "Planted.cti")
+        assert cti._scan(cti._SearchDir(str(gtl), root=str(sdk))) == []
