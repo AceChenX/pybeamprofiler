@@ -1619,7 +1619,8 @@ class TestROIExtraBranches:
         fn = self._find(bp, "div-roi-status")
         assert fn is not None
         result = fn(1, 0, 0, 100, 100)
-        assert "Error" in result and "bad roi" in result
+        # The camera's own message, with nothing wrapped around it.
+        assert result == "bad roi"
 
     def test_reset_roi_no_camera_returns_no_camera(self):
         bp = BeamProfiler(camera="simulated")
@@ -1632,18 +1633,20 @@ class TestROIExtraBranches:
         fn = self._find(bp, "btn-roi-reset")
         assert fn is not None
         bp.camera = None
-        assert fn(1) == (0, 0, 0, 0, "No camera")
+        assert fn(1) == (*(dash.no_update,) * 4, "No camera")
 
-    def test_reset_roi_restarts_when_was_acquiring(self):
+    def test_reset_roi_reports_what_the_camera_read_back(self):
         bp = BeamProfiler(camera="simulated")
         assert bp.camera is not None
         bp.camera.start_acquisition()
-        assert bp.camera.is_acquiring
+        getattr(bp.camera, "set_roi")(offset_x=100, offset_y=50, width=200, height=100)
         fn = self._find(bp, "btn-roi-reset")
         assert fn is not None
         result = fn(1)
-        assert result[4] == "Reset to full sensor"
-        assert bp.camera.is_acquiring  # restarted
+        assert result == (0, 0, 1024, 1024, "Reset to full sensor")
+        # Stopping and restarting is the camera's business; the GUI leaves
+        # the stream as it found it.
+        assert bp.camera.is_acquiring
 
     def test_reset_roi_exception_returns_error_tuple(self):
         from unittest.mock import MagicMock
@@ -1656,8 +1659,10 @@ class TestROIExtraBranches:
         fn = self._find(bp, "btn-roi-reset")
         assert fn is not None
         result = fn(1)
-        assert result[:4] == (0, 0, 0, 0)
-        assert "Error" in result[4]
+        # The boxes keep their values: zeros would make the next Apply ask
+        # for a 0x0 ROI.
+        assert all(v is dash.no_update for v in result[:4])
+        assert result[4] == "bad reset"
 
 
 # ─── GenICam pattern-matching extra branches ──────────────────────────────

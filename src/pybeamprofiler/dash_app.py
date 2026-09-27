@@ -619,6 +619,26 @@ def _averaged_image(image: np.ndarray, n: int) -> np.ndarray:
     return mean.astype(image.dtype)
 
 
+def _discard_frame_history(bp: BeamProfiler) -> None:
+    """Forget everything measured from frames the next frame won't match.
+
+    Needed whenever the coordinate system of the frames changes under us: an
+    ROI moves the origin and usually the shape, and a camera switch changes
+    both along with the pixel pitch. The fitter warm-starts from the previous
+    frame, so a centre measured before the change seeds the next fit outside
+    the new frame; the averaging buffer would blend two different windows;
+    the zoom box would frame the wrong region; and the fps window would span
+    two different frame sizes.
+
+    The caller must hold ``_callback_lock``.
+    """
+    global _zoom_range  # noqa: PLW0603
+    bp.reset_analysis()
+    _reset_avg_state()
+    _recent_frame_times.clear()
+    _zoom_range = None
+
+
 def _register_callbacks(app: dash.Dash, bp: BeamProfiler) -> None:
     """Wire up all Dash callbacks."""
     global _known_options, _server_paused, _zoom_range  # noqa: PLW0603
@@ -685,7 +705,7 @@ def _register_callbacks(app: dash.Dash, bp: BeamProfiler) -> None:
         Streaming is left paused afterwards: the caller picked a camera, and
         starting it is the next deliberate click.
         """
-        global _server_paused, _zoom_range  # noqa: PLW0603
+        global _server_paused  # noqa: PLW0603
 
         if not key:
             return (dash.no_update,) * 6
@@ -710,15 +730,8 @@ def _register_callbacks(app: dash.Dash, bp: BeamProfiler) -> None:
                 return (f"Could not open {option.label}: {e}",) + (dash.no_update,) * 5
 
             bp.attach_camera(camera)
-
-            # Everything derived from the previous camera is now meaningless:
-            # the zoom is in the old sensor's micrometres, the averaging
-            # buffer holds frames of the old shape, and the fps window
-            # measured a different device.
+            _discard_frame_history(bp)
             _server_paused = True
-            _zoom_range = None
-            _recent_frame_times.clear()
-            _reset_avg_state()
 
             items = _build_setting_items(bp)
             scale = round(bp.pixel_size, 4)
@@ -1069,6 +1082,9 @@ def _register_callbacks(app: dash.Dash, bp: BeamProfiler) -> None:
 
         Cameras quantise ROI values to their own granularity, so the status
         line reports what the device accepted, not what was asked for.
+        Stopping and restarting acquisition around the change is the
+        camera's job (``set_roi`` knows whether its device needs it), and a
+        rejection comes back as an exception whose message is shown as is.
         """
         if bp.camera is None:
             return "No camera"
@@ -1076,25 +1092,19 @@ def _register_callbacks(app: dash.Dash, bp: BeamProfiler) -> None:
             return "Please enter offset/width/height"
         with _callback_lock:
             try:
-                offset_x = int(ox)
-                offset_y = int(oy)
-                width = int(w)
-                height = int(h)
-                was_acquiring = bp.camera.is_acquiring
-                if was_acquiring:
-                    bp.camera.stop_acquisition()
                 getattr(bp.camera, "set_roi")(
-                    offset_x=offset_x, offset_y=offset_y, width=width, height=height
+                    offset_x=int(ox), offset_y=int(oy), width=int(w), height=int(h)
                 )
-                if was_acquiring:
-                    bp.camera.start_acquisition()
                 roi = getattr(bp.camera, "roi_info")
-                return (
-                    f"ROI: {roi['width']}×{roi['height']} at ({roi['offset_x']},{roi['offset_y']})"
-                )
             except Exception as e:
-                logger.warning(f"Failed to set ROI: {e}")
-                return f"Error: {e}"
+                logger.warning("ROI not applied: %s", e)
+                return str(e) or type(e).__name__
+            finally:
+                # Even a rejected ROI may have been half applied (an offset
+                # accepted before the width was refused), so the old frames'
+                # coordinates can't be trusted either way.
+                _discard_frame_history(bp)
+        return f"ROI: {roi['width']}×{roi['height']} at ({roi['offset_x']},{roi['offset_y']})"
 
     @app.callback(
         Output("input-roi-ox", "value"),
@@ -1105,23 +1115,31 @@ def _register_callbacks(app: dash.Dash, bp: BeamProfiler) -> None:
         Input("btn-roi-reset", "n_clicks"),
         prevent_initial_call=True,
     )
-    def reset_roi(_n: int) -> tuple[int, int, int, int, str]:
-        """Restore the full sensor and refresh the ROI boxes."""
+    def reset_roi(_n: int) -> tuple[Any, ...]:
+        """Restore the full sensor and refresh the ROI boxes.
+
+        On failure the boxes are left alone. Writing zeros into them, as this
+        used to, set up the next Apply to request a 0×0 ROI.
+        """
+        unchanged = (dash.no_update,) * 4
         if bp.camera is None:
-            return 0, 0, 0, 0, "No camera"
+            return (*unchanged, "No camera")
         with _callback_lock:
             try:
-                was_acquiring = bp.camera.is_acquiring
-                if was_acquiring:
-                    bp.camera.stop_acquisition()
                 getattr(bp.camera, "set_roi")(offset_x=0, offset_y=0, width=None, height=None)
-                if was_acquiring:
-                    bp.camera.start_acquisition()
                 roi = getattr(bp.camera, "roi_info")
-                return 0, 0, roi["max_width"], roi["max_height"], "Reset to full sensor"
             except Exception as e:
-                logger.warning(f"Failed to reset ROI: {e}")
-                return 0, 0, 0, 0, f"Error: {e}"
+                logger.warning("Could not restore the full sensor: %s", e)
+                return (*unchanged, str(e) or type(e).__name__)
+            finally:
+                _discard_frame_history(bp)
+        return (
+            roi["offset_x"],
+            roi["offset_y"],
+            roi["width"],
+            roi["height"],
+            "Reset to full sensor",
+        )
 
     # -- GenICam feature callbacks (pattern-matching) -------------------------
     # Also unconditional. Pattern-matching callbacks happily target components
