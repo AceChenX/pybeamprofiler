@@ -55,7 +55,12 @@ def _no_installed_sdk(request, monkeypatch):
 
     Tests that genuinely exercise the tables opt out with
     ``@pytest.mark.real_cti``.
+
+    ``GENICAM_GENTL64_PATH`` is removed for every test, opted out or not:
+    discovery reads it too, and a developer's shell setting would otherwise
+    leak their producers into the suite exactly as an installed SDK would.
     """
+    monkeypatch.delenv("GENICAM_GENTL64_PATH", raising=False)
     if request.node.get_closest_marker("real_cti"):
         return
     monkeypatch.setattr(
@@ -63,6 +68,22 @@ def _no_installed_sdk(request, monkeypatch):
         "_VENDOR_DIRS",
         {system: dict.fromkeys(vendors, ()) for system, vendors in REAL_VENDOR_DIRS.items()},
     )
+
+
+@pytest.fixture(autouse=True)
+def _fresh_shared_harvester() -> Iterator[None]:
+    """Start and end every test with no process-wide Harvester.
+
+    ``gen_camera`` keeps one Harvester for the whole process, because a
+    GenTL producer can only be initialised once. A test that opens a camera
+    on a mocked Harvester and never closes it would otherwise hand that mock
+    to every later test.
+    """
+    from pybeamprofiler import gen_camera
+
+    gen_camera._reset_shared_harvester()
+    yield
+    gen_camera._reset_shared_harvester()
 
 
 @pytest.fixture

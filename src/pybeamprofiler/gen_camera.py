@@ -18,6 +18,7 @@ import importlib
 import logging
 import os
 import platform
+import threading
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -32,7 +33,7 @@ except ImportError:
     _HarvestersTimeout = None  # ty:ignore[invalid-assignment]
 
 from .camera import Camera, _roi_pixels
-from .cti import parse_gentl_path
+from .cti import find_cti_files, parse_gentl_path
 
 logger = logging.getLogger(__name__)
 
@@ -251,6 +252,221 @@ def _to_mono(component: Any) -> np.ndarray:
     return planes.mean(axis=2).astype(data.dtype)
 
 
+def _device_field(device: Any, name: str) -> str:
+    """One field of a Harvesters ``DeviceInfo``, as a stripped string.
+
+    ``property_dict`` is the snapshot Harvesters takes at enumeration, with
+    the fields a producer does not implement already turned into ``None``.
+    Reading the live attribute instead raises for those -- which used to
+    abort discovery, and every ``open()``, for all cameras because of one.
+    """
+    props = getattr(device, "property_dict", None)
+    if isinstance(props, dict) and name in props:
+        value = props[name]
+    else:
+        try:
+            value = getattr(device, name, None)
+        except Exception:
+            value = None
+    return "" if value is None else str(value).strip()
+
+
+def _device_cti(device: Any) -> str | None:
+    """The resolved path of the producer that enumerated ``device``, if known.
+
+    Harvesters links ``DeviceInfo`` -> ``Interface`` -> ``System`` ->
+    ``Producer``, and the producer knows the file it was loaded from.
+    """
+    try:
+        path = device.parent.parent.parent.path_name
+    except Exception:
+        return None
+    return os.path.realpath(path) if isinstance(path, str) else None
+
+
+class _SharedHarvester:
+    """The one Harvester this process uses, and who is using it.
+
+    A GenTL producer can be initialised once per process: a second
+    Harvester loading the same ``.cti`` gets ``GC_ERR_RESOURCE_IN_USE`` from
+    ``GCInitLib``, and Harvesters drops the producer with a log line, so it
+    sees no cameras at all. That is what stopped the GUI from switching
+    between two cameras on one producer, and made a rescan find nothing
+    while a camera was open. Discovery and every camera therefore go through
+    this single Harvester.
+
+    ``Harvester.update()`` destroys every ImageAcquirer the Harvester has
+    created, so it only runs while no camera is open. While one is, the
+    device list from the last enumeration is served instead; cameras
+    plugged in since then appear once no camera is open.
+
+    Attributes:
+        lock: Guards everything here. Taken inside a camera's own lock,
+            never the other way round.
+        harvester: The Harvester, or ``None`` while nothing needs one.
+        files: Producers added to it, in load order.
+        users: ImageAcquirers created from it and not yet destroyed. At zero
+            the Harvester is reset and dropped, releasing the producers.
+    """
+
+    def __init__(self) -> None:
+        self.lock = threading.RLock()
+        self.harvester: Any = None
+        self.files: list[str] = []
+        self.users = 0
+
+
+_SHARED = _SharedHarvester()
+
+
+def _new_harvester() -> Any:
+    """A new Harvester, or ImportError if Harvesters is not installed."""
+    if Harvester is None:
+        raise ImportError("harvesters is not installed")
+    return Harvester()
+
+
+def _drop_shared_harvester() -> None:
+    """Reset and forget the shared Harvester. Call with ``_SHARED.lock`` held."""
+    h = _SHARED.harvester
+    _SHARED.harvester, _SHARED.files, _SHARED.users = None, [], 0
+    if h is not None:
+        try:
+            h.reset()
+        except Exception:
+            logger.debug("Error resetting Harvester", exc_info=True)
+
+
+def _reset_shared_harvester() -> None:
+    """Drop the shared Harvester whatever holds it. For test isolation."""
+    with _SHARED.lock:
+        _drop_shared_harvester()
+
+
+def _acquire_device(files: list[str], choose: Any) -> tuple[Any, Any, Any]:
+    """Open a device through the shared Harvester, creating it if need be.
+
+    Args:
+        files: Producers the caller needs loaded, in order of preference.
+        choose: Called with the device list; returns the ``DeviceInfo`` to
+            open or raises ``RuntimeError`` saying why there is none.
+
+    Returns:
+        ``(harvester, image_acquirer, device_info)``.
+    """
+    with _SHARED.lock:
+        h = _SHARED.harvester
+        if h is None:
+            h = _new_harvester()
+            _SHARED.harvester = h
+        missing = [path for path in files if path not in _SHARED.files]
+        if _SHARED.users == 0:
+            for path in missing:
+                h.add_file(path)
+                _SHARED.files.append(path)
+            # Nothing is open, so a fresh enumeration is safe, and it finds
+            # cameras plugged in since the last one.
+            h.update()
+        elif missing:
+            logger.warning(
+                "Not loading %s: another camera is open, and adding a producer means "
+                "re-enumerating, which would close it.",
+                ", ".join(missing),
+            )
+        try:
+            try:
+                device = choose(list(h.device_info_list))
+            except RuntimeError as exc:
+                if _SHARED.users:
+                    raise RuntimeError(
+                        f"{exc} (The device list is not rescanned while another camera is open.)"
+                    ) from exc
+                raise
+            ia = h.create(device)
+        except BaseException:
+            if _SHARED.users == 0:
+                _drop_shared_harvester()
+            raise
+        _SHARED.users += 1
+        logger.info(f"Harvester loaded {len(_SHARED.files)} CTI file(s)")
+        for path in _SHARED.files:
+            logger.info(f"  CTI: {path}")
+        return h, ia, device
+
+
+def _return_device(ia: Any) -> None:
+    """Destroy an ImageAcquirer from the shared Harvester and drop a user."""
+    with _SHARED.lock:
+        try:
+            ia.destroy()
+        except Exception:
+            logger.debug("Error destroying ImageAcquirer", exc_info=True)
+        if _SHARED.users > 0:
+            _SHARED.users -= 1
+        if _SHARED.users == 0:
+            _drop_shared_harvester()
+
+
+def _device_records(devices: list[Any], files: list[str]) -> list[dict[str, str | int]]:
+    """Plain-data descriptions of the devices that came from ``files``."""
+    wanted = {os.path.realpath(path) for path in files}
+    records: list[dict[str, str | int]] = []
+    for device in devices:
+        cti = _device_cti(device)
+        if cti is not None and wanted and cti not in wanted:
+            continue
+        records.append(
+            {
+                "vendor": _device_field(device, "vendor"),
+                "model": _device_field(device, "model"),
+                "serial_number": _device_field(device, "serial_number"),
+                "id": _device_field(device, "id_"),
+                "index": len(records),
+                "cti": cti or "",
+            }
+        )
+    return records
+
+
+def _list_devices(files: list[str]) -> list[dict[str, str | int]]:
+    """Describe every device the given producers can see.
+
+    Never disturbs an open camera: while one is open this answers from the
+    last enumeration rather than calling ``update()``. With nothing open it
+    enumerates on a scratch Harvester and resets it again, so no producer
+    stays loaded behind the caller's back.
+
+    Raises:
+        Exception: Whatever enumeration raises; callers treat discovery as
+            best-effort.
+    """
+    with _SHARED.lock:
+        if _SHARED.users and _SHARED.harvester is not None:
+            missing = [path for path in files if path not in _SHARED.files]
+            if missing:
+                logger.info(
+                    "%d producer(s) are not loaded and cannot be while a camera is open: %s",
+                    len(missing),
+                    ", ".join(missing),
+                )
+            return _device_records(list(_SHARED.harvester.device_info_list), files)
+
+        h = _new_harvester()
+        try:
+            for path in files:
+                try:
+                    h.add_file(path)
+                except Exception as e:
+                    logger.warning(f"Could not load {path}: {e}")
+            h.update()
+            return _device_records(list(h.device_info_list), files)
+        finally:
+            try:
+                h.reset()
+            except Exception:
+                logger.debug("Error resetting Harvester", exc_info=True)
+
+
 class HarvesterCamera(Camera):
     """GenICam camera interface using Harvesters library.
 
@@ -270,14 +486,20 @@ class HarvesterCamera(Camera):
         self,
         cti_file: str | list[str] | None = None,
         serial_number: str | None = None,
+        device_id: str | None = None,
     ) -> None:
         """Initialize Harvester camera.
+
+        Nothing is loaded or claimed until :meth:`open`.
 
         Args:
             cti_file: Path(s) to GenTL producer (``.cti``) file(s).
                 If ``None``, the caller (e.g. :class:`BaslerCamera`) is expected
                 to resolve the path via ``GENICAM_GENTL64_PATH`` or platform search.
-            serial_number: Camera serial number for device selection.
+            serial_number: Open the device with exactly this serial number.
+            device_id: Open the device with exactly this GenTL device id, for
+                producers that report no serial number. Ignored if
+                ``serial_number`` is given.
         """
         super().__init__()
         if Harvester is None:
@@ -286,21 +508,30 @@ class HarvesterCamera(Camera):
                 "(Pylon or Spinnaker) and ensure its genicam Python bindings are on the path. "
                 "On Linux/Windows: pip install harvesters"
             )
-        self.h = Harvester()
 
+        # The producers *this* camera was asked for. Every other installed
+        # producer is loaded too (see _harvester_files), but only these
+        # decide which device "the first camera" means.
+        self._cti_files: list[str] = []
         if cti_file:
             files = [cti_file] if isinstance(cti_file, str) else cti_file
             for file_path in files:
                 if not os.path.exists(file_path):
                     logger.warning(f"CTI file not found: {file_path}")
                 else:
-                    self.h.add_file(file_path)
+                    self._cti_files.append(file_path)
                     logger.info(f"Using CTI file: {file_path}")
         else:
             logger.warning(
                 "No CTI file specified. Please provide cti_file parameter or set GENICAM_GENTL64_PATH."
             )
 
+        # The Harvester in use while open. It is the process-wide shared one
+        # unless a Harvester was assigned here before open(), which is then
+        # used as it is and reset by close().
+        self.h: Any = None
+        self._shared = False
+        self.device_id: str | None = device_id
         self.serial_number: str | None = serial_number
         self.device_model: str | None = None
         self.device_vendor: str | None = None
@@ -347,43 +578,35 @@ class HarvesterCamera(Camera):
         return found if len(found) > 1 else found[0]
 
     def open(self) -> None:
-        """Open camera connection and retrieve camera properties."""
-        logger.info(f"Harvester loaded {len(self.h.files)} CTI file(s)")
-        for cti in self.h.files:
-            logger.info(f"  CTI: {cti}")
+        """Claim the device and read back its capabilities.
 
-        self.h.update()
+        A failure at any point releases whatever was claimed on the way, so
+        a failed open() never leaves a producer or device held -- the next
+        attempt, in this process or another, starts clean.
 
-        if len(self.h.device_info_list) == 0:
-            raise RuntimeError(
-                f"No GenICam cameras found using {len(self.h.files)} CTI file(s). "
-                "Ensure camera is connected and the correct GenTL producer (.cti) is loaded. "
-                f"Loaded CTI files: {self.h.files}"
-            )
+        Raises:
+            RuntimeError: No matching camera, or the device refused to open
+                (most often because another application holds it).
+        """
+        if self.ia is not None:
+            self._release_device()  # reopening: hand the old device back first
+        try:
+            if self.h is not None:
+                ia, device = self._open_private()
+            else:
+                self.h, ia, device = _acquire_device(self._harvester_files(), self._choose_device)
+                self._shared = True
+            self.ia = ia
+            self._take_device_identity(device)
+            self.node_map = ia.remote_device.node_map
+            self._configure_device()
+        except BaseException:
+            self.close()
+            raise
+        logger.info(f"Camera opened successfully: {self.device_model}")
 
-        logger.info(f"Found {len(self.h.device_info_list)} camera(s):")
-        for i, device in enumerate(self.h.device_info_list):
-            logger.info(f"  [{i}] {device.vendor} {device.model} (S/N: {device.serial_number})")
-
-        device_to_open = None
-        if self.serial_number:
-            for device in self.h.device_info_list:
-                if self.serial_number in device.serial_number:
-                    device_to_open = device
-                    break
-            if not device_to_open:
-                raise RuntimeError(f"Camera with serial number '{self.serial_number}' not found.")
-        else:
-            device_to_open = self.h.device_info_list[0]
-            logger.info(f"Using first camera: {device_to_open.model}")
-
-        self.device_model = getattr(device_to_open, "model", None)
-        self.device_vendor = getattr(device_to_open, "vendor", None)
-        self.serial_number = getattr(device_to_open, "serial_number", self.serial_number)
-
-        self.ia = self.h.create(device_to_open)
-        self.node_map = self.ia.remote_device.node_map
-
+    def _configure_device(self) -> None:
+        """Put a freshly opened device into a known state and read it back."""
         self._configure_gige_stream()
         self._configure_camera_settings()
 
@@ -401,7 +624,92 @@ class HarvesterCamera(Camera):
         self._detect_gain_range()
         self._detect_roi_range()
 
-        logger.info(f"Camera opened successfully: {device_to_open.model}")
+    def _harvester_files(self) -> list[str]:
+        """Producers to load: this camera's own first, then every other one found.
+
+        Loading them all means discovery can list every camera while this one
+        is open -- it cannot add a producer later without closing this camera.
+        Own producers go first so a camera visible through two of them is
+        opened through its vendor's.
+        """
+        extra = []
+        try:
+            extra = find_cti_files()
+        except Exception:
+            logger.debug("Producer search failed", exc_info=True)
+        files: list[str] = []
+        for path in [*self._cti_files, *extra]:
+            if path not in files:
+                files.append(path)
+        return files
+
+    def _open_private(self) -> tuple[Any, Any]:
+        """Open through a Harvester assigned to this camera, as it is."""
+        h = self.h
+        for path in self._cti_files:
+            h.add_file(path)
+        h.update()
+        device = self._choose_device(list(h.device_info_list))
+        return h.create(device), device
+
+    def _choose_device(self, devices: list[Any]) -> Any:
+        """Pick the device to open from an enumeration.
+
+        A serial number or device id is matched exactly -- a substring match
+        let "4001234" open camera "24001234". Without either, the first
+        device found through this camera's own producers is used, so a
+        :class:`FlirCamera` does not open a Basler camera just because the
+        Pylon producer is loaded too.
+
+        Raises:
+            RuntimeError: Nothing matches.
+        """
+        if not devices:
+            raise RuntimeError(
+                f"No GenICam cameras found using {len(self._harvester_files())} CTI file(s). "
+                "Ensure camera is connected and the correct GenTL producer (.cti) is loaded. "
+                f"Loaded CTI files: {self._harvester_files()}"
+            )
+        logger.info(f"Found {len(devices)} camera(s):")
+        for i, device in enumerate(devices):
+            logger.info(
+                f"  [{i}] {_device_field(device, 'vendor')} {_device_field(device, 'model')} "
+                f"(S/N: {_device_field(device, 'serial_number')})"
+            )
+
+        own = {os.path.realpath(path) for path in self._cti_files}
+
+        def is_own(device: Any) -> bool:
+            cti = _device_cti(device)
+            return not own or cti is None or cti in own
+
+        if self.serial_number:
+            wanted = str(self.serial_number).strip()
+            matches = [d for d in devices if _device_field(d, "serial_number") == wanted]
+            if not matches:
+                raise RuntimeError(f"Camera with serial number '{wanted}' not found.")
+        elif self.device_id:
+            wanted = str(self.device_id).strip()
+            matches = [d for d in devices if _device_field(d, "id_") == wanted]
+            if not matches:
+                raise RuntimeError(f"Camera with device id '{wanted}' not found.")
+        else:
+            matches = [d for d in devices if is_own(d)]
+            if not matches:
+                raise RuntimeError(
+                    f"No GenICam cameras found using {len(self._cti_files)} CTI file(s). "
+                    f"Loaded CTI files: {self._cti_files}"
+                )
+            logger.info(f"Using first camera: {_device_field(matches[0], 'model')}")
+        preferred = [d for d in matches if is_own(d)]
+        return (preferred or matches)[0]
+
+    def _take_device_identity(self, device: Any) -> None:
+        """Record who the opened device is, as the producer reports it."""
+        self.device_model = _device_field(device, "model") or None
+        self.device_vendor = _device_field(device, "vendor") or None
+        self.serial_number = _device_field(device, "serial_number") or self.serial_number
+        self.device_id = _device_field(device, "id_") or self.device_id
 
     def _detect_pixel_size(self) -> None:
         """Detect pixel size from camera's GenICam features.
@@ -700,20 +1008,44 @@ class HarvesterCamera(Camera):
             logger.warning(f"Could not detect gain range: {e}")
 
     def close(self) -> None:
-        """Close camera connection and release hardware."""
+        """Release the device. Safe to call twice, or after a failed open().
+
+        Every handle into Harvesters is dropped here, not just released:
+        the node map and acquirer of a closed device point at freed C++
+        objects, and reading a node through them segfaults the interpreter
+        rather than raising. A closed camera answers "Camera not opened."
+        instead, and can be opened again.
+        """
         try:
             self.stop_acquisition()
         except Exception:
             logger.debug("Error stopping acquisition during close", exc_info=True)
-        try:
-            if self.ia:
-                self.ia.destroy()
-        except Exception:
-            logger.debug("Error destroying ImageAcquirer", exc_info=True)
-        try:
-            self.h.reset()
-        except Exception:
-            logger.debug("Error resetting Harvester", exc_info=True)
+        was_shared = self._shared
+        self._release_device()
+        h, self.h = self.h, None
+        if h is not None and not was_shared:
+            try:
+                h.reset()
+            except Exception:
+                logger.debug("Error resetting Harvester", exc_info=True)
+
+    def _release_device(self) -> None:
+        """Give the device back and forget every handle that pointed into it."""
+        ia, self.ia = self.ia, None
+        self.node_map = None
+        self.is_acquiring = False
+        self._feature_cache = None
+        self._feature_cache_source = None
+        if self._shared:
+            self._shared = False
+            self.h = None
+            if ia is not None:
+                _return_device(ia)
+        elif ia is not None:
+            try:
+                ia.destroy()
+            except Exception:
+                logger.debug("Error destroying ImageAcquirer", exc_info=True)
 
     def start_acquisition(self) -> None:
         """Start image acquisition on the GenTL producer."""

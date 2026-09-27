@@ -22,7 +22,13 @@ class TestHarvesterCamera:
 
         camera = HarvesterCamera(cti_file="/path/to/test.cti")
 
-        assert camera.h == mock_h
+        # Nothing is loaded until open(): the process-wide Harvester is
+        # only taken when a device is actually claimed.
+        assert camera.h is None
+        mock_h.add_file.assert_not_called()
+        mock_h.device_info_list = []
+        with pytest.raises(RuntimeError, match="No GenICam cameras found"):
+            camera.open()
         mock_h.add_file.assert_called_once_with("/path/to/test.cti")
 
     @patch("pybeamprofiler.gen_camera.Harvester")
@@ -178,12 +184,8 @@ class TestCameraUtils:
 
     def test_list_cameras(self):
         """Test camera listing."""
-        import sys
-
         from pybeamprofiler.utils import list_cameras
 
-        mock_harvesters = Mock()
-        mock_core = Mock()
         mock_harvester_class = Mock()
 
         mock_h = Mock()
@@ -195,11 +197,9 @@ class TestCameraUtils:
         mock_h.device_info_list = [mock_device]
 
         mock_harvester_class.return_value = mock_h
-        mock_core.Harvester = mock_harvester_class
-        mock_harvesters.core = mock_core
 
-        # Mock harvesters module for testing without hardware dependency
-        with patch.dict(sys.modules, {"harvesters": mock_harvesters, "harvesters.core": mock_core}):
+        # Discovery builds its Harvester through gen_camera, like the cameras.
+        with patch("pybeamprofiler.gen_camera.Harvester", mock_harvester_class):
             with patch("pybeamprofiler.discovery.find_cti_files", return_value=["/fake/path.cti"]):
                 cameras = list_cameras()
 

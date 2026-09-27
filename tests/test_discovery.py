@@ -1,7 +1,6 @@
 """Tests for camera discovery: enumerating devices and opening one."""
 
-import sys
-from types import ModuleType
+from typing import Any
 from unittest.mock import Mock, patch
 
 import pytest
@@ -9,12 +8,13 @@ import pytest
 from pybeamprofiler import discovery
 
 
-def _mock_harvesters_core() -> tuple[ModuleType, Mock]:
-    """Return a fake harvesters.core module and its Harvester class mock."""
+def _mock_harvesters_core() -> tuple[Any, Mock]:
+    """Patch the Harvester class that discovery (via gen_camera) builds.
+
+    Returns the patcher -- use it as a context manager -- and the class mock.
+    """
     mock_harvester_class = Mock()
-    fake_core = ModuleType("harvesters.core")
-    fake_core.Harvester = mock_harvester_class  # type: ignore
-    return fake_core, mock_harvester_class
+    return patch("pybeamprofiler.gen_camera.Harvester", mock_harvester_class), mock_harvester_class
 
 
 class TestFindCtiFiles:
@@ -38,11 +38,7 @@ class TestListCameras:
 
         mock_h.device_info_list = [mock_device]
 
-        # Ensure both the parent package and the core submodule are present in sys.modules
-        fake_parent = ModuleType("harvesters")
-        fake_parent.core = fake_core  # type: ignore
-
-        with patch.dict(sys.modules, {"harvesters": fake_parent, "harvesters.core": fake_core}):
+        with fake_core:
             with patch("pybeamprofiler.discovery.os.path.exists", return_value=True):
                 cameras = discovery.list_cameras("/path/to/test.cti")
 
@@ -59,7 +55,7 @@ class TestListCameras:
         mock_h = Mock()
         mock_harvester_class.return_value = mock_h
 
-        with patch.dict(sys.modules, {"harvesters.core": fake_core}):
+        with fake_core:
             with patch("pybeamprofiler.discovery.os.path.exists", return_value=False):
                 cameras = discovery.list_cameras("/nonexistent/path.cti")
 
@@ -73,7 +69,7 @@ class TestListCameras:
         mock_harvester_class.return_value = mock_h
         mock_find_cti.return_value = []
 
-        with patch.dict(sys.modules, {"harvesters.core": fake_core}):
+        with fake_core:
             cameras = discovery.list_cameras()
 
         assert cameras == []
@@ -100,7 +96,7 @@ class TestListCameras:
 
         mock_h.device_info_list = [mock_device1, mock_device2]
 
-        with patch.dict(sys.modules, {"harvesters.core": fake_core}):
+        with fake_core:
             cameras = discovery.list_cameras()
 
         assert len(cameras) == 2
@@ -111,9 +107,8 @@ class TestListCameras:
 
     def test_list_cameras_no_harvesters(self):
         """Test listing cameras when harvesters not installed."""
-        # Mock the import to fail
-        with patch.dict(sys.modules, {"harvesters.core": None}):
-            with patch("pybeamprofiler.discovery.Harvester", side_effect=ImportError, create=True):
+        with patch("pybeamprofiler.gen_camera.Harvester", None):
+            with patch("pybeamprofiler.discovery.find_cti_files", return_value=["/x.cti"]):
                 cameras = discovery.list_cameras()
                 assert cameras == []
 
@@ -197,10 +192,7 @@ class TestListCamerasEdgeCases:
         mock_h.add_file.side_effect = Exception("bad file")
         mock_h.device_info_list = []
 
-        fake_parent = ModuleType("harvesters")
-        fake_parent.core = fake_core  # type: ignore
-
-        with patch.dict(sys.modules, {"harvesters": fake_parent, "harvesters.core": fake_core}):
+        with fake_core:
             cameras = discovery.list_cameras()
 
         assert cameras == []
@@ -214,10 +206,7 @@ class TestListCamerasEdgeCases:
         mock_find_cti.return_value = ["/path/to/test.cti"]
         mock_h.update.side_effect = Exception("update failed")
 
-        fake_parent = ModuleType("harvesters")
-        fake_parent.core = fake_core  # type: ignore
-
-        with patch.dict(sys.modules, {"harvesters": fake_parent, "harvesters.core": fake_core}):
+        with fake_core:
             cameras = discovery.list_cameras()
 
         assert cameras == []

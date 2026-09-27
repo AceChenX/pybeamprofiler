@@ -51,65 +51,45 @@ def find_cti_files() -> list[str]:
 def list_cameras(cti_file: str | None = None) -> list[dict[str, str | int]]:
     """List all available GenICam cameras.
 
+    Enumeration goes through the process-wide Harvester the cameras use, so
+    it works while a camera is open -- a second Harvester would be refused
+    the producers that camera holds. While any camera is open, the list is
+    the one from the last enumeration; see
+    :class:`pybeamprofiler.gen_camera._SharedHarvester`.
+
     Args:
         cti_file: Path to specific CTI file, or ``None`` to search all.
 
     Returns:
         List of dicts with keys ``vendor``, ``model``, ``serial_number``
-        (all ``str``), ``id`` (GenTL device id string), and ``index`` (``int``).
+        (all ``str``), ``id`` (GenTL device id string), ``index`` (``int``)
+        and ``cti`` (the producer that found it, when known).
     """
-    try:
-        from harvesters.core import Harvester
-    except ImportError:
+    from . import gen_camera
+
+    if gen_camera.Harvester is None:
         logger.error("harvesters package not installed")
         return []
 
-    h = Harvester()
-
-    try:
-        if cti_file:
-            if os.path.exists(cti_file):
-                h.add_file(cti_file)
-            else:
-                logger.error(f"CTI file not found: {cti_file}")
-                return []
-        else:
-            cti_files = find_cti_files()
-            if not cti_files:
-                # Expected on any machine using only the simulator, and the
-                # GUI calls this every time the camera list is refreshed --
-                # so this is information, not a problem worth warning about.
-                logger.info("No GenTL producers (.cti files) found")
-                return []
-
-            for cti in cti_files:
-                try:
-                    h.add_file(cti)
-                except Exception as e:
-                    logger.warning(f"Could not load {cti}: {e}")
-
-        try:
-            h.update()
-        except Exception as e:
-            logger.error(f"Error updating Harvester: {e}")
+    if cti_file:
+        if not os.path.exists(cti_file):
+            logger.error(f"CTI file not found: {cti_file}")
+            return []
+        files = [cti_file]
+    else:
+        files = find_cti_files()
+        if not files:
+            # Expected on any machine using only the simulator, and the
+            # GUI calls this every time the camera list is refreshed --
+            # so this is information, not a problem worth warning about.
+            logger.info("No GenTL producers (.cti files) found")
             return []
 
-        cameras = []
-        for i, device in enumerate(h.device_info_list):
-            cameras.append(
-                {
-                    "vendor": device.vendor,
-                    "model": device.model,
-                    "serial_number": device.serial_number,
-                    "id": device.id_,
-                    "index": i,
-                }
-            )
-
-        return cameras
-
-    finally:
-        h.reset()
+    try:
+        return gen_camera._list_devices(files)
+    except Exception as e:
+        logger.error(f"Error updating Harvester: {e}")
+        return []
 
 
 def print_camera_info(cti_file: str | None = None) -> None:

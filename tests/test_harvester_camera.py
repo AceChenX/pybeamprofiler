@@ -16,7 +16,7 @@ import pytest
 from _genapi_device import FakeBus, FakeDevice
 from conftest import requires_genicam, requires_harvesters
 
-from pybeamprofiler import gen_camera
+from pybeamprofiler import discovery, gen_camera
 from pybeamprofiler.gen_camera import HarvesterCamera
 
 pytestmark = [requires_genicam, requires_harvesters]
@@ -187,3 +187,125 @@ class TestRoiWithoutWidthMax:
 
         assert cam.roi_info["offset_x"] == 0
         assert cam.roi_info["width"] == 256
+
+
+@pytest.fixture
+def two_cameras(tmp_path, monkeypatch) -> FakeBus:
+    """Two cameras on one producer, which discovery also finds."""
+    cti = tmp_path / "FakeProducer.cti"
+    cti.touch()
+    fake = FakeBus(
+        [
+            FakeDevice("SN-A", id_="dev-a", cti=str(cti)),
+            FakeDevice("SN-B", id_="dev-b", cti=str(cti)),
+        ]
+    )
+    fake.cti = str(cti)  # ty: ignore[unresolved-attribute]
+    monkeypatch.setattr(gen_camera, "Harvester", fake.harvester_class)
+    monkeypatch.setattr(discovery, "find_cti_files", lambda: [str(cti)])
+    return fake
+
+
+def _option(serial: str) -> discovery.CameraOption:
+    return discovery._describe({"vendor": "Fake", "model": "FakeCam", "serial_number": serial})
+
+
+class TestOneHarvesterPerProcess:
+    """Every camera and every discovery pass built its own Harvester. A GenTL
+    producer initialises once per process, so the second Harvester was
+    refused the producer and saw no devices: with a camera open, a rescan
+    found nothing and switching to another camera on the same producer
+    failed with "No GenICam cameras found"."""
+
+    def test_discovery_lists_every_camera_while_one_is_open(self, two_cameras):
+        a = HarvesterCamera(cti_file=two_cameras.cti, serial_number="SN-A")
+        a.open()
+        try:
+            found = [c["serial_number"] for c in discovery.list_cameras()]
+            assert found == ["SN-A", "SN-B"]
+            # Harvester.update() destroys live acquirers; discovery must not call it.
+            assert not a.ia.destroyed
+        finally:
+            a.close()
+
+    def test_switching_between_two_cameras_on_one_producer(self, two_cameras):
+        a = HarvesterCamera(cti_file=two_cameras.cti, serial_number="SN-A")
+        a.open()
+        b = discovery.open_camera(_option("SN-B"))  # opened before A is released
+        assert isinstance(b, HarvesterCamera)
+        a.close()
+        try:
+            assert b.serial_number == "SN-B"
+            assert not b.ia.destroyed
+            assert b.node_map.Width.value == 2048
+        finally:
+            b.close()
+
+    def test_the_producer_is_released_when_the_last_camera_closes(self, two_cameras):
+        a = HarvesterCamera(cti_file=two_cameras.cti, serial_number="SN-A")
+        b = HarvesterCamera(cti_file=two_cameras.cti, serial_number="SN-B")
+        a.open()
+        b.open()
+        a.close()
+        assert two_cameras.producer_owner(two_cameras.cti) is not None
+        b.close()
+        assert two_cameras.producer_owner(two_cameras.cti) is None
+        assert gen_camera._SHARED.harvester is None
+
+    def test_a_failed_open_releases_the_producer(self, two_cameras):
+        """In Jupyter: mistype the serial, fix it, run the cell again. The
+        failed attempt kept its producer, so the corrected one found nothing."""
+        with pytest.raises(RuntimeError, match="serial number 'SN-X' not found"):
+            HarvesterCamera(cti_file=two_cameras.cti, serial_number="SN-X").open()
+        assert two_cameras.producer_owner(two_cameras.cti) is None
+
+        cam = HarvesterCamera(cti_file=two_cameras.cti, serial_number="SN-A")
+        cam.open()
+        assert cam.serial_number == "SN-A"
+        cam.close()
+
+    def test_a_failure_after_the_device_opened_releases_it(self, two_cameras, monkeypatch):
+        def broken(self):
+            raise RuntimeError("register read failed")
+
+        monkeypatch.setattr(HarvesterCamera, "_detect_pixel_size", broken)
+        cam = HarvesterCamera(cti_file=two_cameras.cti, serial_number="SN-A")
+        with pytest.raises(RuntimeError, match="register read failed"):
+            cam.open()
+        assert cam.ia is None
+        assert two_cameras.producer_owner(two_cameras.cti) is None
+
+
+class TestCloseLeavesNothingBehind:
+    """close() destroyed the acquirer but kept ``ia`` and ``node_map``. Reading
+    a node through them afterwards segfaulted the interpreter -- which is
+    what a Jupyter panel still on screen did after the camera was swapped."""
+
+    def test_close_drops_every_handle(self, camera):
+        camera.close()
+        assert camera.ia is None
+        assert camera.node_map is None
+        assert camera.h is None
+        assert not camera.is_acquiring
+
+    def test_close_is_idempotent(self, camera):
+        camera.close()
+        camera.close()
+
+    def test_a_closed_camera_says_so(self, camera):
+        camera.close()
+        with pytest.raises(RuntimeError, match="Camera not opened"):
+            camera.get_image(timeout=0.1)
+
+    def test_close_forgets_the_feature_cache(self, camera):
+        assert camera._discover_features()
+        camera.close()
+        assert camera._feature_cache is None
+        assert camera._discover_features() == {}
+
+    def test_a_closed_camera_opens_again(self, camera):
+        first = camera.ia
+        camera.close()
+        camera.open()
+        assert camera.ia is not None and camera.ia is not first
+        assert camera.node_map.Width.value == 2048

@@ -356,8 +356,11 @@ class TestGenCameraInit:
         f2.touch()
 
         mock_harvester = MagicMock()
+        mock_harvester.return_value.device_info_list = []
         with patch("pybeamprofiler.gen_camera.Harvester", mock_harvester):
-            HarvesterCamera(cti_file=[str(f1), str(f2)])
+            cam = HarvesterCamera(cti_file=[str(f1), str(f2)])
+            with pytest.raises(RuntimeError, match="No GenICam cameras found"):
+                cam.open()
             assert mock_harvester.return_value.add_file.call_count == 2
 
 
@@ -495,20 +498,27 @@ class TestGenCameraExposureGain:
         assert info["max_width"] == 1024
 
     def test_close_with_ia(self):
-        """Test close destroys image acquirer."""
+        """close() destroys the acquirer and resets a Harvester it was given."""
         cam = self._make_mock_camera()
         mock_ia = MagicMock()
+        mock_h = MagicMock()
         cam.ia = mock_ia
+        cam.h = mock_h
         cam.close()
         mock_ia.destroy.assert_called_once()
-        cam.h.reset.assert_called_once()
+        mock_h.reset.assert_called_once()
+        assert cam.ia is None
+        assert cam.node_map is None
+        assert cam.h is None
 
     def test_close_without_ia(self):
         """Test close with no image acquirer."""
         cam = self._make_mock_camera()
+        mock_h = MagicMock()
         cam.ia = None
+        cam.h = mock_h
         cam.close()  # Should not raise
-        cam.h.reset.assert_called_once()
+        mock_h.reset.assert_called_once()
 
     def test_start_acquisition(self):
         """Test start_acquisition calls ia.start."""
