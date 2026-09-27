@@ -696,6 +696,45 @@ def _build_status(
     return children
 
 
+def _png_bytes(image: np.ndarray) -> bytes:
+    """Encode a frame as a greyscale PNG without wrapping or clipping it.
+
+    uint8 and uint16 frames, which is everything a camera delivers (averaged
+    or not), are written exactly as 8- and 16-bit greyscale. Anything else
+    came from a file: integers that fit 0..65535 are written exactly as 16
+    bit, and wider integers and floats are scaled linearly onto the 16-bit
+    range -- their shape survives but not their units, which the .npy
+    download keeps. Handed straight to Pillow, a float frame could not be
+    written at all ("cannot write mode F as PNG") and a 32-bit one was
+    silently clipped at 65535.
+    """
+    if image.dtype in (np.uint8, np.uint16):
+        data = image
+    elif image.dtype == np.bool_:
+        data = image.astype(np.uint8) * 255
+    elif (
+        np.issubdtype(image.dtype, np.integer)
+        and image.size
+        and image.min() >= 0
+        and image.max() <= np.iinfo(np.uint16).max
+    ):
+        data = image.astype(np.uint16)
+    else:
+        values = image.astype(np.float64)
+        finite = np.isfinite(values)
+        if finite.any():
+            lo, hi = float(values[finite].min()), float(values[finite].max())
+            values[~finite] = lo
+        else:
+            lo = hi = 0.0
+            values[:] = 0.0
+        scale = 65535.0 / (hi - lo) if hi > lo else 0.0
+        data = np.rint((values - lo) * scale).astype(np.uint16)
+    buf = io.BytesIO()
+    Image.fromarray(data).save(buf, format="PNG")
+    return buf.getvalue()
+
+
 def _reset_avg_state() -> None:
     """Drop any cached averaging state (used on pause/resume, exposure
     changes, ROI changes, etc. where frame contents change shape or
@@ -971,9 +1010,7 @@ def _register_callbacks(app: dash.Dash, bp: BeamProfiler) -> None:
         img = bp.last_img
         if img is None:
             return None
-        buf = io.BytesIO()
-        Image.fromarray(img).save(buf, format="PNG")
-        b64 = base64.b64encode(buf.getvalue()).decode()
+        b64 = base64.b64encode(_png_bytes(img)).decode()
         ts = time.strftime("%Y%m%d_%H%M%S")
         return {
             "content": b64,

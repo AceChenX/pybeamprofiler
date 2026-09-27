@@ -876,3 +876,64 @@ class TestAFitIsDrawnToTheDatasScale:
         assert fit_height == pytest.approx(data_height / 2, rel=0.1)
         # A correct fit still sits on its data.
         assert np.max(drawn["y_fit"].x) == pytest.approx(np.max(drawn["y_data"].x), rel=0.05)
+
+
+def _saved_png(bp: BeamProfiler, frame: np.ndarray) -> np.ndarray:
+    """Press Save PNG with *frame* as the current frame; decode what comes back."""
+    import base64
+    import io
+
+    from PIL import Image
+
+    bp.last_img = frame
+    payload = _callbacks(bp)["save_frame_png"](1)
+    return np.array(Image.open(io.BytesIO(base64.b64decode(payload["content"]))))
+
+
+class TestSavePngHandlesWhatAFileCanHold:
+    """Save PNG handed the frame straight to Pillow. That covers the uint8 and
+    uint16 frames a camera delivers, but a frame loaded with --file can be
+    anything: a float32 TIFF raised "cannot write mode F as PNG" (the
+    callback failed and nothing downloaded), and a 32-bit one was silently
+    clipped at 65535."""
+
+    @staticmethod
+    def _beam(scale: float, dtype: Any) -> np.ndarray:
+        y, x = np.mgrid[0:48, 0:64]
+        return (scale * np.exp(-((x - 32) ** 2 + (y - 24) ** 2) / 50.0)).astype(dtype)
+
+    @pytest.mark.parametrize("dtype", [np.uint8, np.uint16])
+    def test_camera_frames_are_written_exactly(self, dtype):
+        frame = self._beam(200 if dtype == np.uint8 else 4000, dtype)
+        saved = _saved_png(BeamProfiler(camera="simulated"), frame)
+        assert saved.dtype == dtype
+        assert np.array_equal(saved, frame)
+
+    def test_a_float_frame_is_scaled_onto_16_bits(self):
+        frame = self._beam(1000.0, np.float32)
+        saved = _saved_png(BeamProfiler(camera="simulated"), frame)
+        assert saved.dtype == np.uint16
+        expected = np.rint((frame - frame.min()) / (frame.max() - frame.min()) * 65535)
+        assert np.abs(saved.astype(float) - expected).max() <= 1
+
+    def test_a_wide_integer_frame_is_scaled_not_clipped(self):
+        frame = self._beam(100_000, np.int32)
+        saved = _saved_png(BeamProfiler(camera="simulated"), frame)
+        # Clipping made every value above 65535 identical; scaling keeps the
+        # peak unique and the profile's shape.
+        assert int(np.count_nonzero(saved == saved.max())) == int(
+            np.count_nonzero(frame == frame.max())
+        )
+        assert np.unravel_index(np.argmax(saved), saved.shape) == (24, 32)
+
+    def test_an_integer_frame_that_fits_is_written_exactly(self):
+        frame = self._beam(60_000, np.int32)
+        saved = _saved_png(BeamProfiler(camera="simulated"), frame)
+        assert np.array_equal(saved.astype(np.int64), frame.astype(np.int64))
+
+    def test_non_finite_pixels_do_not_break_the_download(self):
+        frame = self._beam(1000.0, np.float32)
+        frame[0, 0], frame[0, 1] = np.nan, np.inf
+        saved = _saved_png(BeamProfiler(camera="simulated"), frame)
+        assert saved.max() == 65535
+        assert saved[0, 0] == saved[0, 1] == 0
