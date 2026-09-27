@@ -557,8 +557,8 @@ def _zoom_after_relayout(
     """Fold a Plotly ``relayoutData`` event into the zoom, in pixels.
 
     A box zoom or pan reports ``xaxis.range[0]``/``[1]`` (sometimes a
-    ``xaxis.range`` pair) for the axes it moved; autoscale and a double-click
-    report ``autorange``. An axis the event doesn't mention keeps its current
+    ``xaxis.range`` pair) for the axes it moved, and the modebar's autoscale
+    reports ``autorange``. An axis the event doesn't mention keeps its current
     range. Anything else -- ``autosize`` on a resize, a mode change -- leaves
     the zoom as it was.
 
@@ -932,7 +932,9 @@ def _register_callbacks(app: dash.Dash, bp: BeamProfiler) -> None:
                 return nothing
 
             def refuse(message: str) -> tuple[Any, ...]:
-                return (message, *(dash.no_update,) * 5, current or dash.no_update)
+                # Back to the open camera -- or to no selection, when a file
+                # is being shown and there is no camera open.
+                return (message, *(dash.no_update,) * 5, current)
 
             # Resolve against what the dropdown last offered. Re-running
             # discovery here would put a multi-second GenTL enumeration on the

@@ -218,6 +218,13 @@ class TestSwitchCamera:
         assert profiler.camera is old
         assert result[6] == discovery.describe_open_camera(old).key
 
+    def test_with_no_camera_open_a_failed_switch_clears_the_selection(self, profiler):
+        """Showing a file, there is no camera to go back to."""
+        profiler.camera.close()
+        profiler.camera = None
+        result = _callbacks(profiler)["switch_camera"]("genicam:not-here")
+        assert result[6] == ""
+
     def test_a_successful_switch_leaves_the_selection_alone(self, profiler):
         result = _callbacks(profiler)["switch_camera"](_other_key(profiler))
         assert isinstance(result[6], dash._no_update.NoUpdate)
