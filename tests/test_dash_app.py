@@ -1736,9 +1736,10 @@ class TestGenicamCallbackBranches:
             patch.object(type(node), "value", property(lambda s: 0.0, boom)),
         ):
             mock_ctx.triggered_id = {"type": "genicam-num", "feature": "ExposureTime"}
-            # Slider-triggered → callback mirrors value onto the companion input.
+            # The write was refused, so both controls show the value the node
+            # still holds (0.0), not the 1.0 that was asked for.
             result = fn(1.0, None)
-            assert result[1] == 1.0
+            assert result == (0.0, 0.0)
 
     def test_numeric_ignores_a_trigger_without_a_feature(self):
         """Guards against a malformed pattern-matching id reaching the setter
@@ -1887,7 +1888,8 @@ class TestGenicamCallbackBranches:
             patch.object(type(node), "value", property(lambda s: False, boom)),
         ):
             mock_ctx.triggered_id = {"type": "genicam-sw", "feature": "ReverseX"}
-            assert fn(True) is True
+            # Refused: the switch shows the node's actual state.
+            assert fn(True) is False
 
 
 # ─── Pre-existing edge cases (cheap one-liners) ───────────────────────────
@@ -2305,8 +2307,9 @@ class TestCallbackErrorBranches:
         fn = _extract_callback(bp, "slider-exposure")
         assert fn is not None
         result = _fire_slider(fn, "slider-exposure", 50.0)
-        # Exception is swallowed; the other control still gets mirrored.
-        assert result[1] == 50.0
+        # The exception is swallowed, and both controls go back to the
+        # exposure the camera still has (the default 10 ms).
+        assert result == (10.0, 10.0)
 
     def test_gain_exception_handled(self):
         from unittest.mock import MagicMock
@@ -2319,7 +2322,7 @@ class TestCallbackErrorBranches:
         fn = _extract_callback(bp, "slider-gain")
         assert fn is not None
         result = _fire_slider(fn, "slider-gain", 5.0)
-        assert result[1] == 5.0
+        assert result == (0.0, 0.0)
 
     def test_roi_apply_no_camera(self):
         bp = BeamProfiler(camera="simulated")

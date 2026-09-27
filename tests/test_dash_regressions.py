@@ -937,3 +937,119 @@ class TestSavePngHandlesWhatAFileCanHold:
         saved = _saved_png(BeamProfiler(camera="simulated"), frame)
         assert saved.max() == 65535
         assert saved[0, 0] == saved[0, 1] == 0
+
+
+class _LockedNode:
+    """A GenICam node that refuses writes, as many do while streaming."""
+
+    min = max = None
+
+    def __init__(self, value: Any, symbolics: list[str] | None = None) -> None:
+        self._value = value
+        self.symbolics = symbolics
+
+    @property
+    def value(self) -> Any:
+        return self._value
+
+    @value.setter
+    def value(self, v: Any) -> None:
+        raise RuntimeError("AccessException: node is not writable (TLParamsLocked)")
+
+
+class _ClampingNode:
+    """A numeric node that clamps to its range instead of refusing."""
+
+    symbolics = None
+
+    def __init__(self, value: float, lo: float, hi: float) -> None:
+        self._value, self.min, self.max = value, lo, hi
+
+    @property
+    def value(self) -> float:
+        return self._value
+
+    @value.setter
+    def value(self, v: float) -> None:
+        self._value = min(max(v, self.min), self.max)
+
+
+class TestSettingControlsShowWhatTheCameraHas:
+    """Every setting control echoed the requested value, whatever the camera
+    did with it. A write refused while streaming (PixelFormat is locked on
+    real devices) was logged at DEBUG only, and the dropdown went on showing
+    Mono16 over a camera still in Mono8; a clamped number showed the value
+    asked for, not the one set."""
+
+    @staticmethod
+    def _write(cbs: dict[str, Any], kind: str, feature: str, *args: Any) -> Any:
+        callback = {
+            "genicam-sel": "set_genicam_select",
+            "genicam-sw": "set_genicam_switch",
+            "genicam-num": "set_genicam_numeric",
+            "genicam-num-input": "set_genicam_numeric",
+        }[kind]
+        with patch("pybeamprofiler.dash_app.ctx") as ctx:
+            ctx.triggered_id = {"type": kind, "feature": feature}
+            return cbs[callback](*args)
+
+    @staticmethod
+    def _camera() -> tuple[BeamProfiler, Any, dict[str, Any]]:
+        bp = _profiler()
+        return bp, getattr(bp.camera, "node_map"), _callbacks(bp)
+
+    def test_a_refused_choice_shows_the_cameras_value_and_says_why(self, caplog):
+        import logging
+
+        _, node_map, cbs = self._camera()
+        node_map.PixelFormat = _LockedNode("Mono8", ["Mono8", "Mono12", "Mono16"])
+        with caplog.at_level(logging.WARNING, logger="pybeamprofiler.dash_app"):
+            shown = self._write(cbs, "genicam-sel", "PixelFormat", "Mono16")
+        assert shown == "Mono8"
+        assert any("PixelFormat" in r.getMessage() for r in caplog.records)
+
+    def test_a_refused_switch_shows_the_cameras_state(self):
+        _, node_map, cbs = self._camera()
+        node_map.ReverseX = _LockedNode(False)
+        assert self._write(cbs, "genicam-sw", "ReverseX", True) is False
+
+    def test_a_clamped_number_is_shown_clamped_in_both_controls(self):
+        _, node_map, cbs = self._camera()
+        node_map.Gamma = _ClampingNode(1.0, 0.25, 4.0)
+        assert self._write(cbs, "genicam-num", "Gamma", 9.0, None) == (4.0, 4.0)
+        assert self._write(cbs, "genicam-num-input", "Gamma", None, 0.1) == (0.25, 0.25)
+
+    def test_a_number_taken_as_given_only_updates_the_other_control(self):
+        _, node_map, cbs = self._camera()
+        node_map.Gamma = _ClampingNode(1.0, 0.25, 4.0)
+        assert self._write(cbs, "genicam-num", "Gamma", 2.0, None) == (dash.no_update, 2.0)
+
+    def test_exposure_shows_what_the_camera_set(self):
+        bp, _, cbs = self._camera()
+        assert bp.camera is not None
+        camera = bp.camera
+
+        def clamped(seconds: float) -> None:
+            camera.exposure_time = min(seconds, 0.5)
+
+        with (
+            patch.object(camera, "set_exposure", side_effect=clamped),
+            patch("pybeamprofiler.dash_app.ctx") as ctx,
+        ):
+            ctx.triggered_id = "input-exposure"
+            assert cbs["set_exposure"](None, 900.0) == (500.0, 500.0)
+
+    def test_gain_shows_what_the_camera_set(self):
+        bp, _, cbs = self._camera()
+        assert bp.camera is not None
+        camera = bp.camera
+
+        def quantised(gain: float) -> None:
+            camera.gain = round(gain * 2) / 2  # 0.5 dB steps
+
+        with (
+            patch.object(camera, "set_gain", side_effect=quantised),
+            patch("pybeamprofiler.dash_app.ctx") as ctx,
+        ):
+            ctx.triggered_id = "slider-gain"
+            assert cbs["set_gain"](3.3, None) == (3.5, 3.5)

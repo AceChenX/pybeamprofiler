@@ -812,6 +812,27 @@ def _discard_frame_history(bp: BeamProfiler) -> None:
     _zoom_range = None
 
 
+def _paired_values(requested: Any, actual: Any, *, from_slider: bool) -> tuple[Any, Any]:
+    """``(slider, box)`` outputs after a write that may not have stuck as asked.
+
+    The control that was not touched always shows *actual*, the value read
+    back from the device. The one that was touched is left alone when the
+    device took the value as given -- echoing it back only costs a redraw --
+    and corrected when the device clamped, quantised or refused it. Echoing
+    the request unconditionally, as this used to, showed values the camera
+    did not have.
+    """
+    if actual is None:
+        actual = requested
+    took = actual == requested or (
+        isinstance(actual, (int, float))
+        and isinstance(requested, (int, float))
+        and np.isclose(actual, requested, rtol=1e-9, atol=1e-9)
+    )
+    touched = dash.no_update if took else actual
+    return (touched, actual) if from_slider else (actual, touched)
+
+
 def _register_callbacks(app: dash.Dash, bp: BeamProfiler) -> None:
     """Wire up all Dash callbacks, and reset the state they share.
 
@@ -1246,11 +1267,18 @@ def _register_callbacks(app: dash.Dash, bp: BeamProfiler) -> None:
         prevent_initial_call=True,
     )
     def set_exposure(slider_val: float | None, input_val: float | None) -> tuple[Any, Any]:
-        """Apply an exposure change from either the slider or the box."""
+        """Apply an exposure change from either the slider or the box.
+
+        Both controls end up showing the exposure the camera reports after
+        the write, which is its clamped, quantised value -- or the old one,
+        if the write failed.
+        """
         trigger = ctx.triggered_id
-        val = slider_val if trigger == "slider-exposure" else input_val
+        from_slider = trigger == "slider-exposure"
+        val = slider_val if from_slider else input_val
         if val is None:
             return dash.no_update, dash.no_update
+        actual = None
         if bp.camera is not None:
             with _callback_lock:
                 try:
@@ -1261,13 +1289,12 @@ def _register_callbacks(app: dash.Dash, bp: BeamProfiler) -> None:
                     _recent_frame_times.clear()
                     _reset_avg_state()
                 except Exception as e:
-                    logger.warning(f"Failed to set exposure: {e}")
-        # Mirror the committed value to the *other* control only — echoing
-        # the triggering control would cause a pointless second callback
-        # round-trip and can jitter the slider thumb while the user drags.
-        if trigger == "slider-exposure":
-            return dash.no_update, val
-        return val, dash.no_update
+                    logger.warning("Failed to set exposure: %s", e)
+                exposure = bp.camera.exposure_time
+                # Rounded to the controls' 1 us step, so float noise in the
+                # read-back doesn't count as the camera changing the value.
+                actual = None if exposure is None else round(exposure * 1000.0, 3)
+        return _paired_values(val, actual, from_slider=from_slider)
 
     # -- Gain slider + input (kept in sync) -----------------------------------
     @app.callback(
@@ -1278,11 +1305,14 @@ def _register_callbacks(app: dash.Dash, bp: BeamProfiler) -> None:
         prevent_initial_call=True,
     )
     def set_gain(slider_val: float | None, input_val: float | None) -> tuple[Any, Any]:
-        """Apply a gain change from either the slider or the box."""
+        """Apply a gain change from either the slider or the box, showing
+        the gain the camera reports afterwards (see set_exposure)."""
         trigger = ctx.triggered_id
-        val = slider_val if trigger == "slider-gain" else input_val
+        from_slider = trigger == "slider-gain"
+        val = slider_val if from_slider else input_val
         if val is None:
             return dash.no_update, dash.no_update
+        actual = None
         if bp.camera is not None:
             with _callback_lock:
                 try:
@@ -1293,10 +1323,9 @@ def _register_callbacks(app: dash.Dash, bp: BeamProfiler) -> None:
                     _recent_frame_times.clear()
                     _reset_avg_state()
                 except Exception as e:
-                    logger.warning(f"Failed to set gain: {e}")
-        if trigger == "slider-gain":
-            return dash.no_update, val
-        return val, dash.no_update
+                    logger.warning("Failed to set gain: %s", e)
+                actual = bp.camera.gain
+        return _paired_values(val, actual, from_slider=from_slider)
 
     # -- ROI apply ------------------------------------------------------------
     # Registered unconditionally: the attached camera can change at runtime,
@@ -1381,6 +1410,34 @@ def _register_callbacks(app: dash.Dash, bp: BeamProfiler) -> None:
     # that appear later, which is exactly what happens when a camera switch
     # rebuilds the Setting panel with a different feature set.
 
+    def _write_node(feature: str, value: Any) -> Any:
+        """Write a GenICam feature and return what it holds afterwards.
+
+        The read-back is what the controls show: a write can be refused (many
+        features are locked while the camera streams) or clamped, and
+        showing the request instead left the control claiming a setting the
+        camera did not have. Refusals are logged as warnings; they used to go
+        to DEBUG, where nobody sees them. Returns ``None`` when there is no
+        such node, or it cannot be read back. The caller holds the lock.
+        """
+        camera = bp.camera
+        nm = getattr(camera, "node_map", None)
+        node = getattr(nm, feature, None) if nm is not None else None
+        if camera is None or node is None:
+            return None
+        try:
+            was_acquiring = camera.is_acquiring
+            node.value = value
+            if was_acquiring and not camera.is_acquiring and not _server_paused:
+                camera.start_acquisition()
+        except Exception as e:
+            logger.warning("Camera did not accept %s = %r: %s", feature, value, e)
+        try:
+            return node.value
+        except Exception:
+            logger.debug("Could not read %s back", feature, exc_info=True)
+            return None
+
     @app.callback(
         Output({"type": "genicam-num", "feature": MATCH}, "value"),
         Output({"type": "genicam-num-input", "feature": MATCH}, "value"),
@@ -1399,21 +1456,8 @@ def _register_callbacks(app: dash.Dash, bp: BeamProfiler) -> None:
         if feature is None:
             return dash.no_update, dash.no_update
         with _callback_lock:
-            nm = getattr(bp.camera, "node_map", None)
-            if nm is not None:
-                node = getattr(nm, feature, None)
-                if node is not None:
-                    try:
-                        was_acquiring = bp.camera.is_acquiring
-                        node.value = value
-                        if was_acquiring and not bp.camera.is_acquiring and not _server_paused:
-                            bp.camera.start_acquisition()
-                    except Exception as e:
-                        logger.debug("Failed to set %s: %s", feature, e)
-        # Mirror to the other control only (see set_exposure for rationale).
-        if source == "genicam-num":
-            return dash.no_update, value
-        return value, dash.no_update
+            actual = _write_node(feature, value)
+        return _paired_values(value, actual, from_slider=source == "genicam-num")
 
     @app.callback(
         Output({"type": "genicam-sel", "feature": MATCH}, "value"),
@@ -1426,18 +1470,8 @@ def _register_callbacks(app: dash.Dash, bp: BeamProfiler) -> None:
             return dash.no_update
         feature = ctx.triggered_id["feature"]
         with _callback_lock:
-            nm = getattr(bp.camera, "node_map", None)
-            if nm is not None:
-                node = getattr(nm, feature, None)
-                if node is not None:
-                    try:
-                        was_acquiring = bp.camera.is_acquiring
-                        node.value = value
-                        if was_acquiring and not bp.camera.is_acquiring and not _server_paused:
-                            bp.camera.start_acquisition()
-                    except Exception as e:
-                        logger.debug("Failed to set %s: %s", feature, e)
-        return value
+            actual = _write_node(feature, value)
+        return value if actual is None else str(actual)
 
     @app.callback(
         Output({"type": "genicam-sw", "feature": MATCH}, "value"),
@@ -1450,18 +1484,8 @@ def _register_callbacks(app: dash.Dash, bp: BeamProfiler) -> None:
             return dash.no_update
         feature = ctx.triggered_id["feature"]
         with _callback_lock:
-            nm = getattr(bp.camera, "node_map", None)
-            if nm is not None:
-                node = getattr(nm, feature, None)
-                if node is not None:
-                    try:
-                        was_acquiring = bp.camera.is_acquiring
-                        node.value = value
-                        if was_acquiring and not bp.camera.is_acquiring and not _server_paused:
-                            bp.camera.start_acquisition()
-                    except Exception as e:
-                        logger.debug("Failed to set %s: %s", feature, e)
-        return value
+            actual = _write_node(feature, value)
+        return value if actual is None else bool(actual)
 
     # -- Main update loop -----------------------------------------------------
     # Registered last: other test suites find this callback as the final one.
