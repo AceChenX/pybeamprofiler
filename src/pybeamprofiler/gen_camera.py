@@ -14,10 +14,12 @@ recovery attempt before the caller is left waiting forever.
 
 from __future__ import annotations
 
+import importlib
 import logging
 import os
 import platform
 import time
+from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
@@ -29,10 +31,138 @@ except ImportError:
     Harvester = None  # ty:ignore[invalid-assignment]
     _HarvestersTimeout = None  # ty:ignore[invalid-assignment]
 
-from .camera import Camera
+from .camera import Camera, _roi_pixels
 from .cti import parse_gentl_path
 
 logger = logging.getLogger(__name__)
+
+
+def _genicam_errors() -> tuple[type[Exception], ...]:
+    """The base classes of what the GenICam bindings raise, where installed.
+
+    ``genicam.genapi`` (node reads and writes) and ``genicam.gentl``
+    (transport) each define their own ``GenericException``. Neither derives
+    from ``ValueError`` or ``AttributeError``: an out-of-range write raises
+    ``OutOfRangeException``, which an ``except ValueError`` does not catch.
+    """
+    found: list[type[Exception]] = []
+    for name in ("genicam.genapi", "genicam.gentl"):
+        try:
+            found.append(importlib.import_module(name).GenericException)
+        except (ImportError, AttributeError):
+            pass
+    return tuple(found)
+
+
+#: What reading or writing a node can raise: ``AttributeError`` for a feature
+#: the camera does not have, ``TypeError``/``ValueError`` for a value of the
+#: wrong kind, and the GenICam families for everything the device refuses.
+_NODE_ERRORS: tuple[type[Exception], ...] = (
+    AttributeError,
+    TypeError,
+    ValueError,
+    *_genicam_errors(),
+)
+
+
+def _numeric(value: Any) -> float | None:
+    """``value`` as a float if it is a real number, else ``None``.
+
+    Node attributes on a real camera are plain Python numbers. Anything else
+    -- a feature that is not implemented, a test double -- is treated as
+    unknown rather than coerced into a number that looks meaningful.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float, np.integer, np.floating)):
+        return None
+    return float(value)
+
+
+def _node(node_map: Any, name: str) -> Any:
+    """The node called ``name``, or ``None`` if the camera has no such feature."""
+    if node_map is None:
+        return None
+    try:
+        return getattr(node_map, name)
+    except Exception:  # absent (AttributeError) or a node map that cannot answer
+        return None
+
+
+def _node_int(node: Any, attr: str = "value") -> int | None:
+    """Read ``node.<attr>`` as an int, or ``None`` if it is absent or unreadable."""
+    if node is None:
+        return None
+    try:
+        number = _numeric(getattr(node, attr))
+    except Exception:  # e.g. AccessException from a node that is not available
+        return None
+    return None if number is None else int(number)
+
+
+def _node_error_text(exc: BaseException) -> str:
+    """The human half of a GenICam error message.
+
+    GenApi messages read "Value = 100 must be equal or smaller than Max = 0.
+    : OutOfRangeException thrown in node 'OffsetX' while calling ... (file
+    'IntegerT.h', line 81)"; the part after the separator is for C++
+    developers.
+    """
+    return str(exc).split(" : ")[0].strip() or type(exc).__name__
+
+
+@dataclass(frozen=True)
+class _Axis:
+    """What one ROI axis allows right now, read from the live node map.
+
+    Attributes:
+        sensor: Full extent, i.e. ``WidthMax``/``HeightMax``. SFNC defines
+            those *after* binning and decimation, so this is re-read every
+            time rather than remembered from ``open()``.
+        size_min: Smallest ``Width``/``Height`` the camera accepts.
+        size_inc: Step of ``Width``/``Height``.
+        offset_min: Smallest offset (0 on every camera seen so far).
+        offset_inc: Step of the offset.
+        has_offset: Whether the camera can offset the ROI at all.
+    """
+
+    sensor: int
+    size_min: int = 1
+    size_inc: int = 1
+    offset_min: int = 0
+    offset_inc: int = 1
+    has_offset: bool = True
+
+
+def _align_down(value: int, minimum: int, step: int) -> int:
+    """Round ``value`` down onto the grid ``minimum + k * step``."""
+    return minimum + ((value - minimum) // step) * step
+
+
+def _fit_axis(axis: _Axis, offset: int, size: int | None) -> tuple[int, int]:
+    """Clamp and align one axis of a requested ROI to what the camera allows.
+
+    GenApi rejects a value that is off the node's increment instead of
+    rounding it, so both numbers are snapped down onto the grid -- down, so
+    the ROI never grows past what was asked for or off the sensor edge.
+
+    Args:
+        axis: The axis limits.
+        offset: Requested offset; clamped into the sensor.
+        size: Requested size, or ``None`` for the full sensor.
+
+    Returns:
+        ``(offset, size)`` that the camera will accept.
+    """
+    full = axis.sensor
+    size = full if size is None else size
+    size = max(axis.size_min, min(size, full))
+    if size > axis.size_min:
+        size = _align_down(size, axis.size_min, axis.size_inc)
+    if not axis.has_offset:
+        return 0, size
+    offset = max(axis.offset_min, min(offset, full - size))
+    offset = _align_down(offset, axis.offset_min, axis.offset_inc)
+    return offset, size
+
 
 # Known sensor pixel sizes in micrometers, used for auto-detection
 SENSOR_PIXEL_SIZES: dict[str, float] = {
@@ -186,6 +316,8 @@ class HarvesterCamera(Camera):
         self._roi_offset_y: int = 0
         self.width: int = 0
         self.height: int = 0
+        self.width_pixels: int = 0
+        self.height_pixels: int = 0
         # Time of the most recent successful frame. Used to detect when the
         # producer has silently stalled (a known issue on some GenTL stacks
         # after long-running acquisition) so ``get_image`` can attempt a
@@ -255,18 +387,14 @@ class HarvesterCamera(Camera):
         self._configure_gige_stream()
         self._configure_camera_settings()
 
-        try:
-            self.width_pixels = self.node_map.Width.value
-            self.height_pixels = self.node_map.Height.value
-            self.width = self.width_pixels  # For Camera base class compatibility
-            self.height = self.height_pixels
-            logger.info(f"Sensor: {self.width_pixels}×{self.height_pixels} pixels")
-        except Exception as e:
-            logger.warning(f"Could not get camera dimensions: {e}")
-            self.width_pixels = 1024  # Default fallback
-            self.height_pixels = 1024
-            self.width = 1024
-            self.height = 1024
+        width = _node_int(_node(self.node_map, "Width"))
+        height = _node_int(_node(self.node_map, "Height"))
+        if width is None or height is None:
+            logger.warning("Could not read the camera dimensions; assuming 1024×1024")
+            width = height = 1024
+        self.width = self.width_pixels = width
+        self.height = self.height_pixels = height
+        logger.info(f"Sensor: {width}×{height} pixels")
 
         self._detect_pixel_size()
         self._detect_exposure_range()
@@ -406,40 +534,131 @@ class HarvesterCamera(Camera):
             logger.warning(f"Error configuring camera settings: {e}")
 
     def _reset_roi_to_full_sensor(self) -> None:
-        """Reset Region of Interest to full sensor size."""
+        """Start from the full sensor, whatever ROI the last user left behind.
+
+        Only done when the camera states its full size (``WidthMax`` and
+        ``HeightMax``); without them "full" is a guess, and an ROI that was
+        deliberately configured elsewhere is better left alone.
+        """
         try:
-            if hasattr(self.node_map, "WidthMax") and hasattr(self.node_map, "HeightMax"):
-                width_max = self.node_map.WidthMax.value
-                height_max = self.node_map.HeightMax.value
-
-                if hasattr(self.node_map, "OffsetX"):
-                    self.node_map.OffsetX.value = 0
-                if hasattr(self.node_map, "OffsetY"):
-                    self.node_map.OffsetY.value = 0
-
-                if hasattr(self.node_map, "Width"):
-                    self.node_map.Width.value = width_max
-                if hasattr(self.node_map, "Height"):
-                    self.node_map.Height.value = height_max
-
-                logger.info(f"ROI set to full sensor: {width_max}×{height_max}")
+            if (
+                _node(self.node_map, "WidthMax") is None
+                or _node(self.node_map, "HeightMax") is None
+            ):
+                return
+            x, y = self._roi_axes()
+            _, width = _fit_axis(x, 0, None)
+            _, height = _fit_axis(y, 0, None)
+            self._write_roi(x.offset_min, y.offset_min, width, height, x, y)
+            logger.info("ROI set to full sensor: %d×%d", width, height)
         except Exception as e:
             logger.debug(f"Could not reset ROI: {e}")
 
     def _detect_roi_range(self) -> None:
-        """Detect ROI (Region of Interest) capabilities."""
+        """Read the ROI limits and the current geometry back from the camera."""
         try:
-            if hasattr(self.node_map, "WidthMax") and hasattr(self.node_map, "HeightMax"):
-                width_max = self.node_map.WidthMax.value
-                height_max = self.node_map.HeightMax.value
-                logger.info(f"ROI max: {width_max}×{height_max}")
-
-                self._roi_max_width = width_max
-                self._roi_max_height = height_max
-                self._roi_offset_x = 0
-                self._roi_offset_y = 0
+            self._refresh_roi_cache()
+            logger.info(f"ROI max: {self._roi_max_width}×{self._roi_max_height}")
         except Exception as e:
             logger.debug(f"Could not detect ROI range: {e}")
+
+    def _roi_axes(self) -> tuple[_Axis, _Axis]:
+        """The live limits of both ROI axes."""
+        return (
+            self._roi_axis("Width", "OffsetX", "WidthMax", self._roi_max_width or self.width),
+            self._roi_axis("Height", "OffsetY", "HeightMax", self._roi_max_height or self.height),
+        )
+
+    def _roi_axis(self, size_name: str, offset_name: str, max_name: str, fallback: int) -> _Axis:
+        """Limits of one ROI axis, read from the node map on every call.
+
+        Without a ``WidthMax`` node the full extent is recovered from
+        ``Width.max``, which SFNC-style descriptions define as ``WidthMax -
+        OffsetX``. ``fallback`` (the last extent seen) is used only when the
+        camera answers neither.
+        """
+        node_map = self.node_map
+        size_node = _node(node_map, size_name)
+        offset_node = _node(node_map, offset_name)
+        sensor = _node_int(_node(node_map, max_name))
+        if sensor is None:
+            size_max = _node_int(size_node, "max")
+            if size_max is not None:
+                sensor = size_max + (_node_int(offset_node) or 0)
+        if sensor is None:
+            sensor = max(1, int(fallback or 1))
+        return _Axis(
+            sensor=sensor,
+            size_min=max(1, _node_int(size_node, "min") or 1),
+            size_inc=max(1, _node_int(size_node, "inc") or 1),
+            offset_min=max(0, _node_int(offset_node, "min") or 0),
+            offset_inc=max(1, _node_int(offset_node, "inc") or 1),
+            has_offset=_node_int(offset_node) is not None,
+        )
+
+    def _write_roi(self, ox: int, oy: int, width: int, height: int, x: _Axis, y: _Axis) -> None:
+        """Write an ROI in an order the camera cannot refuse half-way.
+
+        ``OffsetX.max`` is ``WidthMax - Width`` and ``Width.max`` is ``WidthMax
+        - OffsetX``, so at full width the only legal offset is 0 and a wide
+        ROI does not fit behind a large offset. Moving the offsets to their
+        minimum first frees the whole sensor for the size; the final offsets
+        then fit behind the new size by construction.
+
+        Nodes already holding their target are not written. Besides saving
+        register writes, that lets an offset-only change -- including putting
+        back the previous ROI after a refusal -- go through on a camera whose
+        size is locked.
+        """
+        node_map = self.node_map
+        cur_ox, cur_oy, cur_w, cur_h = self._read_roi()
+        steps: list[tuple[str, int]] = []
+        if (width, height) != (cur_w, cur_h):
+            if x.has_offset and cur_ox != x.offset_min:
+                steps.append(("OffsetX", x.offset_min))
+                cur_ox = x.offset_min
+            if y.has_offset and cur_oy != y.offset_min:
+                steps.append(("OffsetY", y.offset_min))
+                cur_oy = y.offset_min
+            if width != cur_w:
+                steps.append(("Width", width))
+            if height != cur_h:
+                steps.append(("Height", height))
+        if x.has_offset and ox != cur_ox:
+            steps.append(("OffsetX", ox))
+        if y.has_offset and oy != cur_oy:
+            steps.append(("OffsetY", oy))
+        for name, value in steps:
+            node = _node(node_map, name)
+            if node is not None:
+                node.value = int(value)
+
+    def _read_roi(self) -> tuple[int, int, int, int]:
+        """``(offset_x, offset_y, width, height)`` as the camera reports it now."""
+        node_map = self.node_map
+        ox = _node_int(_node(node_map, "OffsetX"))
+        oy = _node_int(_node(node_map, "OffsetY"))
+        width = _node_int(_node(node_map, "Width"))
+        height = _node_int(_node(node_map, "Height"))
+        return (
+            self._roi_offset_x if ox is None else ox,
+            self._roi_offset_y if oy is None else oy,
+            self.width_pixels if width is None else width,
+            self.height_pixels if height is None else height,
+        )
+
+    def _refresh_roi_cache(self) -> None:
+        """Copy the camera's current ROI and limits into the cached attributes.
+
+        The cache is what :attr:`roi_info` falls back to once the camera is
+        closed, and what ``width``/``height`` report between frames.
+        """
+        x, y = self._roi_axes()
+        self._roi_max_width, self._roi_max_height = x.sensor, y.sensor
+        ox, oy, width, height = self._read_roi()
+        self._roi_offset_x, self._roi_offset_y = ox, oy
+        self.width = self.width_pixels = width
+        self.height = self.height_pixels = height
 
     def _detect_exposure_range(self) -> None:
         """Detect exposure time range from camera.
@@ -652,63 +871,89 @@ class HarvesterCamera(Camera):
         width: int | None = None,
         height: int | None = None,
     ) -> None:
-        """Set the Region of Interest, clamping to what the sensor allows.
+        """Set the region of interest, within what the sensor allows.
 
-        Out-of-range values are clamped rather than rejected, so a too-large
-        width simply yields the biggest ROI that fits at the given offset.
-        Cameras usually also quantise these to a granularity of their own
-        (often 4 or 8 px), so read :attr:`roi_info` back for the real values.
+        Out-of-range values are clamped, and every value is snapped down onto
+        the camera's increment (GenApi rejects off-grid values rather than
+        rounding them). Read :attr:`roi_info` for the geometry that stuck.
+
+        Width and height are locked while the camera streams, so acquisition
+        is stopped around the write and restored afterwards; callers need
+        not do it themselves.
 
         Args:
             offset_x: X offset in pixels.
             offset_y: Y offset in pixels.
-            width: ROI width in pixels (``None`` for full width).
-            height: ROI height in pixels (``None`` for full height).
+            width: ROI width in pixels (``None`` for the full sensor width).
+            height: ROI height in pixels (``None`` for the full sensor height).
+
+        Raises:
+            ValueError: A value is not a whole number of pixels, or a size is
+                below one pixel.
+            RuntimeError: The camera is not open, or refused the ROI. The
+                previous ROI is put back first, and the message says what the
+                camera is now set to.
         """
+        ox = _roi_pixels("offset_x", offset_x)
+        oy = _roi_pixels("offset_y", offset_y)
+        w = None if width is None else _roi_pixels("width", width, minimum=1)
+        h = None if height is None else _roi_pixels("height", height, minimum=1)
+
         if not self.node_map:
-            logger.warning("Camera not opened, cannot set ROI")
-            return
+            raise RuntimeError("Camera not opened.")
 
+        x, y = self._roi_axes()
+        new_ox, new_w = _fit_axis(x, ox, w)
+        new_oy, new_h = _fit_axis(y, oy, h)
+        before = self._read_roi()
+
+        was_acquiring = self.is_acquiring
+        if was_acquiring:
+            self.stop_acquisition()
         try:
-            if width is None:
-                width = self._roi_max_width
-            if height is None:
-                height = self._roi_max_height
+            try:
+                self._write_roi(new_ox, new_oy, new_w, new_h, x, y)
+            except _NODE_ERRORS as exc:
+                try:
+                    self._write_roi(*before, x, y)
+                except _NODE_ERRORS:
+                    logger.warning("Could not restore the previous ROI", exc_info=True)
+                self._refresh_roi_cache()
+                raise RuntimeError(
+                    f"The camera refused a {new_w}×{new_h} ROI at ({new_ox}, {new_oy}): "
+                    f"{_node_error_text(exc)} It is set to {self.width_pixels}×"
+                    f"{self.height_pixels} at ({self._roi_offset_x}, {self._roi_offset_y})."
+                ) from exc
+            self._refresh_roi_cache()
+        finally:
+            if was_acquiring:
+                self.start_acquisition()
 
-            offset_x = max(0, min(offset_x, self._roi_max_width - 1))
-            offset_y = max(0, min(offset_y, self._roi_max_height - 1))
-            width = max(1, min(width, self._roi_max_width - offset_x))
-            height = max(1, min(height, self._roi_max_height - offset_y))
-
-            # Order matters: set offsets before dimensions
-            if hasattr(self.node_map, "OffsetX"):
-                self.node_map.OffsetX.value = offset_x
-            if hasattr(self.node_map, "OffsetY"):
-                self.node_map.OffsetY.value = offset_y
-            if hasattr(self.node_map, "Width"):
-                self.node_map.Width.value = width
-            if hasattr(self.node_map, "Height"):
-                self.node_map.Height.value = height
-
-            self.width = width
-            self.height = height
-            self._roi_offset_x = offset_x
-            self._roi_offset_y = offset_y
-            self.width_pixels = width
-            self.height_pixels = height
-
-            logger.info(f"ROI set: offset=({offset_x}, {offset_y}), size={width}×{height}")
-        except Exception as e:
-            logger.error(f"Could not set ROI: {e}")
+        logger.info(
+            "ROI set: offset=(%d, %d), size=%d×%d",
+            self._roi_offset_x,
+            self._roi_offset_y,
+            self.width_pixels,
+            self.height_pixels,
+        )
 
     @property
     def roi_info(self) -> dict[str, int]:
-        """Get current ROI information.
+        """The current ROI, read back from the camera.
+
+        Falls back to the last geometry seen once the camera is closed or a
+        read fails, so it is always safe to call.
 
         Returns:
             Dict with keys ``offset_x``, ``offset_y``, ``width``, ``height``,
-            ``max_width``, ``max_height``.
+            ``max_width``, ``max_height``. The maxima follow binning and
+            decimation, which change them on the camera.
         """
+        if self.node_map:
+            try:
+                self._refresh_roi_cache()
+            except Exception:
+                logger.debug("Could not read the ROI back from the camera", exc_info=True)
         return {
             "offset_x": self._roi_offset_x,
             "offset_y": self._roi_offset_y,

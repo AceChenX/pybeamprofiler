@@ -113,6 +113,28 @@ def _categorize_feature(name: str) -> str:
     return "Other"
 
 
+def _roi_pixels(name: str, value: Any, *, minimum: int | None = None) -> int:
+    """Validate one ``set_roi`` argument as a whole number of pixels.
+
+    Values that are merely out of range are the camera's business -- every
+    implementation clamps those to what the sensor allows. What cannot be
+    clamped into meaning is a fraction of a pixel, a non-number, or a size
+    below one pixel, and those are rejected here so that simulated and real
+    cameras refuse the same inputs.
+
+    Raises:
+        ValueError: With a message naming the argument.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float, np.integer, np.floating)):
+        raise ValueError(f"{name} must be a whole number of pixels, not {value!r}")
+    if not float(value).is_integer():
+        raise ValueError(f"{name} must be a whole number of pixels, not {value!r}")
+    pixels = int(value)
+    if minimum is not None and pixels < minimum:
+        raise ValueError(f"{name} must be at least {minimum} pixel(s), not {pixels}")
+    return pixels
+
+
 class Camera(ABC):
     """Abstract base class for camera interfaces.
 

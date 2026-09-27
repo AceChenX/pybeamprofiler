@@ -88,6 +88,33 @@ class TestSimulatedCamera:
         cam.close()
 
 
+class TestSimulatedRoiContract:
+    """The simulator must refuse what a real camera refuses, or code that
+    passes against it fails on hardware."""
+
+    @pytest.mark.parametrize(
+        ("args", "message"),
+        [
+            ((0, 0, 100.5, 100), "width must be a whole number"),
+            ((0, 0, 0, 100), "width must be at least 1"),
+            ((0, 0, 100, 0), "height must be at least 1"),
+            ((0.5, 0, 100, 100), "offset_x must be a whole number"),
+            ((0, None, 100, 100), "offset_y must be a whole number"),
+        ],
+    )
+    def test_meaningless_geometry_is_a_value_error(self, args, message):
+        cam = SimulatedCamera()
+        with pytest.raises(ValueError, match=message):
+            cam.set_roi(*args)
+        assert cam.roi_info["width"] == cam.roi_info["max_width"]
+
+    def test_integral_floats_are_accepted(self):
+        cam = SimulatedCamera()
+        whole: Any = (10.0, 20.0, 64.0, 32.0)  # e.g. read back from a float widget
+        cam.set_roi(*whole)
+        assert cam.get_image().shape == (32, 64)
+
+
 class TestCameraIntegration:
     """Test camera integration with BeamProfiler."""
 
@@ -513,14 +540,28 @@ class TestGenCameraExposureGain:
             cam.get_image()
 
     def test_set_roi(self):
-        """Test set_roi sets node_map values."""
+        """set_roi writes the nodes and reads the geometry back.
+
+        GenICam write-order and increment rules are covered against the real
+        GenApi engine in test_harvester_camera.py; this only checks the
+        plumbing with plain attribute-backed nodes.
+        """
+        from types import SimpleNamespace
+
         cam = self._make_mock_camera()
-        cam._roi_max_width = 1024
-        cam._roi_max_height = 768
+        cam.node_map = SimpleNamespace(
+            Width=SimpleNamespace(value=1024, min=1, max=1024, inc=1),
+            Height=SimpleNamespace(value=768, min=1, max=768, inc=1),
+            OffsetX=SimpleNamespace(value=0, min=0, max=0, inc=1),
+            OffsetY=SimpleNamespace(value=0, min=0, max=0, inc=1),
+            WidthMax=SimpleNamespace(value=1024),
+            HeightMax=SimpleNamespace(value=768),
+        )
         cam.set_roi(offset_x=10, offset_y=20, width=640, height=480)
         assert cam.width == 640
         assert cam.height == 480
         assert cam._roi_offset_x == 10
+        assert cam.node_map.OffsetY.value == 20
 
     def test_set_roi_defaults_to_max(self):
         """Test set_roi uses max dimensions when not specified."""
@@ -532,10 +573,11 @@ class TestGenCameraExposureGain:
         assert cam.height == 768
 
     def test_set_roi_no_node_map(self):
-        """Test set_roi warns when camera not opened."""
+        """An unopened camera refuses rather than pretending to succeed."""
         cam = self._make_mock_camera()
         cam.node_map = None
-        cam.set_roi()  # Should not raise
+        with pytest.raises(RuntimeError, match="not opened"):
+            cam.set_roi()
 
 
 class TestGenCameraSensorLookup:
@@ -922,11 +964,15 @@ class TestGenCameraDetection:
         assert cam.node_map.GammaEnable.value is False
         cam._reset_roi_to_full_sensor.assert_called_once()
 
+    @requires_genicam
     def test_reset_roi_to_full_sensor(self):
-        """Test _reset_roi_to_full_sensor sets offset and max dimensions."""
+        """A camera left with an offset ROI is reset in a legal order."""
+        from _genapi_device import make_node_map
+
         cam = self._make_cam()
-        cam.node_map.WidthMax.value = 2048
-        cam.node_map.HeightMax.value = 1536
+        cam.node_map = make_node_map()
+        cam.node_map.Width.value = 400
+        cam.node_map.OffsetX.value = 1500  # only legal once Width is small
         cam._reset_roi_to_full_sensor()
         assert cam.node_map.OffsetX.value == 0
         assert cam.node_map.OffsetY.value == 0
