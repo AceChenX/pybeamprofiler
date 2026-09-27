@@ -241,3 +241,41 @@ class TestControls:
         payload = body["response"]["download-png"]["data"]
         assert payload["filename"].endswith(".png")
         assert payload["base64"] is True
+
+
+def _props_by_id(node: Any, found: dict[str, dict[str, Any]] | None = None) -> dict[str, Any]:
+    """Walk a serialised Dash layout and index each component's props by id."""
+    found = {} if found is None else found
+    if isinstance(node, dict):
+        props = node.get("props")
+        if isinstance(props, dict) and isinstance(props.get("id"), str):
+            found[props["id"]] = props
+        for value in node.values():
+            _props_by_id(value, found)
+    elif isinstance(node, list):
+        for value in node:
+            _props_by_id(value, found)
+    return found
+
+
+class TestPageLoad:
+    def test_a_reload_after_a_switch_is_served_the_new_state(self, live_app):
+        """The layout used to be frozen at start-up, so a reload after a
+        switch was served the old camera, its pixel pitch and a Pause button
+        over a stopped stream."""
+        client, bp = live_app
+        from pybeamprofiler import dash_layout
+
+        options, current = dash_layout._camera_options(bp)
+        target = next(o for o in options if o.key != current)
+        client.fire("div-camera-status.children", "dropdown-camera", target.key)
+
+        layout = client.session.get(f"{client.base}/_dash-layout", timeout=REQUEST_TIMEOUT)
+        props = _props_by_id(layout.json())
+        try:
+            assert props["dropdown-camera"]["value"] == target.key
+            assert props["input-pixel-scale"]["value"] == round(bp.pixel_size, 4)
+            assert props["store-paused"]["data"] is True
+        finally:
+            # Leave the shared server streaming for whatever runs next.
+            client.fire("store-paused.data", "btn-play-pause", 9, {"store-paused": True})

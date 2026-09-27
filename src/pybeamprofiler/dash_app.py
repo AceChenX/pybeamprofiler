@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import base64
 import collections
+import functools
 import io
 import logging
 import threading
@@ -27,11 +28,10 @@ import dash
 import dash_bootstrap_components as dbc
 import numpy as np
 import plotly.graph_objs as go
-from dash import MATCH, Input, Output, Patch, State, ctx, dcc, html
+from dash import MATCH, Input, Output, Patch, State, ctx, html
 from PIL import Image
 
 from .constants import (
-    DEFAULT_UPDATE_INTERVAL_MS,
     MAX_AVG_FRAMES,
     MAX_DISPLAY_DIM,
 )
@@ -39,9 +39,10 @@ from .dash_layout import (
     GRAY_COLORSCALE,
     _build_setting_items,
     _camera_options,
-    _fitting_tab,
     _format_results,
-    _setting_tab,
+    _page,
+    _play_pause_face,
+    _with_open_camera,
 )
 from .discovery import (
     CameraOption,
@@ -389,86 +390,23 @@ window.addEventListener('load', function() {
         initial_img = bp.last_img
 
     if initial_img is not None:
-        popt_x, popt_y = bp.analyze(initial_img)
-        initial_fig = build_figure(bp, initial_img, popt_x, popt_y)
-    else:
-        initial_fig = go.Figure()
+        bp.analyze(initial_img)
+        # Kept so the first page load has a frame to show; the page is built
+        # from the profiler's state (see _serve_page).
+        bp.last_img = initial_img
 
     # ── Layout ──────────────────────────────────────────────────
     # One enumeration at start-up, shared by the dropdown and the cache the
     # switch callback resolves against. Scanning twice would double a
     # multi-second GenTL walk on a machine with hardware attached.
-    camera_options, current_camera = _camera_options(bp)
+    camera_options, _ = _camera_options(bp)
 
-    # The two-column split is implemented with explicit pixel widths so a
-    # draggable divider (``#col-divider``) can resize them on the client.
-    # Defaults match the original 75/25% Bootstrap row.
-    app.layout = html.Div(
-        [
-            html.Div(
-                [
-                    html.Div(
-                        dcc.Graph(
-                            id="live-graph",
-                            figure=initial_fig,
-                            style={"height": "100vh"},
-                            config={"responsive": True, "displaylogo": False},
-                        ),
-                        id="col-graph",
-                        style={"flex": "1 1 0", "minWidth": "200px", "overflow": "hidden"},
-                    ),
-                    html.Div(
-                        id="col-divider",
-                        title="Drag to resize",
-                        style={
-                            "width": "5px",
-                            "cursor": "col-resize",
-                            "backgroundColor": "#444",
-                            "flex": "0 0 5px",
-                        },
-                    ),
-                    html.Div(
-                        [
-                            html.H6(
-                                "pyBeamprofiler",
-                                className="text-center mb-2 mt-1 fw-bold",
-                            ),
-                            dbc.Tabs(
-                                [
-                                    _fitting_tab(bp, camera_options, current_camera),
-                                    _setting_tab(bp),
-                                ],
-                                id="tabs",
-                                active_tab="tab-fitting",
-                            ),
-                            html.Div(
-                                id="status-bar",
-                                className="small text-muted text-center mt-2",
-                            ),
-                        ],
-                        id="col-side",
-                        className="ps-1",
-                        style={
-                            "flex": "0 0 320px",
-                            "minWidth": "240px",
-                            "maxWidth": "60%",
-                            "height": "100vh",
-                            "overflowY": "auto",
-                        },
-                    ),
-                ],
-                style={"display": "flex", "width": "100%", "height": "100vh"},
-            ),
-            dcc.Interval(id="interval", interval=DEFAULT_UPDATE_INTERVAL_MS, n_intervals=0),
-            dcc.Store(id="store-paused", data=False),
-            dcc.Store(id="store-frame", data=0),
-            dcc.Store(id="store-dark-theme", data=True),
-            dcc.Download(id="download-png"),
-            dcc.Download(id="download-npy"),
-        ],
-        id="main-container",
-        style={"backgroundColor": "#222"},
-    )
+    # A function rather than a component tree, so Dash builds the page for
+    # each load. A tree built here kept serving the start-up state: after a
+    # camera switch, a reloaded page named the old camera and pixel pitch
+    # and offered Pause on a stopped stream -- and merely tabbing out of the
+    # Scale box wrote the stale pitch back into the profiler.
+    app.layout = functools.partial(_serve_page, bp)
 
     _register_callbacks(app, bp)
     # Seeded only now: _register_callbacks clears the module state, this
@@ -477,6 +415,31 @@ window.addEventListener('load', function() {
     global _known_options  # noqa: PLW0603
     _known_options = camera_options
     return app
+
+
+def _serve_page(bp: BeamProfiler) -> Any:
+    """Build the page from what is in force right now.
+
+    Runs on every page load, under the lock: the Setting panel reads the
+    camera's node map, and the figure and the controls read profiler state
+    that a callback might be replacing.
+    """
+    with _callback_lock:
+        options, current = _with_open_camera(bp, _known_options)
+        figure: Any = go.Figure()
+        results = None
+        if bp.last_img is not None:
+            zoom = _zoom_range
+            figure = build_figure(
+                bp,
+                bp.last_img,
+                bp._last_popt_x,
+                bp._last_popt_y,
+                xrange=zoom["x"] if zoom else None,
+                yrange=zoom["y"] if zoom else None,
+            )
+            results = _format_results(bp)
+        return _page(bp, figure, options, current, paused=_server_paused, results=results)
 
 
 # ---------------------------------------------------------------------------
@@ -750,11 +713,12 @@ def _register_callbacks(app: dash.Dash, bp: BeamProfiler) -> None:
             items = _build_setting_items(bp)
             scale = round(bp.pixel_size, 4)
 
+        button_children, button_color = _play_pause_face(True)
         return (
             f"{option.label} ready - press Play",
             True,
-            [html.I(className="bi bi-play-fill me-1"), "Play"],
-            "success",
+            button_children,
+            button_color,
             _settings_body(items),
             scale,
         )
@@ -791,19 +755,8 @@ def _register_callbacks(app: dash.Dash, bp: BeamProfiler) -> None:
 
             items = _build_setting_items(bp)
 
-        if new_paused:
-            label = [html.I(className="bi bi-play-fill me-1"), "Play"]
-            color = "success"
-        else:
-            label = [html.I(className="bi bi-pause-fill me-1"), "Pause"]
-            color = "primary"
-
-        if items:
-            settings_body = dbc.Accordion(items, start_collapsed=False, always_open=True)
-        else:
-            settings_body = html.P("No camera connected.", className="text-muted p-3")
-
-        return new_paused, label, color, settings_body
+        label, color = _play_pause_face(new_paused)
+        return new_paused, label, color, _settings_body(items)
 
     # -- Save current frame as PNG -------------------------------------------
     @app.callback(

@@ -18,6 +18,7 @@ import dash
 import numpy as np
 import pytest
 from dash import html
+from dash.development.base_component import Component
 
 from pybeamprofiler import dash_app, dash_layout, discovery
 from pybeamprofiler.beamprofiler import BeamProfiler
@@ -50,6 +51,31 @@ def _registered(app: dash.Dash, name: str) -> Any:
         if fn is not None and getattr(fn, "__wrapped__", fn).__name__ == name:
             return fn.__wrapped__
     raise KeyError(name)
+
+
+def _by_id(page: Any) -> dict[str, Any]:
+    """Every component in *page* that has a plain string id, keyed by it."""
+    found: dict[str, Any] = {}
+
+    def walk(node: Any) -> None:
+        if isinstance(node, Component):
+            cid = getattr(node, "id", None)
+            if isinstance(cid, str):
+                found[cid] = node
+            walk(getattr(node, "children", None))
+            walk(getattr(node, "label", None))
+        elif isinstance(node, (list, tuple)):
+            for child in node:
+                walk(child)
+
+    walk(page)
+    return found
+
+
+def _page_load(app: dash.Dash) -> Any:
+    """What Dash serves for one page load, whether the layout is a tree or a
+    function that builds one."""
+    return app._layout_value()
 
 
 def _tick(
@@ -253,3 +279,67 @@ class TestANewAppStartsFromScratch:
         assert len(dash_app._avg_buffer) == 0
         assert dash_app._avg_running_sum is None
         assert len(dash_app._recent_frame_times) == 0
+
+
+class TestAPageLoadShowsWhatIsInForce:
+    """The page used to be one component tree, built at start-up.
+
+    Dash served that same tree on every load, so after a camera switch a
+    reloaded page (or a second tab) named the old camera, showed its pixel
+    pitch in the Scale box and offered Pause on a stopped stream. Checked in
+    Chrome: merely clicking into the Scale box and out again wrote the stale
+    5.0 um/px over the 3.45 um/px camera, inflating every width by 45%.
+    """
+
+    @staticmethod
+    def _switched() -> tuple[BeamProfiler, dash.Dash, str]:
+        bp = BeamProfiler(camera="simulated")
+        app = dash_app.create_app(bp)
+        target = f"{discovery.SIMULATED_PREFIX}sim-2"
+        assert "ready" in _registered(app, "switch_camera")(target)[0]
+        return bp, app, target
+
+    def test_the_page_follows_a_camera_switch(self):
+        bp, app, target = self._switched()
+        page = _by_id(_page_load(app))
+
+        assert page["dropdown-camera"].value == target
+        assert page["input-pixel-scale"].value == 3.45
+        assert page["store-paused"].data is True
+        assert "Play" in str(page["btn-play-pause"].children)
+        assert page["input-roi-w"].value == 1280  # the new sensor's panel
+
+    def test_leaving_the_scale_box_keeps_the_real_pitch(self):
+        bp, app, _ = self._switched()
+        page = _by_id(_page_load(app))
+
+        # What the browser sends on blur: whatever the box shows.
+        _registered(app, "set_pixel_scale")(None, 1, page["input-pixel-scale"].value)
+
+        assert bp.pixel_size == pytest.approx(3.45)
+
+    def test_analysis_settings_come_from_the_profiler(self):
+        bp = BeamProfiler(camera="simulated")
+        app = dash_app.create_app(bp)
+        bp.fit_method, bp.definition = "2d", "d4s"
+
+        page = _by_id(_page_load(app))
+
+        assert page["dropdown-analysis"].value == "2d"
+        assert page["dropdown-definition"].value == "d4s"
+
+    def test_a_paused_page_shows_the_last_frame_and_its_numbers(self):
+        bp = BeamProfiler(camera="simulated")
+        app = dash_app.create_app(bp)
+        _registered(app, "update_live")(
+            1, False, True, "Hot", True, None, None, 0, "1d", "gaussian", True, 1
+        )
+        _registered(app, "toggle_pause")(1, False)
+        assert bp.last_img is not None
+
+        page = _by_id(_page_load(app))
+
+        heatmap = page["live-graph"].figure.data[0]
+        assert np.array_equal(heatmap.z, bp.last_img)
+        assert "μm" in str(page["div-results"].children)
+        assert page["store-paused"].data is True

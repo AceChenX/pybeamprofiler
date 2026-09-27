@@ -412,7 +412,9 @@ class TestCreateApp:
         bp = BeamProfiler(camera="simulated")
         assert bp.camera is not None
         app = create_app(bp)
-        layout = app.layout
+        # The layout is a function, so that each page load reflects the
+        # current state; render it the way Dash does.
+        layout = app.layout()
 
         layout_str = str(layout)
         assert "live-graph" in layout_str
@@ -717,7 +719,7 @@ class TestDashGenicamCallbacks:
         assert bp.camera is not None
         app = create_app(bp)
         assert isinstance(app, dash.Dash)
-        layout_str = str(app.layout)
+        layout_str = str(app.layout())
         assert "genicam" in layout_str
 
 

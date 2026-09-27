@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING, Any
 import dash_bootstrap_components as dbc
 from dash import dcc, html
 
-from .constants import MAX_AVG_FRAMES
+from .constants import DEFAULT_UPDATE_INTERVAL_MS, MAX_AVG_FRAMES
 from .discovery import CameraOption, describe_open_camera, discover_cameras
 
 # Optional: only present when a real GenTL backend is installed. Used by
@@ -92,7 +92,21 @@ def _camera_options(bp: BeamProfiler) -> tuple[list[CameraOption], str]:
     Returns:
         ``(options, current_key)``.
     """
-    options = discover_cameras()
+    return _with_open_camera(bp, discover_cameras())
+
+
+def _with_open_camera(
+    bp: BeamProfiler, options: list[CameraOption]
+) -> tuple[list[CameraOption], str]:
+    """Fold the open camera into *options* and return its key.
+
+    Split out of :func:`_camera_options` so the page can be rebuilt from the
+    cached list on every load without enumerating devices again.
+
+    Returns:
+        ``(options, current_key)``, with *options* copied rather than mutated.
+    """
+    options = list(options)
     current = ""
     if bp.camera is not None:
         open_option = describe_open_camera(bp.camera)
@@ -100,6 +114,17 @@ def _camera_options(bp: BeamProfiler) -> tuple[list[CameraOption], str]:
         if not any(o.key == current for o in options):
             options.insert(0, open_option)
     return options, current
+
+
+def _play_pause_face(paused: bool) -> tuple[list[Any], str]:
+    """The Play/Pause button's children and colour for a given state.
+
+    The button offers the action that is available, so a paused stream shows
+    Play.
+    """
+    if paused:
+        return [html.I(className="bi bi-play-fill me-1"), "Play"], "success"
+    return [html.I(className="bi bi-pause-fill me-1"), "Pause"], "primary"
 
 
 def _camera_controls(options: list[CameraOption], current: str) -> Any:
@@ -135,14 +160,26 @@ def _camera_controls(options: list[CameraOption], current: str) -> Any:
     )
 
 
-def _fitting_tab(bp: BeamProfiler, options: list[CameraOption], current: str) -> dbc.Tab:
+def _fitting_tab(
+    bp: BeamProfiler,
+    options: list[CameraOption],
+    current: str,
+    *,
+    paused: bool = False,
+    results: Any = None,
+) -> dbc.Tab:
     """Build the **Fitting** tab content.
 
     Args:
-        bp: The profiler, read for its current fit method and pixel size.
+        bp: The profiler, read for its current fit method, definition and
+            pixel size.
         options: Cameras to offer in the selector.
         current: Key of the camera already open.
+        paused: Whether the stream is stopped, which decides what the
+            Play/Pause button offers.
+        results: Initial contents of the results panel, if any.
     """
+    button_children, button_color = _play_pause_face(paused)
     return dbc.Tab(
         label="Fitting",
         tab_id="tab-fitting",
@@ -157,9 +194,9 @@ def _fitting_tab(bp: BeamProfiler, options: list[CameraOption], current: str) ->
                     dbc.Row(
                         dbc.Col(
                             dbc.Button(
-                                [html.I(className="bi bi-pause-fill me-1"), "Pause"],
+                                button_children,
                                 id="btn-play-pause",
-                                color="primary",
+                                color=button_color,
                                 size="sm",
                                 className="w-100",
                                 title="Toggle Play / Pause (Spacebar)",
@@ -407,7 +444,7 @@ def _fitting_tab(bp: BeamProfiler, options: list[CameraOption], current: str) ->
                     ),
                     # Row 6 — Fitted results
                     html.Hr(className="my-2"),
-                    html.Div(id="div-results", className="small font-monospace"),
+                    html.Div(results, id="div-results", className="small font-monospace"),
                 ],
             ),
             className="border-0",
@@ -954,3 +991,104 @@ def _format_results(bp: BeamProfiler) -> list[Any]:
         rows.append(html.Span("No fit data", className="text-muted"))
 
     return rows
+
+
+# ---------------------------------------------------------------------------
+# The page
+# ---------------------------------------------------------------------------
+
+
+def _page(
+    bp: BeamProfiler,
+    figure: Any,
+    options: list[CameraOption],
+    current: str,
+    *,
+    paused: bool,
+    results: Any = None,
+) -> html.Div:
+    """Assemble the whole page around an already-built figure.
+
+    Everything that depends on the profiler is taken from its current state,
+    because this is built afresh for every page load: see
+    :func:`pybeamprofiler.dash_app.create_app`.
+
+    Args:
+        bp: The profiler, read for the camera, analysis settings and scale.
+        figure: The figure to show until the first tick replaces it.
+        options: Cameras to offer in the selector.
+        current: Key of the camera already open.
+        paused: Whether the stream is stopped.
+        results: Initial contents of the results panel, if any.
+    """
+    # The two-column split is implemented with explicit pixel widths so a
+    # draggable divider (``#col-divider``) can resize them on the client.
+    # Defaults match the original 75/25% Bootstrap row.
+    return html.Div(
+        [
+            html.Div(
+                [
+                    html.Div(
+                        dcc.Graph(
+                            id="live-graph",
+                            figure=figure,
+                            style={"height": "100vh"},
+                            config={"responsive": True, "displaylogo": False},
+                        ),
+                        id="col-graph",
+                        style={"flex": "1 1 0", "minWidth": "200px", "overflow": "hidden"},
+                    ),
+                    html.Div(
+                        id="col-divider",
+                        title="Drag to resize",
+                        style={
+                            "width": "5px",
+                            "cursor": "col-resize",
+                            "backgroundColor": "#444",
+                            "flex": "0 0 5px",
+                        },
+                    ),
+                    html.Div(
+                        [
+                            html.H6(
+                                "pyBeamprofiler",
+                                className="text-center mb-2 mt-1 fw-bold",
+                            ),
+                            dbc.Tabs(
+                                [
+                                    _fitting_tab(
+                                        bp, options, current, paused=paused, results=results
+                                    ),
+                                    _setting_tab(bp),
+                                ],
+                                id="tabs",
+                                active_tab="tab-fitting",
+                            ),
+                            html.Div(
+                                id="status-bar",
+                                className="small text-muted text-center mt-2",
+                            ),
+                        ],
+                        id="col-side",
+                        className="ps-1",
+                        style={
+                            "flex": "0 0 320px",
+                            "minWidth": "240px",
+                            "maxWidth": "60%",
+                            "height": "100vh",
+                            "overflowY": "auto",
+                        },
+                    ),
+                ],
+                style={"display": "flex", "width": "100%", "height": "100vh"},
+            ),
+            dcc.Interval(id="interval", interval=DEFAULT_UPDATE_INTERVAL_MS, n_intervals=0),
+            dcc.Store(id="store-paused", data=paused),
+            dcc.Store(id="store-frame", data=0),
+            dcc.Store(id="store-dark-theme", data=True),
+            dcc.Download(id="download-png"),
+            dcc.Download(id="download-npy"),
+        ],
+        id="main-container",
+        style={"backgroundColor": "#222"},
+    )
