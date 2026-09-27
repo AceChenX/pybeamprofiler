@@ -404,10 +404,12 @@ class SimulatedCamera(Camera):
 
         Both scale the signal on a real sensor, so both have to be folded in
         together — deriving the amplitude from only the setting that changed
-        last would quietly undo the other one.
+        last would quietly undo the other one. The base is this profile's own
+        amplitude: scaling the default camera's snapped every other profile
+        to its brightness the moment exposure or gain was touched.
         """
         self._amplitude = (
-            SIMULATED_AMPLITUDE
+            self.profile.amplitude
             * (self.exposure_time / DEFAULT_EXPOSURE_TIME)
             * (1 + self.gain / 10)
         )
@@ -415,22 +417,26 @@ class SimulatedCamera(Camera):
     def set_exposure(self, exposure_time: float | None) -> None:  # type: ignore[override]
         """Set exposure time and adjust simulated signal amplitude.
 
+        Clamped to :attr:`exposure_range`, as a real camera clamps to its
+        node's range, so :attr:`exposure_time` is always a value the
+        simulated sensor could have.
+
         Args:
             exposure_time: Exposure in seconds, or ``None`` to reset to the default.
         """
         if exposure_time is None:
             exposure_time = DEFAULT_EXPOSURE_TIME
-        self.exposure_time = exposure_time
+        self.exposure_time = min(max(float(exposure_time), self._exposure_min), self._exposure_max)
         self._refresh_amplitude()
         if self.node_map is not None:
-            self.node_map.ExposureTime._value = exposure_time * 1_000_000
+            self.node_map.ExposureTime._value = self.exposure_time * 1_000_000
 
     def set_gain(self, gain: float) -> None:
-        """Set gain and adjust simulated signal amplitude."""
-        self.gain = gain
+        """Set gain, clamped to :attr:`gain_range`, and adjust the amplitude."""
+        self.gain = min(max(float(gain), self._gain_min), self._gain_max)
         self._refresh_amplitude()
         if self.node_map is not None:
-            self.node_map.Gain._value = gain
+            self.node_map.Gain._value = self.gain
 
     def set_roi(
         self,

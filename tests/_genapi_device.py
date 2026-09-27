@@ -12,6 +12,8 @@ XML description that follows the SFNC conventions real cameras use:
   rejects anything off the increment rather than rounding it.
 * ``Width``, ``Height``, ``BinningHorizontal`` and ``PixelFormat`` are locked
   while ``TLParamsLocked`` is set, which Harvesters does on every ``start()``.
+* ``ExposureTime`` (µs, 20 to 10 000 000) is locked while ``ExposureAuto`` is
+  on, and the device starts with it on, as many do out of the box.
 
 Around that sits just enough of Harvesters -- a ``Harvester`` that enumerates
 devices and whose ``update()`` destroys every acquirer it created, as the real
@@ -101,6 +103,7 @@ XML = """<?xml version="1.0" encoding="utf-8"?>
   </Integer>
 
   <Float Name="ExposureTime" NameSpace="Standard">
+    <pIsLocked>ExposureAutoVal</pIsLocked>
     <Value>5000</Value><Min>20</Min><Max>10000000</Max><Unit>us</Unit>
   </Float>
   <Float Name="Gain" NameSpace="Standard">

@@ -118,6 +118,16 @@ def _node_int(node: Any, attr: str = "value") -> int | None:
     return None if number is None else int(number)
 
 
+def _node_float(node: Any, attr: str = "value") -> float | None:
+    """Read ``node.<attr>`` as a float, or ``None`` if it is absent or unreadable."""
+    if node is None:
+        return None
+    try:
+        return _numeric(getattr(node, attr))
+    except Exception:
+        return None
+
+
 def _node_error_text(exc: BaseException) -> str:
     """The human half of a GenICam error message.
 
@@ -656,6 +666,7 @@ class HarvesterCamera(Camera):
         self._detect_exposure_range()
         self._detect_gain_range()
         self._detect_roi_range()
+        self._sync_exposure_and_gain()
 
     def _harvester_files(self) -> list[str]:
         """Producers to load: this camera's own first, then every other one found.
@@ -1253,49 +1264,126 @@ class HarvesterCamera(Camera):
             return False
 
     def set_exposure(self, exposure_time: float) -> None:
-        """Set exposure time, restarting acquisition to flush stale buffers.
+        """Set the exposure, in seconds, within what the camera allows.
 
-        Without the stop/start the producer's buffer ring still holds frames
-        captured at the old exposure, so the display would show a couple of
-        wrongly-exposed frames after every change.
+        The value is clamped to the node's range as the camera reports it
+        now -- on some cameras the maximum follows the frame rate -- because
+        GenApi refuses an out-of-range write instead of clamping it.
+        Acquisition is restarted around the write so the producer's buffer
+        ring cannot deliver a couple of frames still at the old exposure.
+
+        Afterwards :attr:`exposure_time` is what the camera reports back, not
+        what was asked for.
 
         Args:
             exposure_time: Exposure time in seconds.
+
+        Raises:
+            RuntimeError: The camera is not open, or refused the value (for
+                example while auto exposure is on).
         """
         with self._device():
+            if not self.node_map:
+                raise RuntimeError("Camera not opened.")
+            node = self._exposure_node()
+            if node is None:
+                logger.warning("This camera has no ExposureTime feature; exposure unchanged.")
+                return
+            target_us = self._clamp_to_node(float(exposure_time) * 1_000_000, node)
+            lo, hi = _node_float(node, "min"), _node_float(node, "max")
+            if lo is not None and hi is not None:
+                self._exposure_min, self._exposure_max = lo / 1_000_000, hi / 1_000_000
+
             was_acquiring = self.is_acquiring
             if was_acquiring:
                 self.stop_acquisition()
-
-            if self.node_map:
+            try:
                 try:
-                    self.node_map.ExposureTime.value = exposure_time * 1_000_000
-                except (AttributeError, ValueError, TypeError):
-                    try:
-                        self.node_map.ExposureTimeAbs.value = exposure_time * 1_000_000
-                    except (AttributeError, ValueError, TypeError):
-                        logger.error("Could not set exposure time.")
-            self.exposure_time = exposure_time
-
-            if was_acquiring:
-                self.start_acquisition()
+                    node.value = target_us
+                except _NODE_ERRORS as exc:
+                    raise RuntimeError(
+                        f"The camera refused an exposure of {target_us / 1000:.3f} ms: "
+                        f"{_node_error_text(exc)}"
+                    ) from exc
+                readback = _node_float(node)
+                self.exposure_time = (target_us if readback is None else readback) / 1_000_000
+            finally:
+                if was_acquiring:
+                    self.start_acquisition()
 
     def set_gain(self, gain: float) -> None:
-        """Set camera gain, falling back to the legacy ``GainRaw`` feature.
+        """Set the gain within what the camera allows.
+
+        Clamped to the node's live range like :meth:`set_exposure`. Falls
+        back to the legacy ``GainRaw`` feature, whose units are raw ADC
+        steps rather than dB, on cameras without ``Gain``. Afterwards
+        :attr:`gain` is what the camera reports back.
 
         Args:
-            gain: Gain in the camera's own units — dB on most SFNC-compliant
+            gain: Gain in the camera's own units -- dB on most SFNC-compliant
                 devices, raw ADC steps on older ones.
+
+        Raises:
+            RuntimeError: The camera is not open, or refused the value.
         """
         with self._device():
-            if self.node_map:
-                try:
-                    self.node_map.Gain.value = gain
-                except (AttributeError, ValueError, TypeError):
-                    try:
-                        self.node_map.GainRaw.value = int(gain)
-                    except (AttributeError, ValueError, TypeError):
-                        logger.error("Could not set gain.")
+            if not self.node_map:
+                raise RuntimeError("Camera not opened.")
+            node = _node(self.node_map, "Gain")
+            raw = node is None
+            if raw:
+                node = _node(self.node_map, "GainRaw")
+            if node is None:
+                logger.warning("This camera has no Gain feature; gain unchanged.")
+                return
+            target: float = self._clamp_to_node(float(gain), node)
+            if raw:
+                lo = _node_int(node, "min") or 0
+                target = _align_down(int(round(target)), lo, max(1, _node_int(node, "inc") or 1))
+            try:
+                node.value = target
+            except _NODE_ERRORS as exc:
+                raise RuntimeError(
+                    f"The camera refused a gain of {target:g}: {_node_error_text(exc)}"
+                ) from exc
+            readback = _node_float(node)
+            self.gain = target if readback is None else readback
+
+    def _exposure_node(self) -> Any:
+        """``ExposureTime`` (SFNC), or ``ExposureTimeAbs`` on older cameras; both µs."""
+        for name in ("ExposureTime", "ExposureTimeAbs"):
+            node = _node(self.node_map, name)
+            if node is not None:
+                return node
+        return None
+
+    @staticmethod
+    def _clamp_to_node(value: float, node: Any) -> float:
+        """``value`` limited to the node's current ``min``/``max``, where readable."""
+        lo, hi = _node_float(node, "min"), _node_float(node, "max")
+        if lo is not None and value < lo:
+            logger.info("%g is below the camera's minimum; using %g", value, lo)
+            value = lo
+        if hi is not None and value > hi:
+            logger.info("%g is above the camera's maximum; using %g", value, hi)
+            value = hi
+        return value
+
+    def _sync_exposure_and_gain(self) -> None:
+        """Take exposure and gain from the device instead of assuming defaults.
+
+        They used to stay at the class defaults (10 ms, 0 dB) whatever the
+        camera was set to -- by pylon Viewer, a user set, or a previous
+        session -- so the GUI showed the wrong values, and every timeout and
+        stall window derived from exposure_time was wrong with them.
+        """
+        exposure_us = _node_float(self._exposure_node())
+        if exposure_us is not None:
+            self.exposure_time = exposure_us / 1_000_000
+        gain = _node_float(_node(self.node_map, "Gain"))
+        if gain is None:
+            gain = _node_float(_node(self.node_map, "GainRaw"))
+        if gain is not None:
             self.gain = gain
 
     @property

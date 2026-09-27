@@ -1437,7 +1437,9 @@ class TestBuildStatus:
 
         bp = BeamProfiler(camera="simulated")
         assert bp.camera is not None
-        bp.camera.set_exposure(2.5)
+        # Set directly: 2.5 s is past the simulator's 1 s limit, and
+        # set_exposure() clamps to the camera's range. This is about format.
+        bp.camera.exposure_time = 2.5
         children = da._build_status(bp, np.zeros((4, 4), dtype=np.uint8), 1)
         text = str(children)
         assert "2.50 s" in text

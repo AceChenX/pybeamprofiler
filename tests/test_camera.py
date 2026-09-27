@@ -88,6 +88,39 @@ class TestSimulatedCamera:
         cam.close()
 
 
+class TestSimulatedExposureContract:
+    """The simulator clamps like a camera, and each profile keeps its own
+    brightness."""
+
+    def test_exposure_is_clamped_to_its_range(self):
+        cam = SimulatedCamera()
+        cam.set_exposure(5.0)
+        assert cam.exposure_time == cam.exposure_range[1]
+        cam.set_exposure(1e-6)
+        assert cam.exposure_time == cam.exposure_range[0]
+
+    def test_gain_is_clamped_to_its_range(self):
+        cam = SimulatedCamera()
+        cam.set_gain(99.0)
+        assert cam.gain == cam.gain_range[1]
+        cam.set_gain(-1.0)
+        assert cam.gain == cam.gain_range[0]
+
+    def test_a_profile_keeps_its_brightness(self):
+        """Exposure and gain scaled the *default* camera's amplitude, so
+        touching either snapped sim-2 (180 counts) to sim-1's 200."""
+        from pybeamprofiler.constants import DEFAULT_EXPOSURE_TIME
+        from pybeamprofiler.simulated import SIMULATED_PROFILES
+
+        profile = SIMULATED_PROFILES[1]
+        cam = SimulatedCamera(profile)
+        cam.set_exposure(DEFAULT_EXPOSURE_TIME)
+        cam.set_gain(0.0)
+        assert cam._amplitude == pytest.approx(profile.amplitude)
+        cam.set_gain(10.0)
+        assert cam._amplitude == pytest.approx(2 * profile.amplitude)
+
+
 class TestSimulatedRoiContract:
     """The simulator must refuse what a real camera refuses, or code that
     passes against it fails on hardware."""
@@ -177,11 +210,40 @@ class TestApplySettingsFromKwargs:
         cam.close()
 
     def test_set_exposure_alias(self):
-        """Test setting ExposureTime alias."""
+        """ExposureTime is the GenICam node, so it is in microseconds.
+
+        It used to be read as seconds: ExposureTime=5000 -- 5 ms to anyone
+        who knows GenICam -- asked for 5000 s.
+        """
         cam = SimulatedCamera()
         cam.open()
-        cam._apply_settings_from_kwargs({"ExposureTime": 0.02})
-        assert cam.exposure_time == 0.02
+        cam._apply_settings_from_kwargs({"ExposureTime": 20_000})
+        assert cam.exposure_time == pytest.approx(0.02)
+        cam.close()
+
+    def test_integral_float_for_an_integer_node(self):
+        cam = SimulatedCamera()
+        cam.open()
+        cam._apply_settings_from_kwargs({"BlackLevel": 12.0})
+        assert cam.node_map is not None
+        value = cam.node_map.BlackLevel.value
+        assert value == 12 and isinstance(value, int)
+        cam.close()
+
+    def test_numeric_string_for_a_float_node(self):
+        cam = SimulatedCamera()
+        cam.open()
+        cam._apply_settings_from_kwargs({"Gamma": "1.5"})
+        assert cam.node_map is not None
+        assert cam.node_map.Gamma.value == 1.5
+        cam.close()
+
+    def test_boolean_word_for_a_boolean_node(self):
+        cam = SimulatedCamera()
+        cam.open()
+        cam._apply_settings_from_kwargs({"ReverseX": "on"})
+        assert cam.node_map is not None
+        assert cam.node_map.ReverseX.value is True
         cam.close()
 
     def test_set_gain_alias(self):
@@ -449,12 +511,16 @@ class TestGenCameraExposureGain:
         assert cam.exposure_time == 0.01
 
     def test_set_exposure_fallback(self):
-        """Test set_exposure falls back to ExposureTimeAbs."""
+        """Cameras without ExposureTime (older Basler GigE) use ExposureTimeAbs."""
+        from types import SimpleNamespace
+
         cam = self._make_mock_camera()
-        cam.node_map.ExposureTime = MagicMock()
-        type(cam.node_map.ExposureTime).value = property(fset=MagicMock(side_effect=AttributeError))
+        cam.node_map = SimpleNamespace(
+            ExposureTimeAbs=SimpleNamespace(value=5000.0, min=20.0, max=1e6)
+        )
         cam.set_exposure(0.01)
-        assert cam.exposure_time == 0.01
+        assert cam.node_map.ExposureTimeAbs.value == pytest.approx(10_000.0)
+        assert cam.exposure_time == pytest.approx(0.01)
 
     def test_set_gain_primary(self):
         """Test set_gain using Gain node."""
@@ -463,11 +529,13 @@ class TestGenCameraExposureGain:
         assert cam.gain == 5.0
 
     def test_set_gain_fallback(self):
-        """Test set_gain falls back to GainRaw."""
+        """Cameras without Gain use GainRaw, an integer in ADC steps."""
+        from types import SimpleNamespace
+
         cam = self._make_mock_camera()
-        cam.node_map.Gain = MagicMock()
-        type(cam.node_map.Gain).value = property(fset=MagicMock(side_effect=AttributeError))
-        cam.set_gain(10.0)
+        cam.node_map = SimpleNamespace(GainRaw=SimpleNamespace(value=0, min=0, max=511, inc=1))
+        cam.set_gain(10.4)
+        assert cam.node_map.GainRaw.value == 10
         assert cam.gain == 10.0
 
     def test_exposure_range_property(self):
@@ -1195,27 +1263,35 @@ class TestGenCameraDetection:
 
         assert cam.width == 1024
 
-    def test_set_exposure_both_fail(self):
-        """Test set_exposure when both ExposureTime and ExposureTimeAbs fail."""
+    def test_set_exposure_refused(self):
+        """A refused write is an error, and exposure_time keeps the old value.
+
+        It used to be logged and then recorded anyway, so the GUI showed an
+        exposure the camera was not using.
+        """
         cam = self._make_cam()
+        cam.exposure_time = 0.02
         type(cam.node_map.ExposureTime).value = property(
             fset=MagicMock(side_effect=AttributeError("no"))
         )
-        type(cam.node_map.ExposureTimeAbs).value = property(
-            fset=MagicMock(side_effect=AttributeError("no"))
-        )
-        cam.set_exposure(0.01)
-        assert cam.exposure_time == 0.01
+        with pytest.raises(RuntimeError, match="refused an exposure"):
+            cam.set_exposure(0.01)
+        assert cam.exposure_time == 0.02
 
-    def test_set_gain_both_fail(self):
-        """Test set_gain when both Gain and GainRaw fail."""
+    def test_set_gain_refused(self):
         cam = self._make_cam()
+        cam.gain = 1.0
         type(cam.node_map.Gain).value = property(fset=MagicMock(side_effect=AttributeError("no")))
-        type(cam.node_map.GainRaw).value = property(
-            fset=MagicMock(side_effect=AttributeError("no"))
-        )
-        cam.set_gain(5.0)
-        assert cam.gain == 5.0
+        with pytest.raises(RuntimeError, match="refused a gain"):
+            cam.set_gain(5.0)
+        assert cam.gain == 1.0
+
+    def test_no_exposure_feature_leaves_exposure_alone(self):
+        cam = self._make_cam()
+        cam.node_map = MagicMock(spec=[])
+        cam.exposure_time = 0.02
+        cam.set_exposure(0.5)
+        assert cam.exposure_time == 0.02
 
     def test_set_roi_error_handling(self):
         """Test set_roi handles exceptions."""

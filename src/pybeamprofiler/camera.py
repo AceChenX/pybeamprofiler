@@ -117,6 +117,44 @@ def _categorize_feature(name: str) -> str:
     return "Other"
 
 
+def _coerce_for_node(node: Any, value: Any) -> Any:
+    """Convert a keyword value to the kind the node holds, where unambiguous.
+
+    Keyword arguments arrive as whatever the caller typed -- ``Width=512.0``
+    from arithmetic, ``"on"`` for a boolean, a number read from a config
+    file as a string -- and GenApi rejects a float for an integer node or a
+    string for a boolean one. Anything that does not convert cleanly is
+    passed through for the node to accept or refuse.
+    """
+    try:
+        current = node.value
+    except Exception:
+        return value
+    if isinstance(current, bool):
+        if isinstance(value, str):
+            word = value.strip().lower()
+            if word in ("on", "true", "1", "yes"):
+                return True
+            if word in ("off", "false", "0", "no"):
+                return False
+        return value
+    if isinstance(current, int):
+        if isinstance(value, float) and value.is_integer():
+            return int(value)
+        if isinstance(value, str):
+            try:
+                return int(value.strip())
+            except ValueError:
+                return value
+        return value
+    if isinstance(current, float) and isinstance(value, str):
+        try:
+            return float(value.strip())
+        except ValueError:
+            return value
+    return value
+
+
 def _roi_pixels(name: str, value: Any, *, minimum: int | None = None) -> int:
     """Validate one ``set_roi`` argument as a whole number of pixels.
 
@@ -266,8 +304,11 @@ class Camera(ABC):
 
         Args:
             **kwargs: Camera parameters to apply before showing the UI.
-                Parameter names should match ``node_map`` feature names
-                (e.g. ``ExposureTime=0.01``, ``Gain=10.0``, ``BlackLevel=0``).
+                ``exposure_time`` (seconds) and ``gain`` go through
+                :meth:`set_exposure` / :meth:`set_gain`; any other name is a
+                ``node_map`` feature, in that feature's own unit (e.g.
+                ``ExposureTime=10000`` is 10 ms, since the node counts
+                microseconds; ``Gain=10.0``, ``BlackLevel=0``).
         """
         import ipywidgets as widgets
         from IPython.display import display
@@ -290,8 +331,11 @@ class Camera(ABC):
         # anything a real sensor supports anyway.
         exposure_min = max(exposure_min, 1e-6)
         exposure_max = max(exposure_max, exposure_min * 10)
-        exp_min_log = math.floor(math.log10(exposure_min))
-        exp_max_log = math.ceil(math.log10(exposure_max))
+        # The camera's own limits, not whole decades around them: rounding
+        # the exponents outwards let the slider reach values the camera then
+        # refused -- 10 µs on a camera whose minimum is 20 µs.
+        exp_min_log = math.log10(exposure_min)
+        exp_max_log = math.log10(exposure_max)
 
         exposure_slider = widgets.FloatLogSlider(
             value=self.exposure_time,
@@ -873,17 +917,21 @@ class Camera(ABC):
     def _apply_settings_from_kwargs(self, kwargs: dict[str, Any]) -> None:
         """Apply camera settings from keyword arguments.
 
-        Handles both standard camera attributes (``exposure_time``, ``gain``)
-        and GenICam ``node_map`` features.
+        ``exposure_time`` is in seconds and ``gain`` in the camera's gain
+        unit, like the methods they call. A GenICam feature name is in that
+        feature's own unit: ``ExposureTime`` used to be read as seconds, so
+        ``ExposureTime=5000`` -- 5 ms to anyone who knows GenICam -- asked
+        for 5000 s.
 
         Args:
             kwargs: Mapping of parameter names to values.
         """
         for param_name, value in kwargs.items():
-            if param_name in ("exposure_time", "ExposureTime"):
+            if param_name in ("exposure_time", "ExposureTime", "ExposureTimeAbs"):
+                seconds = value if param_name == "exposure_time" else float(value) / 1_000_000
                 try:
-                    self.set_exposure(value)
-                    logger.info(f"Set exposure_time = {value}")
+                    self.set_exposure(seconds)
+                    logger.info(f"Set exposure_time = {self.exposure_time}")
                 except Exception as e:
                     logger.error(f"Error setting exposure_time: {e}")
                 continue
@@ -891,7 +939,7 @@ class Camera(ABC):
             if param_name in ("gain", "Gain"):
                 try:
                     self.set_gain(value)
-                    logger.info(f"Set gain = {value}")
+                    logger.info(f"Set gain = {self.gain}")
                 except Exception as e:
                     logger.error(f"Error setting gain: {e}")
                 continue
@@ -900,23 +948,9 @@ class Camera(ABC):
                 if hasattr(self.node_map, param_name):
                     try:
                         node = getattr(self.node_map, param_name)
-
-                        if isinstance(value, str):
-                            if param_name.endswith("Enable") or param_name.endswith("Auto"):
-                                # Check if this is actually a boolean node
-                                try:
-                                    current_val = node.value
-                                    if isinstance(current_val, bool):
-                                        if value.lower() in ["on", "true", "1", "yes"]:
-                                            value = True
-                                        elif value.lower() in ["off", "false", "0", "no"]:
-                                            value = False
-                                except Exception as e:
-                                    logger.debug(
-                                        f"Could not check boolean type for {param_name}: {e}"
-                                    )
-
-                        node.value = value
+                        value = _coerce_for_node(node, value)
+                        with self._device():
+                            node.value = value
                         logger.info(f"Set {param_name} = {value}")
                     except Exception as e:
                         logger.error(f"Error setting {param_name}: {e}")

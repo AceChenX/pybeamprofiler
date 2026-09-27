@@ -496,3 +496,94 @@ class TestPanelControlsOfAClosedCamera:
         camera.close()
         camera.setting()  # must not touch the released node map
         assert camera._create_genicam_controls({}) == []
+
+
+class TestExposureAndGain:
+    """Out-of-range exposures escaped as a GenICam OutOfRangeException --
+    which is not a ValueError, so nothing caught it -- after acquisition had
+    already been stopped. A refused write was recorded anyway. And open()
+    never read the device, so exposure and gain showed the class defaults
+    whatever the camera was actually doing."""
+
+    def test_open_reads_exposure_and_gain_from_the_device(self, camera):
+        assert camera.exposure_time == pytest.approx(0.005)
+        assert camera.gain == pytest.approx(1.5)
+
+    def test_open_turns_auto_exposure_off(self, camera):
+        assert camera.node_map.ExposureAuto.value == "Off"
+
+    def test_exposure_range_comes_from_the_node(self, camera):
+        assert camera.exposure_range == pytest.approx((20e-6, 10.0))
+
+    def test_too_long_an_exposure_is_clamped_and_streaming_resumes(self, camera):
+        camera.start_acquisition()
+        camera.set_exposure(20.0)
+        assert camera.node_map.ExposureTime.value == pytest.approx(10_000_000)
+        assert camera.exposure_time == pytest.approx(10.0)
+        assert camera.is_acquiring
+
+    def test_too_short_an_exposure_is_clamped(self, camera):
+        camera.set_exposure(1e-7)
+        assert camera.node_map.ExposureTime.value == pytest.approx(20)
+        assert camera.exposure_time == pytest.approx(20e-6)
+
+    def test_a_refused_exposure_raises_and_changes_nothing(self, camera):
+        camera.start_acquisition()
+        camera.node_map.ExposureAuto.value = "Continuous"  # locks ExposureTime
+        with pytest.raises(RuntimeError, match="refused an exposure"):
+            camera.set_exposure(0.02)
+        assert camera.exposure_time == pytest.approx(0.005)
+        assert camera.is_acquiring
+
+    def test_gain_is_clamped_and_read_back(self, camera):
+        camera.set_gain(99.0)
+        assert camera.gain == pytest.approx(24.0)
+        camera.set_gain(-3.0)
+        assert camera.gain == pytest.approx(0.0)
+        assert camera.node_map.Gain.value == pytest.approx(0.0)
+
+    def test_an_exposure_left_on_the_device_is_picked_up(self, bus):
+        """E.g. 8 s set in pylon Viewer before this session. It used to read
+        as the 10 ms default, which also sized every fetch timeout."""
+        node_map = bus.devices[0].node_map
+        node_map.ExposureAuto.value = "Off"
+        node_map.ExposureTime.value = 8_000_000
+        cam = HarvesterCamera(cti_file=bus.cti)
+        cam.open()
+        try:
+            assert cam.exposure_time == pytest.approx(8.0)
+        finally:
+            cam.close()
+
+
+class TestExposurePanel:
+    """The Jupyter exposure slider spanned whole decades around the camera's
+    range, and its observer let the camera's refusal escape."""
+
+    @staticmethod
+    def _slider(camera, monkeypatch) -> Any:
+        import IPython.display
+        import ipywidgets as widgets
+
+        shown: list[Any] = []
+        monkeypatch.setattr(IPython.display, "display", lambda w, *a, **k: shown.append(w))
+        camera.setting()
+
+        def walk(w: Any) -> Iterator[Any]:
+            yield w
+            for child in getattr(w, "children", ()):
+                yield from walk(child)
+
+        return next(w for w in walk(shown[0]) if isinstance(w, widgets.FloatLogSlider))
+
+    def test_the_slider_stops_at_the_camera_limits(self, camera, monkeypatch):
+        slider = self._slider(camera, monkeypatch)
+        assert slider.base**slider.min == pytest.approx(20e-6)
+        assert slider.base**slider.max == pytest.approx(10.0)
+
+    def test_a_refusal_from_the_slider_is_logged_not_raised(self, camera, monkeypatch, caplog):
+        slider = self._slider(camera, monkeypatch)
+        camera.node_map.ExposureAuto.value = "Continuous"  # locks ExposureTime
+        with caplog.at_level("ERROR"):
+            slider.value = 0.02
+        assert "refused an exposure" in caplog.text
