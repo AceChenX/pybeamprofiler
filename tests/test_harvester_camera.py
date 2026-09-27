@@ -578,6 +578,13 @@ class TestExposureAndGain:
             cam.close()
 
 
+class TestPixelSizeDetection:
+    def test_an_unreadable_feature_falls_through_to_the_next(self, camera):
+        """SensorPixelWidth raising AccessException (not a ValueError) used to
+        abandon the whole search and fall back to 1.0 µm."""
+        assert camera.pixel_size == pytest.approx(3.45)
+
+
 class TestExposurePanel:
     """The Jupyter exposure slider spanned whole decades around the camera's
     range, and its observer let the camera's refusal escape."""

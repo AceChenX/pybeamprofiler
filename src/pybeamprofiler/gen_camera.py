@@ -11,10 +11,11 @@ behave rather than from anything the GenICam standard asks for:
 * A GenTL producer can be initialised only once per process, so every
   camera and every discovery pass share one Harvester (see
   :class:`_SharedHarvester`).
-* Harvesters segfaults, rather than raising, when a fetched buffer is
-  re-queued after acquisition was stopped under it, or when a node is read
-  through a released device. Each camera therefore serialises everything
-  that touches its device, and ``close()`` drops every handle into it.
+* Harvesters and the GenICam bindings segfault, rather than raise, when a
+  fetched buffer is re-queued after acquisition was stopped under it, or
+  when a node of a released device is read. Each camera therefore
+  serialises everything that touches its device, and ``close()`` drops
+  every handle into it.
 * ``ImageAcquirer.fetch()`` is not bounded by its timeout, so frames are
   taken with ``try_fetch`` against a deadline kept here.
 * Acquisition is restarted after an exposure change so the producer's
@@ -835,6 +836,9 @@ class HarvesterCamera(Camera):
         """Detect pixel size from camera's GenICam features.
 
         Tries multiple standard feature names, sensor model lookup, and defaults to 1.0 μm.
+        A feature that exists but refuses to be read (GenICam AccessException,
+        which is not a ValueError) moves on to the next source instead of
+        abandoning the search.
         """
         try:
             pixel_size = None
@@ -843,7 +847,7 @@ class HarvesterCamera(Camera):
                 if hasattr(self.node_map, "SensorPixelWidth"):
                     pixel_size = self.node_map.SensorPixelWidth.value
                     logger.debug("Using SensorPixelWidth for pixel size")
-            except (AttributeError, ValueError, TypeError):
+            except _NODE_ERRORS:
                 pass
 
             if pixel_size is None:
@@ -851,7 +855,7 @@ class HarvesterCamera(Camera):
                     if hasattr(self.node_map, "SensorPixelHeight"):
                         pixel_size = self.node_map.SensorPixelHeight.value
                         logger.debug("Using SensorPixelHeight for pixel size")
-                except (AttributeError, ValueError, TypeError):
+                except _NODE_ERRORS:
                     pass
 
             if pixel_size is None:
@@ -861,7 +865,7 @@ class HarvesterCamera(Camera):
                         if isinstance(val, (int, float)):
                             pixel_size = val
                             logger.debug("Using PixelSize for pixel size")
-                except (AttributeError, ValueError, TypeError):
+                except _NODE_ERRORS:
                     pass
 
             if pixel_size is None:

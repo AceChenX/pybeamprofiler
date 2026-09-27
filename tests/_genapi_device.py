@@ -14,6 +14,8 @@ XML description that follows the SFNC conventions real cameras use:
   while ``TLParamsLocked`` is set, which Harvesters does on every ``start()``.
 * ``ExposureTime`` (µs, 20 to 10 000 000) is locked while ``ExposureAuto`` is
   on, and the device starts with it on, as many do out of the box.
+* ``SensorPixelWidth`` exists but is not available, so reading it raises
+  ``AccessException``; ``SensorPixelHeight`` reads 3.45 µm.
 
 Around that sits just enough of Harvesters -- a ``Harvester`` that enumerates
 devices and whose ``update()`` destroys every acquirer it created, as the real
@@ -108,6 +110,15 @@ XML = """<?xml version="1.0" encoding="utf-8"?>
   </Float>
   <Float Name="Gain" NameSpace="Standard">
     <Value>1.5</Value><Min>0</Min><Max>24</Max><Unit>dB</Unit>
+  </Float>
+
+  <Integer Name="NotAvailable"><Value>0</Value></Integer>
+  <Float Name="SensorPixelWidth" NameSpace="Standard">
+    <pIsAvailable>NotAvailable</pIsAvailable>
+    <Value>9.99</Value><Min>0</Min><Max>100</Max><Unit>um</Unit>
+  </Float>
+  <Float Name="SensorPixelHeight" NameSpace="Standard">
+    <Value>3.45</Value><Min>0</Min><Max>100</Max><Unit>um</Unit>
   </Float>
 
   <Enumeration Name="ExposureAuto" NameSpace="Standard">
