@@ -1053,3 +1053,50 @@ class TestSettingControlsShowWhatTheCameraHas:
         ):
             ctx.triggered_id = "slider-gain"
             assert cbs["set_gain"](3.3, None) == (3.5, 3.5)
+
+
+class TestAFrameWithNoPlausibleBeam:
+    """The analysis may now report "no beam" -- a blank frame, a beam off the
+    sensor -- as None fit parameters with NaN widths and centre, and None
+    linecut coordinates. The GUI has to show that as missing, not as "nan
+    um", and draw only what exists."""
+
+    @staticmethod
+    def _no_beam(bp: BeamProfiler, image: np.ndarray) -> tuple[None, None]:
+        nan = float("nan")
+        bp.width_x = bp.width_y = bp.center_x = bp.center_y = nan
+        bp.peak_value = float(image.max())
+        bp._last_popt_x = bp._last_popt_y = bp._last_popt_2d = None
+        return None, None
+
+    def test_the_results_show_dashes_not_nan(self):
+        bp = BeamProfiler(camera="simulated")
+        self._no_beam(bp, np.full((8, 8), 10, dtype=np.uint8))
+        text = str(dash_app._format_results(bp))
+        assert "—" in text
+        assert "nan" not in text.lower()
+        assert "Peak" in text  # the frame itself was still measured
+
+    def test_the_figure_draws_the_frame_and_nothing_it_cannot_know(self):
+        bp = BeamProfiler(camera="simulated")
+        bp.fit_method = "linecut"
+        bp._linecut_x = None  # ty: ignore[invalid-assignment]
+        bp._linecut_y = None  # ty: ignore[invalid-assignment]
+        image = np.full((64, 64), 10, dtype=np.uint8)
+        self._no_beam(bp, image)
+
+        fig = dash_app.build_figure(bp, image, None, None)
+
+        assert fig.data[0].type == "heatmap"
+        assert _ellipse_centre(fig) is None
+        assert _crosshair(fig) is None
+        assert len([t for t in fig.data if t.type == "scatter"]) == 2  # the two profiles
+
+    def test_a_tick_on_a_blank_frame_still_draws(self):
+        bp = BeamProfiler(camera="simulated")
+        cbs = _callbacks(bp)
+        with patch.object(bp, "analyze", side_effect=lambda img: self._no_beam(bp, img)):
+            out = _tick(cbs)
+        assert out[0] is not dash.no_update
+        assert "—" in str(out[1])
+        assert "error" not in str(out[2]).lower()

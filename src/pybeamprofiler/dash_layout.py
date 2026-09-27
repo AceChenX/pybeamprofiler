@@ -13,6 +13,7 @@ does, and they were previously interleaved across two thousand lines.
 from __future__ import annotations
 
 import logging
+import math
 import re
 from typing import TYPE_CHECKING, Any
 
@@ -943,54 +944,45 @@ def _setting_tab(bp: BeamProfiler) -> dbc.Tab:
 
 
 def _format_results(bp: BeamProfiler) -> list[Any]:
-    """Format fitted beam parameters for the results panel."""
+    """Format fitted beam parameters for the results panel.
+
+    A frame with no plausible beam leaves the widths and the centre NaN;
+    those read "—" rather than "nan μm". "No fit data" is kept for the state
+    before anything has been measured, when the widths are exactly zero.
+    """
     rows: list[Any] = []
 
-    def _row(label: str, val: float) -> Any:
+    def _um(val: float) -> str:
+        return f"{val:.1f} μm" if math.isfinite(val) else "—"
+
+    def _row(label: str, text: str) -> Any:
         return html.Div(
-            [html.Span(f"{label}: ", className="text-muted"), html.Span(f"{val:.1f} μm")],
+            [html.Span(f"{label}: ", className="text-muted"), html.Span(text)],
             className="mb-1",
         )
 
-    if bp.width_x > 0:
-        rows.append(_row("FW@1/e² X", bp.fw_1e2_x))
-        rows.append(_row("FW@1/e² Y", bp.fw_1e2_y))
-        rows.append(_row("FW@1/e X", bp.fw_1e_x))
-        rows.append(_row("FW@1/e Y", bp.fw_1e_y))
-        rows.append(_row("FWHM X", bp.fwhm_x))
-        rows.append(_row("FWHM Y", bp.fwhm_y))
-
-        rows.append(html.Hr(className="my-1"))
-        ps = bp.pixel_size
-        rows.append(
-            html.Div(
-                [
-                    html.Span("Center: ", className="text-muted"),
-                    html.Span(f"({bp.center_x * ps:.1f}, {bp.center_y * ps:.1f}) μm"),
-                ],
-                className="mb-1",
-            )
-        )
-        rows.append(
-            html.Div(
-                [html.Span("Peak: ", className="text-muted"), html.Span(f"{bp.peak_value:.0f}")],
-                className="mb-1",
-            )
-        )
-        # Only the 2D Gaussian fit measures a rotation; FWHM and D4σ skip it.
-        if bp.fit_method == "2d" and bp.definition == "gaussian":
-            rows.append(
-                html.Div(
-                    [
-                        html.Span("Angle: ", className="text-muted"),
-                        html.Span(f"{bp.angle_deg:.1f}°"),
-                    ],
-                    className="mb-1",
-                )
-            )
-    else:
+    if not (bp.width_x > 0 or math.isnan(bp.width_x) or math.isnan(bp.width_y)):
         rows.append(html.Span("No fit data", className="text-muted"))
+        return rows
 
+    rows.append(_row("FW@1/e² X", _um(bp.fw_1e2_x)))
+    rows.append(_row("FW@1/e² Y", _um(bp.fw_1e2_y)))
+    rows.append(_row("FW@1/e X", _um(bp.fw_1e_x)))
+    rows.append(_row("FW@1/e Y", _um(bp.fw_1e_y)))
+    rows.append(_row("FWHM X", _um(bp.fwhm_x)))
+    rows.append(_row("FWHM Y", _um(bp.fwhm_y)))
+
+    rows.append(html.Hr(className="my-1"))
+    ps = bp.pixel_size
+    cx, cy = bp.center_x * ps, bp.center_y * ps
+    centre = f"({cx:.1f}, {cy:.1f}) μm" if math.isfinite(cx) and math.isfinite(cy) else "—"
+    rows.append(_row("Center", centre))
+    peak = bp.peak_value
+    rows.append(_row("Peak", f"{peak:.0f}" if math.isfinite(peak) else "—"))
+    # Only the 2D Gaussian fit measures a rotation; FWHM and D4σ skip it.
+    if bp.fit_method == "2d" and bp.definition == "gaussian":
+        angle = bp.angle_deg
+        rows.append(_row("Angle", f"{angle:.1f}°" if math.isfinite(angle) else "—"))
     return rows
 
 
