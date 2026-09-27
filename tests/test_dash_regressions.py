@@ -343,3 +343,160 @@ class TestAPageLoadShowsWhatIsInForce:
         assert np.array_equal(heatmap.z, bp.last_img)
         assert "μm" in str(page["div-results"].children)
         assert page["store-paused"].data is True
+
+
+def _ellipse_inside_view(fig: Any) -> float:
+    """Fraction of the drawn beam ellipse that lies inside the axis ranges."""
+    trace = next(t for t in fig.data if t.type == "scatter" and t.line.dash == "dash")
+    x, y = np.asarray(trace.x), np.asarray(trace.y)
+    (x0, x1), (y0, y1) = fig.layout.xaxis.range, fig.layout.yaxis.range
+    return float(np.mean((x >= x0) & (x <= x1) & (y >= y0) & (y <= y1)))
+
+
+class TestAMouseZoomSurvivesTheNextFrame:
+    """A box zoom or pan with the mouse lasted exactly one frame.
+
+    The figure's ``uirevision`` is meant to preserve it, but in Dash 4 the
+    Graph re-plots its own figure with the zoomed range as soon as the user
+    lets go. Plotly takes that as the app setting the range, drops its record
+    of the user's edit (``_preGUI``), and the next tick's explicit
+    full-sensor range wins. Seen in Chrome: zoomed at frame 9, full sensor
+    again by frame 11. The zoom now becomes server state, like Auto-fit.
+    """
+
+    @staticmethod
+    def _streaming() -> tuple[BeamProfiler, dict[str, Any]]:
+        bp = _profiler()
+        cbs = _callbacks(bp)
+        _tick(cbs)
+        return bp, cbs
+
+    def test_a_box_zoom_is_kept_by_the_following_frames(self):
+        bp, cbs = self._streaming()
+        cbs["follow_mouse_zoom"](
+            {
+                "xaxis.range[0]": 1000.0,
+                "xaxis.range[1]": 2000.0,
+                "yaxis.range[0]": 1500.0,
+                "yaxis.range[1]": 2500.0,
+            }
+        )
+        for _ in range(3):
+            fig = _tick(cbs)[0]
+            assert list(fig.layout.xaxis.range) == pytest.approx([1000.0, 2000.0])
+            assert list(fig.layout.yaxis.range) == pytest.approx([1500.0, 2500.0])
+
+    def test_a_drag_along_one_axis_keeps_the_other(self):
+        bp, cbs = self._streaming()
+        cbs["follow_mouse_zoom"]({"xaxis.range": [1000.0, 2000.0]})
+        fig = _tick(cbs)[0]
+        assert list(fig.layout.xaxis.range) == pytest.approx([1000.0, 2000.0])
+        assert list(fig.layout.yaxis.range) == pytest.approx([0.0, 1024 * bp.pixel_size])
+
+    @pytest.mark.parametrize(
+        "event",
+        [
+            {"xaxis.autorange": True, "yaxis.autorange": True},
+            # What a double-click sends: the full extent as explicit ranges.
+            {
+                "xaxis.range[0]": 0.0,
+                "xaxis.range[1]": 5120.0,
+                "yaxis.range[0]": 0.0,
+                "yaxis.range[1]": 5120.0,
+            },
+        ],
+    )
+    def test_autoscale_and_double_click_return_to_the_full_sensor(self, event):
+        bp, cbs = self._streaming()
+        cbs["follow_mouse_zoom"]({"xaxis.range": [1000.0, 2000.0]})
+        cbs["follow_mouse_zoom"](event)
+        assert dash_app._zoom_range is None
+
+    @pytest.mark.parametrize("event", [None, {}, {"autosize": True}, {"dragmode": "pan"}])
+    def test_events_that_move_no_axis_change_nothing(self, event):
+        bp, cbs = self._streaming()
+        cbs["follow_mouse_zoom"]({"xaxis.range": [1000.0, 2000.0]})
+        before = dash_app._zoom_range
+        cbs["follow_mouse_zoom"](event)
+        assert dash_app._zoom_range == before
+
+
+class TestTheZoomStaysOnTheSamePixels:
+    """The zoom box used to be stored in micrometres.
+
+    Correcting the pixel scale while zoomed kept the box's micrometre values
+    while the image's extent changed, so it framed a different part of the
+    sensor: at 5 -> 2.5 um/px none of the beam was left in view.
+    """
+
+    def test_correcting_the_scale_keeps_the_beam_in_view(self):
+        bp = _profiler()
+        cbs = _callbacks(bp)
+        _tick(cbs)
+        cbs["auto_fit_zoom"](1)
+        # The simulated beam jitters by ~17 px a frame, so a later frame's
+        # ellipse can graze the edge of a box fitted to an earlier one.
+        assert _ellipse_inside_view(_tick(cbs)[0]) > 0.9
+
+        cbs["set_pixel_scale"](1, None, 2.5)
+
+        fig = _tick(cbs)[0]
+        assert _ellipse_inside_view(fig) > 0.9  # was 0.0
+        assert dash_app._zoom_range is not None
+        assert list(fig.layout.xaxis.range) == pytest.approx(
+            [v * 2.5 for v in dash_app._zoom_range["x"]]
+        )
+
+
+class _InterleavingLock:
+    """Stands in for ``_callback_lock`` and runs *interloper* at the moment a
+    callback asks for the lock the first time, before it gets it."""
+
+    def __init__(self, interloper: Any) -> None:
+        import threading
+
+        self._lock = threading.Lock()
+        self._interloper = interloper
+
+    def _maybe_interlope(self) -> None:
+        interloper, self._interloper = self._interloper, None
+        if interloper is not None:
+            interloper()
+
+    def __enter__(self) -> _InterleavingLock:
+        self._maybe_interlope()
+        self._lock.acquire()
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self._lock.release()
+
+    def acquire(self, blocking: bool = True, timeout: float = -1) -> bool:
+        self._maybe_interlope()
+        return self._lock.acquire(blocking, timeout)
+
+    def release(self) -> None:
+        self._lock.release()
+
+    def locked(self) -> bool:
+        return self._lock.locked()
+
+
+class TestAutoFitReadsTheFitUnderTheLock:
+    """Auto-fit read the fit and the pixel size before taking the lock and
+    only wrote the zoom under it. A camera switch landing in between was
+    overwritten: the new camera started zoomed onto the old camera's beam."""
+
+    def test_a_switch_in_between_is_not_overwritten(self, monkeypatch):
+        bp = _profiler()
+        cbs = _callbacks(bp)
+        _tick(cbs)
+        target = f"{discovery.SIMULATED_PREFIX}sim-2"
+        switch = lambda: cbs["switch_camera"](target)  # noqa: E731
+        monkeypatch.setattr(dash_app, "_callback_lock", _InterleavingLock(switch))
+
+        cbs["auto_fit_zoom"](1)
+
+        assert bp.camera is not None
+        assert discovery.describe_open_camera(bp.camera).key == target
+        assert dash_app._zoom_range is None

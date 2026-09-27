@@ -2618,15 +2618,33 @@ class TestZoomCallbacks:
             patch = fn(1)
             assert isinstance(patch, Patch)
             assert da._zoom_range is not None
+            # Stored in sensor pixels, so a later scale change keeps the
+            # same region in view.
             zoom = da._zoom_range
-            cx = bp._last_popt_x[1] * bp.pixel_size
-            cy = bp._last_popt_y[1] * bp.pixel_size
-            assert abs((zoom["x"][0] + zoom["x"][1]) / 2 - cx) < bp.pixel_size
-            assert abs((zoom["y"][0] + zoom["y"][1]) / 2 - cy) < bp.pixel_size
+            cx, cy = bp._last_popt_x[1], bp._last_popt_y[1]
+            assert abs((zoom["x"][0] + zoom["x"][1]) / 2 - cx) < 1
+            assert abs((zoom["y"][0] + zoom["y"][1]) / 2 - cy) < 1
             assert zoom["x"][1] > zoom["x"][0]
             assert zoom["y"][1] > zoom["y"][0]
+            # The patch the figure gets is in micrometres.
+            ops = patch.to_plotly_json()["operations"]
+            xs = next(op["params"]["value"] for op in ops if "xaxis" in op["location"])
+            assert xs == pytest.approx([v * bp.pixel_size for v in zoom["x"]])
         finally:
             da._zoom_range = original
+
+    def test_auto_fit_ignores_a_fit_that_found_no_beam(self):
+        """With no plausible beam the fit is NaN; zooming to it would send
+        Plotly a NaN range."""
+        import pybeamprofiler.dash_app as da
+
+        bp = BeamProfiler(camera="simulated")
+        bp._last_popt_x = [np.nan, np.nan, np.nan, np.nan]
+        bp._last_popt_y = [np.nan, np.nan, np.nan, np.nan]
+        fn = _extract_callback_by_input(bp, "btn-zoom-fit")
+        assert fn is not None
+        assert isinstance(fn(1), dash._no_update.NoUpdate)
+        assert da._zoom_range is None
 
     def test_reset_zoom_clears_zoom_and_returns_patch(self):
         from dash import Patch
@@ -2679,7 +2697,7 @@ class TestZoomCallbacks:
         bp.camera.start_acquisition()
         fn = _extract_callback(bp, "live-graph")
         assert fn is not None
-        zoom = {"x": [100.0, 500.0], "y": [50.0, 450.0]}
+        zoom = {"x": [100.0, 500.0], "y": [50.0, 450.0]}  # sensor pixels
         original = da._zoom_range
         da._zoom_range = zoom
         try:
@@ -2687,8 +2705,9 @@ class TestZoomCallbacks:
                 mock_bf.return_value = "FIG"
                 fn(1, False, True, "Hot", True, None, None, 0, "1d", "gaussian", True, 1)
                 kwargs = mock_bf.call_args.kwargs
-            assert kwargs["xrange"] == [100.0, 500.0]
-            assert kwargs["yrange"] == [50.0, 450.0]
+            ps = bp.pixel_size
+            assert kwargs["xrange"] == [100.0 * ps, 500.0 * ps]
+            assert kwargs["yrange"] == [50.0 * ps, 450.0 * ps]
         finally:
             da._zoom_range = original
             bp.camera.stop_acquisition()

@@ -429,14 +429,14 @@ def _serve_page(bp: BeamProfiler) -> Any:
         figure: Any = go.Figure()
         results = None
         if bp.last_img is not None:
-            zoom = _zoom_range
+            xrange, yrange = _zoom_in_um(bp)
             figure = build_figure(
                 bp,
                 bp.last_img,
                 bp._last_popt_x,
                 bp._last_popt_y,
-                xrange=zoom["x"] if zoom else None,
-                yrange=zoom["y"] if zoom else None,
+                xrange=xrange,
+                yrange=yrange,
             )
             results = _format_results(bp)
         return _page(bp, figure, options, current, paused=_server_paused, results=results)
@@ -467,12 +467,66 @@ _avg_running_sum: np.ndarray | None = None
 # loop for the whole switch.
 _known_options: list[CameraOption] = []
 
-# Authoritative zoom state, mutated by Auto-fit / Reset under
-# ``_callback_lock`` and read by ``update_live``. Using a module
-# variable (rather than a Dash ``State``) avoids a 50–100 ms
-# stale-snapshot race that would otherwise blink the previous zoom
-# for one frame whenever a click landed mid-tick.
+# Authoritative zoom state, in sensor *pixels*, mutated by Auto-fit, Reset
+# and mouse zooms under ``_callback_lock`` and read by ``update_live``. Using
+# a module variable (rather than a Dash ``State``) avoids a 50–100 ms
+# stale-snapshot race that would otherwise blink the previous zoom for one
+# frame whenever a click landed mid-tick. Pixels rather than micrometres so
+# that correcting the pixel scale keeps the same part of the sensor in view;
+# a box stored in micrometres framed a different region after the change.
 _zoom_range: dict[str, list[float]] | None = None
+
+
+def _zoom_in_um(bp: BeamProfiler) -> tuple[list[float] | None, list[float] | None]:
+    """The current zoom as ``(xrange, yrange)`` in micrometres, or Nones.
+
+    The caller must hold ``_callback_lock``.
+    """
+    if _zoom_range is None:
+        return None, None
+    ps = bp.pixel_size
+    return [v * ps for v in _zoom_range["x"]], [v * ps for v in _zoom_range["y"]]
+
+
+def _zoom_after_relayout(
+    relayout: dict[str, Any],
+    zoom: dict[str, list[float]] | None,
+    frame_shape: tuple[int, ...] | None,
+    pixel_size: float,
+) -> dict[str, list[float]] | None:
+    """Fold a Plotly ``relayoutData`` event into the zoom, in pixels.
+
+    A box zoom or pan reports ``xaxis.range[0]``/``[1]`` (sometimes a
+    ``xaxis.range`` pair) for the axes it moved; autoscale and a double-click
+    report ``autorange``. An axis the event doesn't mention keeps its current
+    range. Anything else -- ``autosize`` on a resize, a mode change -- leaves
+    the zoom as it was.
+
+    Returns:
+        The new zoom, or ``None`` for the full frame.
+    """
+
+    def axis(name: str) -> list[float] | None:
+        pair: Any = relayout.get(f"{name}.range")
+        if pair is None:
+            pair = (relayout.get(f"{name}.range[0]"), relayout.get(f"{name}.range[1]"))
+        if len(pair) != 2 or pair[0] is None or pair[1] is None:
+            return None
+        return sorted([float(pair[0]) / pixel_size, float(pair[1]) / pixel_size])
+
+    if relayout.get("xaxis.autorange") or relayout.get("yaxis.autorange"):
+        return None
+    x, y = axis("xaxis"), axis("yaxis")
+    if (x is None and y is None) or frame_shape is None:
+        return zoom
+    full = {"x": [0.0, float(frame_shape[1])], "y": [0.0, float(frame_shape[0])]}
+    new = {"x": x or list((zoom or full)["x"]), "y": y or list((zoom or full)["y"])}
+    # A double-click reports the full extent as explicit ranges rather than
+    # as autorange. Treat that as no zoom, so the view keeps following the
+    # frame's own extent.
+    if np.allclose(new["x"], full["x"], atol=0.5) and np.allclose(new["y"], full["y"], atol=0.5):
+        return None
+    return new
 
 
 def _measured_fps() -> float:
@@ -870,28 +924,33 @@ def _register_callbacks(app: dash.Dash, bp: BeamProfiler) -> None:
         prevent_initial_call=True,
     )
     def auto_fit_zoom(n_clicks: int | None) -> Any:
-        """Zoom to a +/-3 sigma box around the fitted beam centre."""
+        """Zoom to a +/-3 sigma box around the fitted beam centre.
+
+        The fit is read under the lock along with the write. Reading it
+        outside let a camera switch land in between, leaving the new camera
+        zoomed onto where the old one's beam had been.
+        """
         global _zoom_range  # noqa: PLW0603
         if not n_clicks:
             return dash.no_update
-        popt_x = bp._last_popt_x
-        popt_y = bp._last_popt_y
-        if popt_x is None or popt_y is None:
-            return dash.no_update
-        ps = bp.pixel_size
-        cx, cy = popt_x[1] * ps, popt_y[1] * ps
-        # 1/e² semi-axis = 2σ.  Pad by 1.5× → ±3σ box around the beam.
-        rx, ry = 2 * abs(popt_x[2]) * ps, 2 * abs(popt_y[2]) * ps
-        pad = 1.5
-        zoom = {
-            "x": [cx - pad * rx, cx + pad * rx],
-            "y": [cy - pad * ry, cy + pad * ry],
-        }
         with _callback_lock:
-            _zoom_range = zoom
+            popt_x, popt_y = bp._last_popt_x, bp._last_popt_y
+            if popt_x is None or popt_y is None:
+                return dash.no_update
+            cx, cy = float(popt_x[1]), float(popt_y[1])
+            # 1/e² semi-axis = 2σ.  Pad by 1.5× → ±3σ box around the beam.
+            rx, ry = 2 * abs(float(popt_x[2])), 2 * abs(float(popt_y[2]))
+            if not np.all(np.isfinite([cx, cy, rx, ry])) or rx == 0 or ry == 0:
+                return dash.no_update
+            pad = 1.5
+            _zoom_range = {
+                "x": [cx - pad * rx, cx + pad * rx],
+                "y": [cy - pad * ry, cy + pad * ry],
+            }
+            xrange, yrange = _zoom_in_um(bp)
         patch = Patch()
-        patch["layout"]["xaxis"]["range"] = zoom["x"]
-        patch["layout"]["yaxis"]["range"] = zoom["y"]
+        patch["layout"]["xaxis"]["range"] = xrange
+        patch["layout"]["yaxis"]["range"] = yrange
         return patch
 
     @app.callback(
@@ -906,13 +965,37 @@ def _register_callbacks(app: dash.Dash, bp: BeamProfiler) -> None:
             return dash.no_update
         with _callback_lock:
             _zoom_range = None
-        patch = Patch()
-        img = bp.last_img
-        if img is not None:
+            img = bp.last_img
             ps = bp.pixel_size
+        patch = Patch()
+        if img is not None:
             patch["layout"]["xaxis"]["range"] = [0, img.shape[1] * ps]
             patch["layout"]["yaxis"]["range"] = [0, img.shape[0] * ps]
         return patch
+
+    # -- Mouse zoom and pan ---------------------------------------------------
+    # No output: the zoom becomes part of the state every tick draws from.
+    @app.callback(
+        Input("live-graph", "relayoutData"),
+        prevent_initial_call=True,
+    )
+    def follow_mouse_zoom(relayout: dict[str, Any] | None) -> None:
+        """Adopt a zoom or pan made with the mouse, so the next frame keeps it.
+
+        The layout's ``uirevision`` is supposed to preserve this across figure
+        updates, and in Dash 4 it doesn't: right after the user zooms, the
+        Graph component re-plots its own figure with the zoomed range, Plotly
+        takes that as the app setting the range and forgets the user's edit,
+        and the next tick's explicit full-sensor range wins. A mouse zoom
+        lasted one frame. Recording it server-side makes it behave like
+        Auto-fit.
+        """
+        global _zoom_range  # noqa: PLW0603
+        if not relayout:
+            return
+        with _callback_lock:
+            shape = bp.last_img.shape if bp.last_img is not None else None
+            _zoom_range = _zoom_after_relayout(relayout, _zoom_range, shape, bp.pixel_size)
 
     # -- Draggable column divider (clientside) -------------------------------
     # Keeps the layout state purely in the DOM — no Dash store round-trip
@@ -1280,14 +1363,12 @@ def _register_callbacks(app: dash.Dash, bp: BeamProfiler) -> None:
             zmin = None if auto_range else (zmin_val if zmin_val is not None else 0)
             zmax_default = _saturation_max(img)
             zmax = None if auto_range else (zmax_val if zmax_val is not None else zmax_default)
-            # Read the live source of truth (mutated by Auto-fit / Reset
-            # under ``_callback_lock``) instead of capturing it as Dash
-            # ``State``: a State snapshot can be 50–100 ms stale if a
-            # zoom click fires after this tick started, which would
-            # cause a one-frame blink to the previous zoom.
-            current_zoom = _zoom_range
-            xrange = current_zoom["x"] if current_zoom else None
-            yrange = current_zoom["y"] if current_zoom else None
+            # Read the live source of truth (mutated by Auto-fit, Reset and
+            # mouse zooms under ``_callback_lock``) instead of capturing it as
+            # Dash ``State``: a State snapshot can be 50–100 ms stale if a
+            # zoom click fires after this tick started, which would cause a
+            # one-frame blink to the previous zoom.
+            xrange, yrange = _zoom_in_um(bp)
             fig = build_figure(
                 bp,
                 img,
