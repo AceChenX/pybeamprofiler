@@ -19,7 +19,7 @@ from typing import Any
 
 import numpy as np
 
-from .camera import Camera, _roi_pixels
+from .camera import Camera, _Axis, _fit_axis, _roi_pixels
 from .constants import (
     DEFAULT_EXPOSURE_TIME,
     DEFAULT_GAIN,
@@ -461,11 +461,12 @@ class SimulatedCamera(Camera):
     ) -> None:
         """Set the region of interest (ROI).
 
-        Follows the same contract as :meth:`HarvesterCamera.set_roi`: values
-        outside the sensor are clamped, and anything that is not a whole
-        number of pixels, or a size below one pixel, is refused. The
-        simulated sensor has a 1-pixel increment and no acquisition lock, so
-        nothing needs aligning or stopping.
+        Follows the same contract as :meth:`HarvesterCamera.set_roi`, through
+        the same planner: a size larger than the sensor is clamped to it, an
+        offset that would push the ROI off the sensor is moved back inside,
+        and anything that is not a whole number of pixels, or a size below
+        one pixel, is refused. The simulated sensor has a 1-pixel increment
+        and no acquisition lock, so nothing needs aligning or stopping.
 
         Args:
             offset_x: Left edge offset in pixels.
@@ -482,13 +483,10 @@ class SimulatedCamera(Camera):
         w_req = None if width is None else _roi_pixels("width", width, minimum=1)
         h_req = None if height is None else _roi_pixels("height", height, minimum=1)
 
-        max_w, max_h = self.profile.width, self.profile.height
-        self._roi_offset_x = max(0, min(ox, max_w - 1))
-        self._roi_offset_y = max(0, min(oy, max_h - 1))
-        w = w_req if w_req is not None else max_w
-        h = h_req if h_req is not None else max_h
-        self._roi_width = max(1, min(w, max_w - self._roi_offset_x))
-        self._roi_height = max(1, min(h, max_h - self._roi_offset_y))
+        self._roi_offset_x, self._roi_width = _fit_axis(_Axis(sensor=self.profile.width), ox, w_req)
+        self._roi_offset_y, self._roi_height = _fit_axis(
+            _Axis(sensor=self.profile.height), oy, h_req
+        )
 
         self.width = self._roi_width
         self.height = self._roi_height

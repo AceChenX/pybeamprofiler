@@ -165,6 +165,18 @@ class TestSimulatedRoiContract:
             cam.set_roi(*args)
         assert cam.roi_info["width"] == cam.roi_info["max_width"]
 
+    def test_an_offset_too_far_right_keeps_the_size(self):
+        """Same planner as HarvesterCamera: the ROI moves back onto the sensor.
+
+        The simulator used to keep the offset and shrink the width instead,
+        so the same request gave a different ROI than a real camera would.
+        """
+        cam = SimulatedCamera()  # 1024 x 1024
+        cam.set_roi(900, 0, 400, 300)
+        roi = cam.roi_info
+        assert (roi["offset_x"], roi["width"]) == (624, 400)
+        assert cam.get_image().shape == (300, 400)
+
     def test_integral_floats_are_accepted(self):
         cam = SimulatedCamera()
         whole: Any = (10.0, 20.0, 64.0, 32.0)  # e.g. read back from a float widget

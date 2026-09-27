@@ -22,6 +22,7 @@ import time
 from abc import ABC, abstractmethod
 from collections.abc import Iterator
 from contextlib import contextmanager
+from dataclasses import dataclass
 from typing import Any, cast
 
 import numpy as np
@@ -115,6 +116,61 @@ def _categorize_feature(name: str) -> str:
     if match:
         return match.group(1)
     return "Other"
+
+
+@dataclass(frozen=True)
+class _Axis:
+    """What one ROI axis allows right now, read from the live node map.
+
+    Attributes:
+        sensor: Full extent, i.e. ``WidthMax``/``HeightMax``. SFNC defines
+            those *after* binning and decimation, so this is re-read every
+            time rather than remembered from ``open()``.
+        size_min: Smallest ``Width``/``Height`` the camera accepts.
+        size_inc: Step of ``Width``/``Height``.
+        offset_min: Smallest offset (0 on every camera seen so far).
+        offset_inc: Step of the offset.
+        has_offset: Whether the camera can offset the ROI at all.
+    """
+
+    sensor: int
+    size_min: int = 1
+    size_inc: int = 1
+    offset_min: int = 0
+    offset_inc: int = 1
+    has_offset: bool = True
+
+
+def _align_down(value: int, minimum: int, step: int) -> int:
+    """Round ``value`` down onto the grid ``minimum + k * step``."""
+    return minimum + ((value - minimum) // step) * step
+
+
+def _fit_axis(axis: _Axis, offset: int, size: int | None) -> tuple[int, int]:
+    """Clamp and align one axis of a requested ROI to what the camera allows.
+
+    GenApi rejects a value that is off the node's increment instead of
+    rounding it, so both numbers are snapped down onto the grid -- down, so
+    the ROI never grows past what was asked for or off the sensor edge.
+
+    Args:
+        axis: The axis limits.
+        offset: Requested offset; clamped into the sensor.
+        size: Requested size, or ``None`` for the full sensor.
+
+    Returns:
+        ``(offset, size)`` that the camera will accept.
+    """
+    full = axis.sensor
+    size = full if size is None else size
+    size = max(axis.size_min, min(size, full))
+    if size > axis.size_min:
+        size = _align_down(size, axis.size_min, axis.size_inc)
+    if not axis.has_offset:
+        return 0, size
+    offset = max(axis.offset_min, min(offset, full - size))
+    offset = _align_down(offset, axis.offset_min, axis.offset_inc)
+    return offset, size
 
 
 def _coerce_for_node(node: Any, value: Any) -> Any:
