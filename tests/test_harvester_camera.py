@@ -282,7 +282,9 @@ class TestCloseLeavesNothingBehind:
     what a Jupyter panel still on screen did after the camera was swapped."""
 
     def test_close_drops_every_handle(self, camera):
+        assert camera.is_open
         camera.close()
+        assert not camera.is_open
         assert camera.ia is None
         assert camera.node_map is None
         assert camera.h is None
@@ -309,6 +311,23 @@ class TestCloseLeavesNothingBehind:
         camera.open()
         assert camera.ia is not None and camera.ia is not first
         assert camera.node_map.Width.value == 2048
+
+
+class TestHandedToTheProfiler:
+    """A camera built with its own ``cti_file`` goes straight into
+    BeamProfiler, which opens it."""
+
+    def test_the_profiler_opens_it_and_reads_the_sensor(self, bus):
+        from pybeamprofiler import BeamProfiler
+
+        cam = HarvesterCamera(cti_file=bus.cti)
+        assert not cam.is_open
+        with BeamProfiler(camera=cam) as bp:
+            assert bp.camera is cam and cam.is_open
+            assert (bp.width_pixels, bp.height_pixels) == (cam.width, cam.height)
+            assert bp.width_pixels == 2048
+        assert not cam.is_open
+        assert gen_camera._SHARED.harvester is None
 
 
 def _timed(fn: Any, limit: float = 3.0) -> tuple[bool, float, BaseException | None]:

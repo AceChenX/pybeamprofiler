@@ -89,7 +89,11 @@ class BeamProfiler:
     or camera streams. Provides beam width measurements in various definitions.
 
     Args:
-        camera: Camera type ('simulated', 'flir', 'basler'), or None for default
+        camera: Camera type ('simulated', 'flir', 'basler'); or a
+            :class:`~pybeamprofiler.camera.Camera` you built yourself, e.g.
+            ``BaslerCamera(cti_file=...)``, which is opened here unless it
+            already is, and closed on leaving a ``with`` block like a camera
+            the profiler opened itself; or None for the default simulator.
         file: Path to a static image file to analyze
         fit: Fitting method ('1d', '2d', 'linecut')
         definition: Width definition ('gaussian' for 1/e², 'fwhm', 'd4s')
@@ -98,7 +102,8 @@ class BeamProfiler:
             camera it overrides the value the camera reports, which is worth
             doing when binning is on or the camera reports nothing useful.
         serial_number: Open this specific device when more than one camera of
-            the requested type is attached. Ignored by the simulated camera.
+            the requested type is attached. Ignored by the simulated camera,
+            and when *camera* is an instance (it already picked its device).
 
     Attributes:
         width_x: Beam width in x, in the selected definition (μm)
@@ -115,7 +120,7 @@ class BeamProfiler:
 
     def __init__(
         self,
-        camera: str | None = None,
+        camera: str | Camera | None = None,
         file: str | None = None,
         fit: str = "1d",
         definition: str = "gaussian",
@@ -131,7 +136,8 @@ class BeamProfiler:
         Raises:
             ValueError: If ``pixel_size`` is missing (or not positive) for a
                 static image file, or if neither camera nor file loaded.
-            RuntimeError: If a physical camera (FLIR/Basler) fails to open.
+            RuntimeError: If a physical camera (FLIR/Basler) fails to open,
+                or a camera instance passed in cannot be opened.
         """
         self.camera: Camera | None = None
         self.fit_method: str = fit
@@ -180,6 +186,8 @@ class BeamProfiler:
             if pixel_size is None:
                 raise ValueError("Pixel size must be provided for static beam image files")
             self.pixel_size = pixel_size
+        elif isinstance(camera, Camera):
+            self._adopt_camera(camera)
         elif camera:
             self._initialize_camera(camera, serial_number)
         else:
@@ -205,6 +213,25 @@ class BeamProfiler:
             pass
         else:
             raise ValueError("Either camera or file must be provided and successfully loaded")
+
+    def _adopt_camera(self, camera: Camera) -> None:
+        """Take over a camera the caller built, opening it unless it already is.
+
+        Passing an instance is how a camera gets anything the names can't
+        express -- a particular ``.cti`` file, above all.
+        """
+        self.camera = camera
+        if not camera.is_open:
+            try:
+                camera.open()
+            except Exception as e:
+                try:
+                    camera.close()
+                except Exception:
+                    logger.debug("Error closing a camera that failed to open", exc_info=True)
+                logger.error(f"Failed to open {type(camera).__name__}: {e}")
+                raise RuntimeError(f"Failed to open {type(camera).__name__}: {e}") from e
+        self._mode = "camera"
 
     def _initialize_camera(self, camera: str, serial_number: str | None = None) -> None:
         """Open the named camera type.

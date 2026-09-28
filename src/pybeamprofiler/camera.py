@@ -324,6 +324,16 @@ class Camera(ABC):
         """Release the device. Must be safe to call twice."""
         ...
 
+    @property
+    def is_open(self) -> bool:
+        """Whether :meth:`open` has claimed the device and :meth:`close` has
+        not released it since.
+
+        The default goes by the node map, which a camera holds only while it
+        is open; subclasses that know more directly override it.
+        """
+        return getattr(self, "node_map", None) is not None
+
     @abstractmethod
     def start_acquisition(self) -> None:
         """Begin streaming frames into the producer's buffer ring."""

@@ -145,6 +145,54 @@ class TestSimulatedCloseContract:
         assert SimulatedCamera().get_image().shape == (1024, 1024)
 
 
+class TestIsOpen:
+    """``BeamProfiler(camera=...)`` opens a camera it is handed only if this
+    says it isn't open already."""
+
+    def test_the_simulator_follows_open_and_close(self):
+        cam = SimulatedCamera()
+        assert not cam.is_open
+        cam.open()
+        assert cam.is_open
+        cam.close()
+        assert not cam.is_open
+        cam.open()
+        assert cam.is_open
+        cam.close()
+
+    def test_the_default_goes_by_the_node_map(self):
+        from pybeamprofiler.camera import Camera
+
+        class Minimal(Camera):
+            def open(self):
+                self.node_map = object()
+
+            def close(self):
+                self.node_map = None
+
+            def start_acquisition(self):
+                pass
+
+            def stop_acquisition(self):
+                pass
+
+            def get_image(self, timeout=None):
+                return np.zeros((4, 4), dtype=np.uint8)
+
+            def set_exposure(self, exposure_time):
+                pass
+
+            def set_gain(self, gain):
+                pass
+
+        cam = Minimal()
+        assert not cam.is_open
+        cam.open()
+        assert cam.is_open
+        cam.close()
+        assert not cam.is_open
+
+
 class TestSimulatedRoiContract:
     """The simulator must refuse what a real camera refuses, or code that
     passes against it fails on hardware."""

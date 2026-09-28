@@ -607,6 +607,63 @@ class TestAttachCamera:
         new.close()
 
 
+class TestCameraInstance:
+    """``BeamProfiler(camera=...)`` also takes a camera built by the caller,
+    which is how it gets a particular ``.cti`` file."""
+
+    def test_an_unopened_camera_is_opened_and_used(self):
+        from pybeamprofiler.simulated import SimulatedCamera, profile_for
+
+        cam = SimulatedCamera(profile_for("sim-2"))
+        assert not cam.is_open
+        bp = BeamProfiler(camera=cam)
+        assert bp.camera is cam and cam.is_open
+        assert (bp.width_pixels, bp.height_pixels) == (1280, 1024)
+        assert bp.pixel_size == 3.45
+        bp.analyze(cam.get_image())
+        assert math.isfinite(bp.width_x)
+        cam.close()
+
+    def test_an_open_camera_is_not_opened_again(self):
+        from pybeamprofiler.simulated import SimulatedCamera
+
+        cam = SimulatedCamera()
+        cam.open()
+        with patch.object(SimulatedCamera, "open", autospec=True) as open_:
+            BeamProfiler(camera=cam)
+        open_.assert_not_called()
+        cam.close()
+
+    def test_the_other_arguments_still_apply(self):
+        from pybeamprofiler.simulated import SimulatedCamera
+
+        cam = SimulatedCamera()
+        bp = BeamProfiler(camera=cam, pixel_size=2.0, exposure_time=0.05, serial_number="ignored")
+        assert bp.pixel_size == 2.0
+        assert cam.exposure_time == 0.05
+        cam.close()
+
+    def test_a_camera_that_fails_to_open_is_released_and_reported(self):
+        from pybeamprofiler.simulated import SimulatedCamera
+
+        cam = SimulatedCamera()
+        with (
+            patch.object(SimulatedCamera, "open", side_effect=OSError("device busy")),
+            patch.object(SimulatedCamera, "close", autospec=True) as close,
+            pytest.raises(RuntimeError, match="Failed to open SimulatedCamera: device busy"),
+        ):
+            BeamProfiler(camera=cam)
+        close.assert_called_once_with(cam)
+
+    def test_leaving_a_with_block_closes_it(self):
+        from pybeamprofiler.simulated import SimulatedCamera
+
+        cam = SimulatedCamera()
+        with BeamProfiler(camera=cam):
+            assert cam.is_open
+        assert not cam.is_open
+
+
 class TestStopMethod:
     """Test the stop() method."""
 

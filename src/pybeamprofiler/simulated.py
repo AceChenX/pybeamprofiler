@@ -524,6 +524,15 @@ class SimulatedCamera(Camera):
         }
 
     @property
+    def is_open(self) -> bool:
+        """Whether :meth:`open` was called and :meth:`close` has not been since.
+
+        A simulator never opened still hands out frames, but it has no node
+        map yet, so the settings panels would have nothing to show.
+        """
+        return self.node_map is not None and not self._closed
+
+    @property
     def exposure_range(self) -> tuple[float, float]:
         """Exposure time range in seconds ``(min, max)``."""
         return (self._exposure_min, self._exposure_max)

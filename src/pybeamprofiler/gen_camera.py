@@ -1431,6 +1431,11 @@ class HarvesterCamera(Camera):
             self.gain = gain
 
     @property
+    def is_open(self) -> bool:
+        """Whether the device is claimed: an ImageAcquirer exists for it."""
+        return self.ia is not None
+
+    @property
     def exposure_range(self) -> tuple[float, float]:
         """Supported exposure time as ``(min, max)`` in seconds."""
         return (self._exposure_min, self._exposure_max)

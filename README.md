@@ -97,13 +97,14 @@ Press **Ctrl+C** in the terminal to stop streaming and exit.
 ### Python API
 
 ```python
-from pybeamprofiler import BeamProfiler, discover_cameras, print_camera_info
+from pybeamprofiler import BaslerCamera, BeamProfiler, discover_cameras, print_camera_info
 
 print_camera_info()                    # list connected cameras
 discover_cameras()                     # the same list the GUI dropdown shows
 
 bp = BeamProfiler(camera="simulated")
 bp = BeamProfiler(camera="flir", serial_number="12345678")   # pick a device
+bp = BeamProfiler(camera=BaslerCamera(cti_file="/path/to/ProducerU3V.cti"))  # pick a producer
 bp.plot()                              # open browser GUI
 bp.plot(num_img=1)                     # single shot
 
@@ -148,10 +149,9 @@ with a beam is measured afresh.
 
 ## Troubleshooting
 
-- **Camera not found** — verify SDK install, `GENICAM_GENTL64_PATH`, and run `print_camera_info()`.
+- **Camera not found** — verify the SDK install and `GENICAM_GENTL64_PATH` (see [Installation](#installation)), and run `print_camera_info()`.
 - **Access denied** — close other camera software (Spinnaker GUI, Pylon Viewer).
 - **Jupyter camera stuck** — restart the kernel to release the hardware lock.
-- **Basler USB3** — pass the USB3 CTI explicitly: `BaslerCamera(cti_file="/path/to/ProducerU3V.cti")`.
 - **`GenTL producer does not implement DS…` in the terminal** — harmless. genicam 1.6 prints these lines whenever it scans a producer that predates the newest GenTL functions; the camera still works.
 
 ---
