@@ -7,6 +7,7 @@ a flaky camera and a crashed session.
 
 from __future__ import annotations
 
+import logging
 import signal
 import sys
 import threading
@@ -563,6 +564,22 @@ class TestCliCleanup:
         err = capsys.readouterr().err
         assert "pybeamprofiler: error: no FLIR camera" in err
         assert "Traceback" not in err
+
+    def test_verbose_shows_the_traceback(self, caplog):
+        """The traceback was logged at DEBUG, which -v (INFO) never shows."""
+        from pybeamprofiler.cli import main
+
+        argv = ["pybeamprofiler", "--camera", "flir", "-v"]
+        with (
+            patch.object(sys, "argv", argv),
+            patch.object(
+                BeamProfiler, "_initialize_camera", side_effect=RuntimeError("no FLIR camera")
+            ),
+            patch("logging.basicConfig"),
+            caplog.at_level(logging.INFO, logger="pybeamprofiler.cli"),
+        ):
+            assert main() == 1
+        assert [r.levelno for r in caplog.records if r.exc_info] == [logging.INFO]
 
 
 class TestConstructorReleasesTheCamera:

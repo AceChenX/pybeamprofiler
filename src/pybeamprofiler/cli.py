@@ -146,8 +146,9 @@ def main() -> int:
         print("\nStopped by user (Ctrl+C).")
     except Exception as e:
         # A camera that isn't plugged in is the common case here; it deserves
-        # a one-line message rather than a traceback, unless asked for one.
-        logger.debug("Fatal error", exc_info=True)
+        # a one-line message rather than a traceback, unless -v asks for one.
+        # -v means INFO, so that is the level the traceback has to be at.
+        logger.info("Fatal error", exc_info=True)
         print(f"pybeamprofiler: error: {e}", file=sys.stderr)
         return 1
     finally:
