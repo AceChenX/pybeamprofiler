@@ -15,7 +15,7 @@ Real-time laser beam profiler with Gaussian fitting for GenICam cameras.
 - **GenICam hardware support** — FLIR (Spinnaker) and Basler (Pylon) via [Harvesters](https://github.com/genicam/harvesters); auto-discovered features grouped by SFNC category
 - **Jupyter support** — Live streaming with `bp.setting()` interactive widgets
 - **Simulated camera** — Gaussian beam with noise, no hardware needed
-- **Auto-configuration** — Pixel size detection for 40+ sensor models
+- **Auto-configuration** — pixel size read from the camera, or looked up for 30 common sensors and models when the camera doesn't report it
 
 ## Quick Start
 
@@ -238,7 +238,7 @@ uv run python tests/benchmarks/accuracy_matrix.py   # width error against the tr
 
 ### Supported sensors
 
-Auto-detected pixel sizes (40+ models) — Sony IMX174, IMX183, IMX226, IMX249, IMX250, IMX252, IMX253, IMX255, IMX264, IMX265, IMX273, IMX287, IMX290, IMX291, IMX304, IMX392, IMX412, IMX477, IMX485, IMX530, IMX531, IMX540, IMX541, IMX542, IMX547, and direct Basler model lookups (acA4024-8gm, acA4024-29um, acA1920-155um, acA2440-75um, acA3800-14um).
+When a camera doesn't report its pixel size (`SensorPixelWidth`, `SensorPixelHeight` or `PixelSize`), it is looked up from the sensor named in `SensorDescription` or the model in `DeviceModelName`. Known sensors: Sony IMX174, IMX183, IMX226, IMX249, IMX250, IMX252, IMX253, IMX255, IMX264, IMX265, IMX273, IMX287, IMX290, IMX291, IMX304, IMX392, IMX412, IMX477, IMX485, IMX530, IMX531, IMX540, IMX541, IMX542, IMX547; and Basler models acA4024-8gm, acA4024-29um, acA1920-155um, acA2440-75um, acA3800-14um. Anything else falls back to 1 μm, with a warning — pass `pixel_size` then.
 
 ---
 
