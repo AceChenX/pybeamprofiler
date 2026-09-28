@@ -193,6 +193,13 @@ uv run pytest --cov-report=html        # HTML coverage report
 uv run pytest tests/test_profiler.py   # single file
 ```
 
+Two scripts measure what the tests only bound (pytest doesn't collect them):
+
+```bash
+uv run python tests/benchmarks/analyze_timing.py    # time per frame, every fit and definition
+uv run python tests/benchmarks/accuracy_matrix.py   # width error against the true beam
+```
+
 ### Architecture
 
 - `fitting.py` — Gaussian models, direct width measurements, curve fits, decimation (pure functions over arrays; no camera or plotting state)
