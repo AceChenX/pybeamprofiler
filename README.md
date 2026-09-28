@@ -165,7 +165,7 @@ with a beam is measured afresh.
 
 - **Camera not found** — verify the SDK install and `GENICAM_GENTL64_PATH` (see [Installation](#installation)), and run `print_camera_info()`.
 - **Access denied** — close other camera software (Spinnaker GUI, Pylon Viewer).
-- **Jupyter camera stuck** — restart the kernel to release the hardware lock.
+- **Jupyter camera stuck** — `bp.stop()`, then `bp.camera.close()`, releases the device (a `with BeamProfiler(...) as bp:` block does both on exit); restart the kernel only if that fails.
 - **`GenTL producer does not implement DS…` in the terminal** — harmless. genicam 1.6 prints these lines whenever it scans a producer that predates the newest GenTL functions; the camera still works.
 
 ---
