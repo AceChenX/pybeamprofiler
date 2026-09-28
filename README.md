@@ -132,8 +132,11 @@ See [the API docs](https://github.com/acechenx/pybeamprofiler) for fitting metho
 
 ### Width definitions
 
-`width_x` / `width_y` are reported in whichever definition you select, and the
-derived properties convert between them from the fitted Gaussian sigma:
+`width_x` / `width_y` are reported in whichever definition you select. The
+derived properties convert that width to the other thresholds as a Gaussian
+beam would have them, through σ (the width over 4 for `gaussian` and `d4s`,
+over 2.3548 for `fwhm`), so on a beam that is not Gaussian they are estimates
+rather than measurements:
 
 | Property | Threshold | Multiple of σ |
 |----------|-----------|---------------|
@@ -147,11 +150,12 @@ which equals 4σ for a Gaussian but — unlike a fit — stays meaningful for
 flat-top and multi-lobed beams.
 
 Choosing `fwhm` or `d4s` measures directly off the frame with no model, so it
-takes precedence over `fit`; the Gaussian fit still runs, but only to draw the
-curves over the profiles. `d4s` follows ISO 11146: the background is removed
-and the moments are taken inside a window three beam widths across, iterated
-until it settles. `fwhm` is read off profiles summed over just the band the
-beam occupies, which keeps the noise of the rest of the sensor out of it.
+takes precedence over `fit`: whatever `fit` is set to, only the 1D fits of the
+projections run, to draw the curves over the profiles, and `angle_deg` stays 0.
+`d4s` follows ISO 11146: the background is removed and the moments are taken
+inside a window three beam widths across, iterated until it settles. `fwhm` is
+read off profiles summed over just the band the beam occupies, which keeps the
+noise of the rest of the sensor out of it.
 
 A frame with no beam standing clear of the noise (a blocked beam, a blank
 sensor) reports NaN widths rather than a fit to the noise, and the next frame

@@ -383,32 +383,32 @@ class BeamProfiler:
 
     @property
     def fwhm_x(self) -> float:
-        """Full Width at Half Maximum in X direction (μm)."""
+        """Full width at half maximum in X (μm), from :attr:`width_x` as for a Gaussian."""
         return GAUSSIAN_TO_FWHM * self._to_sigma(self.width_x)
 
     @property
     def fwhm_y(self) -> float:
-        """Full Width at Half Maximum in Y direction (μm)."""
+        """Full width at half maximum in Y (μm), from :attr:`width_y` as for a Gaussian."""
         return GAUSSIAN_TO_FWHM * self._to_sigma(self.width_y)
 
     @property
     def fw_1e_x(self) -> float:
-        """Full Width at 1/e of peak intensity in X direction (μm)."""
+        """Full width at 1/e of the peak in X (μm), from :attr:`width_x` as for a Gaussian."""
         return FW_1E_FACTOR * self._to_sigma(self.width_x)
 
     @property
     def fw_1e_y(self) -> float:
-        """Full Width at 1/e of peak intensity in Y direction (μm)."""
+        """Full width at 1/e of the peak in Y (μm), from :attr:`width_y` as for a Gaussian."""
         return FW_1E_FACTOR * self._to_sigma(self.width_y)
 
     @property
     def fw_1e2_x(self) -> float:
-        """Full Width at 1/e² in X direction (μm)."""
+        """Full width at 1/e² of the peak in X (μm), from :attr:`width_x` as for a Gaussian."""
         return D4SIGMA_FACTOR * self._to_sigma(self.width_x)
 
     @property
     def fw_1e2_y(self) -> float:
-        """Full Width at 1/e² in Y direction (μm)."""
+        """Full width at 1/e² of the peak in Y (μm), from :attr:`width_y` as for a Gaussian."""
         return D4SIGMA_FACTOR * self._to_sigma(self.width_y)
 
     @property
