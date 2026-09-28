@@ -1219,6 +1219,22 @@ class TestCLIMain:
         mock_main.assert_called_once()
         assert exit_info.value.code == 3
 
+    def test_the_old_module_entrypoint_still_runs_main(self):
+        """``python -m pybeamprofiler.beamprofiler`` ran the command until it
+        moved to cli.py, and still does. runpy warns on the way, because the
+        package imports the module before it is run; that is expected."""
+        import runpy
+
+        with (
+            patch("sys.argv", ["pybeamprofiler"]),
+            patch("pybeamprofiler.cli.main", return_value=3) as mock_main,
+            pytest.warns(RuntimeWarning, match="found in sys.modules"),
+            pytest.raises(SystemExit) as exit_info,
+        ):
+            runpy.run_module("pybeamprofiler.beamprofiler", run_name="__main__")
+        mock_main.assert_called_once()
+        assert exit_info.value.code == 3
+
     def test_finally_closes_camera(self):
         """After ``plot`` returns, ``main`` must stop + close the camera."""
         from pybeamprofiler.simulated import SimulatedCamera

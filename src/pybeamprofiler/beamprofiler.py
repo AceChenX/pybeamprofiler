@@ -1459,3 +1459,14 @@ def _in_notebook() -> bool:
         return False
     shell = get_ipython()
     return shell is not None and getattr(shell, "kernel", None) is not None
+
+
+if __name__ == "__main__":
+    # ``python -m pybeamprofiler.beamprofiler`` worked before the command moved
+    # to cli.py (0.3.0 and earlier), so it still does. Prefer ``python -m
+    # pybeamprofiler``: this form makes runpy warn that the package had already
+    # imported the module. Every release has printed that warning; it is
+    # harmless.
+    from .cli import main
+
+    raise SystemExit(main())
