@@ -162,6 +162,20 @@ class TestNoBeam:
         assert np.isnan(bp.center_x)
         assert bp.beam_ellipse() is None
 
+    @pytest.mark.parametrize("fit", ["1d", "2d", "linecut"])
+    def test_no_blank_frame_is_a_beam(self, fit):
+        """One blank frame proves little. Linecut fitted a one-pixel "beam" on
+        about a quarter of these: its row and column run through the frame's
+        brightest pixel, the loudest of 300k noise samples, on average 4.6
+        sigma above the floor."""
+        rng = np.random.default_rng(11)
+        bp = _profiler(fit)
+        found = 0
+        for _ in range(60):
+            bp.analyze(_frame(rng, 320, 240, 20.0, 20.0, amp=0.0))
+            found += bool(np.isfinite(bp.width_x) or np.isfinite(bp.width_y))
+        assert found == 0
+
 
 class TestAcrossFrames:
     """What happens on the *first* frame after something changes."""

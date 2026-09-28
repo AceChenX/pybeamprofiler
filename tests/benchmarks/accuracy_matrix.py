@@ -17,9 +17,11 @@ by 35 degrees.
 For a Gaussian every definition should report the same thing once converted
 to 1/e², namely four times the beam's sigma along the image axis (a tilted
 beam's projection is itself a Gaussian, of the sigma ``_axis_sigmas``
-gives). A cell is the larger of the X and Y errors in percent, and ``fail``
-means the frame was reported as having no beam. Every cell starts cold, as
-the first frame of a stream does.
+gives). Linecut is the exception: it measures one row and one column, and
+across a tilted beam those are narrower than its projections, so it is held
+to the widths ``_cut_sigmas`` gives. A cell is the larger of the X and Y
+errors in percent, and ``fail`` means the frame was reported as having no
+beam. Every cell starts cold, as the first frame of a stream does.
 """
 
 from __future__ import annotations
@@ -34,7 +36,9 @@ from pybeamprofiler import BeamProfiler, SimulatedCamera
 SIGMAS = (6.0, 12.0, 24.0, 50.0, 100.0)  # minor-axis sigma, px
 NOISES = (0.0, 2.0, 10.0)  # read noise, counts rms
 TILTS = (0.0, 35.0)  # degrees
+# fwhm and d4s ignore the fit method, so linecut appears with gaussian only.
 COMBOS = [(fit, d) for fit in ("1d", "2d") for d in ("gaussian", "fwhm", "d4s")]
+COMBOS.append(("linecut", "gaussian"))
 
 
 def _frame(
@@ -67,6 +71,20 @@ def _axis_sigmas(sx: float, sy: float, theta_deg: float) -> tuple[float, float]:
     return math.sqrt(sx * sx * c2 + sy * sy * s2), math.sqrt(sx * sx * s2 + sy * sy * c2)
 
 
+def _cut_sigmas(sx: float, sy: float, theta_deg: float) -> tuple[float, float]:
+    """Sigma along a row and along a column through the beam.
+
+    A line parallel to an image axis cuts a 2D Gaussian in a 1D Gaussian of
+    the same width wherever it crosses it: one over the root of the matching
+    diagonal element of the inverse covariance.
+    """
+    c2 = math.cos(math.radians(theta_deg)) ** 2
+    s2 = 1.0 - c2
+    return 1 / math.sqrt(c2 / (sx * sx) + s2 / (sy * sy)), 1 / math.sqrt(
+        s2 / (sx * sx) + c2 / (sy * sy)
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--seed", type=int, default=0, help="noise seed (default 0)")
@@ -87,9 +105,11 @@ def main() -> None:
             for tilt in TILTS:
                 sx, sy = 1.5 * sigma, sigma
                 img = _frame(rng, sx, sy, tilt, noise)
-                true_x, true_y = _axis_sigmas(sx, sy, tilt)
+                projected = _axis_sigmas(sx, sy, tilt)
+                cut = _cut_sigmas(sx, sy, tilt)
                 cells = []
                 for combo, bp in profilers.items():
+                    true_x, true_y = cut if combo[0] == "linecut" else projected
                     bp.reset_analysis()
                     bp.analyze(img)
                     error = 100 * max(

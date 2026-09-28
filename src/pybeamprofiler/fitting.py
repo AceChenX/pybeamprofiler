@@ -293,6 +293,14 @@ def _projections(data: np.ndarray, level: float) -> tuple[np.ndarray, np.ndarray
     return col, row
 
 
+def _beam_in_frame(image: np.ndarray) -> bool:
+    """Whether a frame holds a beam at all: the verdict D4σ, FWHM and the 2D
+    fit reach, for a measurement that only looks at part of the frame."""
+    data = np.asarray(image)
+    level, noise = estimate_background(data)
+    return _projections_stand_clear(*_projections(data, level), noise)
+
+
 def measure_fwhm(profile: np.ndarray, baseline: float | None = None) -> tuple[float, float, float]:
     """Measure the Full Width at Half Maximum directly off a profile.
 

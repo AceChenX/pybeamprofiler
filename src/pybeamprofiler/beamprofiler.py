@@ -608,7 +608,14 @@ class BeamProfiler:
         # The profiles plotted under the fit curves have to be the ones that
         # were fitted, not the full-frame projections.
         self._last_proj_x, self._last_proj_y = row, column
-        popt_x, popt_y = self._fit_projections(row, column)
+        # Whether there is a beam is decided on the whole frame, as in every
+        # other mode. The row and column alone can't tell: on a blank frame
+        # they run through the loudest of 0.3-1 million noise samples, on
+        # average 4.6-4.9 sigma above the floor, and 27-42% of blank frames
+        # got a one-pixel "beam" fitted to it.
+        popt_x = popt_y = None
+        if fitting._beam_in_frame(image):
+            popt_x, popt_y = self._fit_projections(row, column)
         if popt_x is None and popt_y is None:
             # No beam on either line: the "brightest pixel" is just the
             # loudest noise, and a crosshair there would look like a result.
