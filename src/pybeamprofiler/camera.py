@@ -1,14 +1,33 @@
-"""Base camera interface for beam profiler."""
+"""The :class:`Camera` interface, and the Jupyter panel built from it.
+
+Every camera — simulated or real — implements the same small contract:
+open, acquire, hand back a 2D frame, close. Concrete implementations live in
+``simulated.py`` and ``gen_camera.py``.
+
+The bulk of this module is the ``ipywidgets`` control panel. It is generated
+by introspecting a camera's GenICam ``node_map`` rather than hard-coding a
+list of features, because which features exist varies by vendor, model and
+firmware. That introspection is deliberately defensive: cameras expose
+plenty of nodes that appear in the map but raise the moment you touch them,
+so anything that cannot be rendered is skipped rather than reported.
+"""
 
 from __future__ import annotations
 
 import logging
 import math
 import re
+import threading
+import time
 from abc import ABC, abstractmethod
+from collections.abc import Iterator
+from contextlib import contextmanager
+from dataclasses import dataclass
 from typing import Any, cast
 
 import numpy as np
+
+from .constants import DEFAULT_EXPOSURE_TIME, DEFAULT_GAIN, DEFAULT_PIXEL_SIZE
 
 # Optional GenICam enums — only present when a real GenTL backend is
 # installed. We tolerate the import failure so the package still works
@@ -101,6 +120,121 @@ def _categorize_feature(name: str) -> str:
     return "Other"
 
 
+@dataclass(frozen=True)
+class _Axis:
+    """What one ROI axis allows right now, read from the live node map.
+
+    Attributes:
+        sensor: Full extent, i.e. ``WidthMax``/``HeightMax``. SFNC defines
+            those *after* binning and decimation, so this is re-read every
+            time rather than remembered from ``open()``.
+        size_min: Smallest ``Width``/``Height`` the camera accepts.
+        size_inc: Step of ``Width``/``Height``.
+        offset_min: Smallest offset (0 on every camera seen so far).
+        offset_inc: Step of the offset.
+        has_offset: Whether the camera can offset the ROI at all.
+    """
+
+    sensor: int
+    size_min: int = 1
+    size_inc: int = 1
+    offset_min: int = 0
+    offset_inc: int = 1
+    has_offset: bool = True
+
+
+def _align_down(value: int, minimum: int, step: int) -> int:
+    """Round ``value`` down onto the grid ``minimum + k * step``."""
+    return minimum + ((value - minimum) // step) * step
+
+
+def _fit_axis(axis: _Axis, offset: int, size: int | None) -> tuple[int, int]:
+    """Clamp and align one axis of a requested ROI to what the camera allows.
+
+    GenApi rejects a value that is off the node's increment instead of
+    rounding it, so both numbers are snapped down onto the grid -- down, so
+    the ROI never grows past what was asked for or off the sensor edge.
+
+    Args:
+        axis: The axis limits.
+        offset: Requested offset; clamped into the sensor.
+        size: Requested size, or ``None`` for the full sensor.
+
+    Returns:
+        ``(offset, size)`` that the camera will accept.
+    """
+    full = axis.sensor
+    size = full if size is None else size
+    size = max(axis.size_min, min(size, full))
+    if size > axis.size_min:
+        size = _align_down(size, axis.size_min, axis.size_inc)
+    if not axis.has_offset:
+        return 0, size
+    offset = max(axis.offset_min, min(offset, full - size))
+    offset = _align_down(offset, axis.offset_min, axis.offset_inc)
+    return offset, size
+
+
+def _coerce_for_node(node: Any, value: Any) -> Any:
+    """Convert a keyword value to the kind the node holds, where unambiguous.
+
+    Keyword arguments arrive as whatever the caller typed -- ``Width=512.0``
+    from arithmetic, ``"on"`` for a boolean, a number read from a config
+    file as a string -- and GenApi rejects a float for an integer node or a
+    string for a boolean one. Anything that does not convert cleanly is
+    passed through for the node to accept or refuse.
+    """
+    try:
+        current = node.value
+    except Exception:
+        return value
+    if isinstance(current, bool):
+        if isinstance(value, str):
+            word = value.strip().lower()
+            if word in ("on", "true", "1", "yes"):
+                return True
+            if word in ("off", "false", "0", "no"):
+                return False
+        return value
+    if isinstance(current, int):
+        if isinstance(value, float) and value.is_integer():
+            return int(value)
+        if isinstance(value, str):
+            try:
+                return int(value.strip())
+            except ValueError:
+                return value
+        return value
+    if isinstance(current, float) and isinstance(value, str):
+        try:
+            return float(value.strip())
+        except ValueError:
+            return value
+    return value
+
+
+def _roi_pixels(name: str, value: Any, *, minimum: int | None = None) -> int:
+    """Validate one ``set_roi`` argument as a whole number of pixels.
+
+    Values that are merely out of range are the camera's business -- every
+    implementation clamps those to what the sensor allows. What cannot be
+    clamped into meaning is a fraction of a pixel, a non-number, or a size
+    below one pixel, and those are rejected here so that simulated and real
+    cameras refuse the same inputs.
+
+    Raises:
+        ValueError: With a message naming the argument.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float, np.integer, np.floating)):
+        raise ValueError(f"{name} must be a whole number of pixels, not {value!r}")
+    if not float(value).is_integer():
+        raise ValueError(f"{name} must be a whole number of pixels, not {value!r}")
+    pixels = int(value)
+    if minimum is not None and pixels < minimum:
+        raise ValueError(f"{name} must be at least {minimum} pixel(s), not {pixels}")
+    return pixels
+
+
 class Camera(ABC):
     """Abstract base class for camera interfaces.
 
@@ -110,6 +244,7 @@ class Camera(ABC):
     Attributes:
         exposure_time: Current exposure time in seconds.
         gain: Current gain value.
+        bit_depth: Bits per sample the sensor delivers, or ``None`` if unknown.
         is_acquiring: Whether the camera is actively acquiring images.
         width: Sensor width in pixels.
         height: Sensor height in pixels.
@@ -118,13 +253,32 @@ class Camera(ABC):
     """
 
     def __init__(self) -> None:
-        self.exposure_time: float = 0.01
-        self.gain: float = 0.0
+        self.exposure_time: float = DEFAULT_EXPOSURE_TIME
+        self.gain: float = DEFAULT_GAIN
         self.is_acquiring: bool = False
         self.width: int = 0
         self.height: int = 0
-        self.pixel_size: float = 1.0
+        self.pixel_size: float = DEFAULT_PIXEL_SIZE
         self.image_buffer: np.ndarray | None = None
+        # Bits per sample the sensor actually delivers (8, 10, 12, 16), or
+        # None if unknown. A 12-bit frame arrives in uint16 and tops out at
+        # 4095, so the dtype's maximum is the wrong saturation level for it.
+        self.bit_depth: int | None = None
+        # Serialises everything that touches the device. Harvesters is a C
+        # library: stopping acquisition while another thread still holds a
+        # fetched buffer frees that buffer under it, which segfaults rather
+        # than raising. Reentrant, because setters call start/stop. Never
+        # held while calling back into BeamProfiler or the Dash app, so the
+        # lock order is always "caller's lock, then this one".
+        self._lock = threading.RLock()
+        # Threads waiting in _device() for the lock; see there.
+        self._contenders = 0
+        self._contenders_lock = threading.Lock()
+        # Bumped on every open() and close(). A Jupyter control remembers
+        # the value it was built under and refuses to write once it changes:
+        # its node belongs to a device that has since been released, and
+        # touching that node would crash the kernel.
+        self._generation = 0
         # Memoised _discover_features() result plus the node map it was built
         # from (see that method for why). Keeping the object itself — rather
         # than its id() — means a replaced node map can never be mistaken for
@@ -132,24 +286,62 @@ class Camera(ABC):
         self._feature_cache: dict[str, list[str]] | None = None
         self._feature_cache_source: Any = None
 
+    @contextmanager
+    def _device(self) -> Iterator[None]:
+        """Hold the device lock for anything other than fetching a frame.
+
+        A fetch releases the lock between waits, but CPython locks are not
+        fair: the fetching thread usually takes it straight back, and a
+        stop() waited up to a second behind a busy fetch loop on TLSimu.
+        Registering here first makes the fetch loop step aside at its next
+        wait boundary, so a control waits for at most one of them.
+        """
+        with self._contenders_lock:
+            self._contenders += 1
+        try:
+            with self._lock:
+                yield
+        finally:
+            with self._contenders_lock:
+                self._contenders -= 1
+
+    def _yield_to_controls(self) -> None:
+        """Wait while a control operation is queued for the device lock."""
+        while self._contenders:
+            time.sleep(0.0005)
+
     @abstractmethod
     def open(self) -> None:
-        """Open connection to the camera."""
+        """Claim the device and read back its capabilities.
+
+        A GenICam device stays claimed until :meth:`close`, so exactly one
+        process can hold it at a time.
+        """
         ...
 
     @abstractmethod
     def close(self) -> None:
-        """Close connection to the camera."""
+        """Release the device. Must be safe to call twice."""
         ...
+
+    @property
+    def is_open(self) -> bool:
+        """Whether :meth:`open` has claimed the device and :meth:`close` has
+        not released it since.
+
+        The default goes by the node map, which a camera holds only while it
+        is open; subclasses that know more directly override it.
+        """
+        return getattr(self, "node_map", None) is not None
 
     @abstractmethod
     def start_acquisition(self) -> None:
-        """Start image acquisition."""
+        """Begin streaming frames into the producer's buffer ring."""
         ...
 
     @abstractmethod
     def stop_acquisition(self) -> None:
-        """Stop image acquisition."""
+        """Stop streaming and discard whatever is still buffered."""
         ...
 
     @abstractmethod
@@ -165,12 +357,16 @@ class Camera(ABC):
 
     @abstractmethod
     def set_exposure(self, exposure_time: float) -> None:
-        """Set exposure time in seconds."""
+        """Set exposure time in seconds.
+
+        Implementations that buffer frames should flush them, or the next
+        few frames will still carry the old exposure.
+        """
         ...
 
     @abstractmethod
     def set_gain(self, gain: float) -> None:
-        """Set gain."""
+        """Set gain, in whatever units the device uses (usually dB)."""
         ...
 
     def setting(self, **kwargs: Any) -> None:
@@ -181,8 +377,11 @@ class Camera(ABC):
 
         Args:
             **kwargs: Camera parameters to apply before showing the UI.
-                Parameter names should match ``node_map`` feature names
-                (e.g. ``ExposureTime=0.01``, ``Gain=10.0``, ``BlackLevel=0``).
+                ``exposure_time`` (seconds) and ``gain`` go through
+                :meth:`set_exposure` / :meth:`set_gain`; any other name is a
+                ``node_map`` feature, in that feature's own unit (e.g.
+                ``ExposureTime=10000`` is 10 ms, since the node counts
+                microseconds; ``Gain=10.0``, ``BlackLevel=0``).
         """
         import ipywidgets as widgets
         from IPython.display import display
@@ -200,8 +399,16 @@ class Camera(ABC):
         if hasattr(self, "gain_range"):
             gain_min, gain_max = cast(tuple[float, float], self.gain_range)
 
-        exp_min_log = math.floor(math.log10(exposure_min))
-        exp_max_log = math.ceil(math.log10(exposure_max))
+        # A log slider cannot represent zero, and some producers report a
+        # minimum of 0 for exposure. Clamp to a microsecond, which is below
+        # anything a real sensor supports anyway.
+        exposure_min = max(exposure_min, 1e-6)
+        exposure_max = max(exposure_max, exposure_min * 10)
+        # The camera's own limits, not whole decades around them: rounding
+        # the exponents outwards let the slider reach values the camera then
+        # refused -- 10 µs on a camera whose minimum is 20 µs.
+        exp_min_log = math.log10(exposure_min)
+        exp_max_log = math.log10(exposure_max)
 
         exposure_slider = widgets.FloatLogSlider(
             value=self.exposure_time,
@@ -248,13 +455,22 @@ class Camera(ABC):
             disabled=True,
         )
 
+        # These observers run inside the widget comm handler, where an
+        # exception is reported as a traceback in the log and leaves the
+        # two controls disagreeing; log it and keep the panel usable.
         def on_exposure_change(change: dict[str, Any]) -> None:
-            self.set_exposure(change["new"])
-            exposure_input.value = change["new"]
+            try:
+                self.set_exposure(change["new"])
+                exposure_input.value = change["new"]
+            except Exception as e:
+                logger.error(f"Error setting exposure: {e}")
 
         def on_gain_change(change: dict[str, Any]) -> None:
-            self.set_gain(change["new"])
-            gain_input.value = change["new"]
+            try:
+                self.set_gain(change["new"])
+                gain_input.value = change["new"]
+            except Exception as e:
+                logger.error(f"Error setting gain: {e}")
 
         def on_exposure_input_change(change: dict[str, Any]) -> None:
             exposure_slider.value = change["new"]
@@ -263,12 +479,19 @@ class Camera(ABC):
             gain_slider.value = change["new"]
 
         def on_start_click(b: Any) -> None:
-            self.start_acquisition()
+            try:
+                self.start_acquisition()
+            except Exception as e:
+                logger.error(f"Error starting acquisition: {e}")
+                return
             start_button.disabled = True
             stop_button.disabled = False
 
         def on_stop_click(b: Any) -> None:
-            self.stop_acquisition()
+            try:
+                self.stop_acquisition()
+            except Exception as e:
+                logger.error(f"Error stopping acquisition: {e}")
             start_button.disabled = False
             stop_button.disabled = True
 
@@ -288,26 +511,29 @@ class Camera(ABC):
         analog_accordion = widgets.Accordion(children=[gain_box])
         analog_accordion.set_title(0, "Gain")
 
-        genicam_controls = self._create_genicam_controls(style)
-
         camera_info: list[Any] = []
         camera_info.append(widgets.HTML(f"<b>Camera Type:</b> {type(self).__name__}"))
         camera_info.append(widgets.HTML(f"<b>Sensor Size:</b> {self.width}×{self.height} pixels"))
         camera_info.append(widgets.HTML(f"<b>Pixel Size:</b> {self.pixel_size:.2f} μm"))
 
-        if hasattr(self, "node_map") and self.node_map:
-            try:
-                if hasattr(self.node_map, "SensorDescription"):
-                    desc = self.node_map.SensorDescription.value  # ty:ignore[unresolved-attribute]
-                    camera_info.append(widgets.HTML(f"<b>Sensor:</b> {desc}"))
-            except Exception as e:
-                logger.debug(f"Optional feature SensorDescription not available: {e}")
-            try:
-                if hasattr(self.node_map, "DeviceModelName"):
-                    model = self.node_map.DeviceModelName.value  # ty:ignore[unresolved-attribute]
-                    camera_info.append(widgets.HTML(f"<b>Model:</b> {model}"))
-            except Exception as e:
-                logger.debug(f"Optional feature DeviceModelName not available: {e}")
+        # Building the panel reads hundreds of nodes; hold the device so a
+        # close() from another thread cannot release it half-way through.
+        with self._device():
+            genicam_controls = self._create_genicam_controls(style)
+
+            if hasattr(self, "node_map") and self.node_map:
+                try:
+                    if hasattr(self.node_map, "SensorDescription"):
+                        desc = self.node_map.SensorDescription.value  # ty:ignore[unresolved-attribute]
+                        camera_info.append(widgets.HTML(f"<b>Sensor:</b> {desc}"))
+                except Exception as e:
+                    logger.debug(f"Optional feature SensorDescription not available: {e}")
+                try:
+                    if hasattr(self.node_map, "DeviceModelName"):
+                        model = self.node_map.DeviceModelName.value  # ty:ignore[unresolved-attribute]
+                        camera_info.append(widgets.HTML(f"<b>Model:</b> {model}"))
+                except Exception as e:
+                    logger.debug(f"Optional feature DeviceModelName not available: {e}")
 
         camera_info_box = widgets.VBox(camera_info)
 
@@ -416,7 +642,8 @@ class Camera(ABC):
         map costs hundreds of round trips and can take seconds.  Which
         features *exist* is fixed for a given node map (only their values
         change), so the cache is keyed on the node map's identity and
-        naturally re-discovers after a reconnect.
+        naturally re-discovers after a reconnect; close() drops it, since a
+        closed camera's nodes must not be touched at all.
 
         Args:
             refresh: Rebuild the cache even if one is already populated.
@@ -425,6 +652,11 @@ class Camera(ABC):
             Mapping from category name to a sorted list of feature names.
             Treat it as read-only; it is the cached object.
         """
+        with self._device():
+            return self._discover_features_locked(refresh)
+
+    def _discover_features_locked(self, refresh: bool) -> dict[str, list[str]]:
+        """:meth:`_discover_features`, with the device already held."""
         if not hasattr(self, "node_map") or not self.node_map:
             return {}
 
@@ -587,20 +819,21 @@ class Camera(ABC):
         """
         controls = []
 
-        for feature_name in features:
-            # Everything here stays inside the guard: getattr and hasattr only
-            # swallow AttributeError, and a camera node that has lost its
-            # connection tends to raise something else entirely.
-            try:
-                node = getattr(self.node_map, feature_name, None)  # ty:ignore[unresolved-attribute]
-                if node is None or not hasattr(node, "value"):
+        with self._device():
+            for feature_name in features:
+                # Everything here stays inside the guard: getattr and hasattr
+                # only swallow AttributeError, and a camera node that has lost
+                # its connection tends to raise something else entirely.
+                try:
+                    node = getattr(self.node_map, feature_name, None)  # ty:ignore[unresolved-attribute]
+                    if node is None or not hasattr(node, "value"):
+                        continue
+                    control = self._build_feature_control(node, feature_name, style)
+                except Exception as e:
+                    logger.debug("Could not create a control for %s: %s", feature_name, e)
                     continue
-                control = self._build_feature_control(node, feature_name, style)
-            except Exception as e:
-                logger.debug("Could not create a control for %s: %s", feature_name, e)
-                continue
-            if control is not None:
-                controls.append(control)
+                if control is not None:
+                    controls.append(control)
 
         return controls
 
@@ -624,15 +857,42 @@ class Camera(ABC):
 
         return self._create_enum_dropdown(node, feature_name, style)
 
+    def _write_node(self, node: Any, value: Any, feature_name: str, generation: int) -> bool:
+        """Write ``value`` to ``node`` on behalf of a panel control.
+
+        Args:
+            node: The node the control was built for.
+            value: New value.
+            feature_name: For messages.
+            generation: ``self._generation`` when the control was built.
+
+        Returns:
+            Whether the value was written. A control built before the camera
+            was last closed or reopened is refused: its node belongs to a
+            device that has been released, and on real hardware touching it
+            crashes the Python process.
+        """
+        with self._device():
+            if generation != self._generation or getattr(self, "node_map", None) is None:
+                logger.warning(
+                    "%s was not changed: this control belongs to a camera that has "
+                    "since been closed. Run setting() again for the current one.",
+                    feature_name,
+                )
+                return False
+            node.value = value
+            return True
+
     def _create_checkbox(self, node: Any, feature_name: str, current_val: bool) -> Any:
         """Create checkbox widget for a boolean GenICam feature."""
         import ipywidgets as widgets
 
         checkbox = widgets.Checkbox(value=bool(current_val), description=feature_name, indent=False)
+        generation = self._generation
 
         def on_change(change: dict[str, Any]) -> None:
             try:
-                node.value = change["new"]
+                self._write_node(node, change["new"], feature_name, generation)
             except Exception as e:
                 logger.error(f"Error setting {feature_name}: {e}")
 
@@ -674,10 +934,12 @@ class Camera(ABC):
                     value=current_val, layout=widgets.Layout(width="100px")
                 )
 
+            generation = self._generation
+
             def on_slider_change(change: dict[str, Any]) -> None:
                 try:
-                    node.value = change["new"]
-                    input_widget.value = change["new"]
+                    if self._write_node(node, change["new"], feature_name, generation):
+                        input_widget.value = change["new"]
                 except Exception as e:
                     logger.error(f"Error setting {feature_name}: {e}")
 
@@ -721,9 +983,11 @@ class Camera(ABC):
                 style=style,
             )
 
+            generation = self._generation
+
             def on_change(change: dict[str, Any]) -> None:
                 try:
-                    node.value = change["new"]
+                    self._write_node(node, change["new"], feature_name, generation)
                 except Exception as e:
                     logger.error(f"Error setting {feature_name}: {e}")
 
@@ -736,17 +1000,21 @@ class Camera(ABC):
     def _apply_settings_from_kwargs(self, kwargs: dict[str, Any]) -> None:
         """Apply camera settings from keyword arguments.
 
-        Handles both standard camera attributes (``exposure_time``, ``gain``)
-        and GenICam ``node_map`` features.
+        ``exposure_time`` is in seconds and ``gain`` in the camera's gain
+        unit, like the methods they call. A GenICam feature name is in that
+        feature's own unit: ``ExposureTime`` used to be read as seconds, so
+        ``ExposureTime=5000`` -- 5 ms to anyone who knows GenICam -- asked
+        for 5000 s.
 
         Args:
             kwargs: Mapping of parameter names to values.
         """
         for param_name, value in kwargs.items():
-            if param_name in ("exposure_time", "ExposureTime"):
+            if param_name in ("exposure_time", "ExposureTime", "ExposureTimeAbs"):
+                seconds = value if param_name == "exposure_time" else float(value) / 1_000_000
                 try:
-                    self.set_exposure(value)
-                    logger.info(f"Set exposure_time = {value}")
+                    self.set_exposure(seconds)
+                    logger.info(f"Set exposure_time = {self.exposure_time}")
                 except Exception as e:
                     logger.error(f"Error setting exposure_time: {e}")
                 continue
@@ -754,7 +1022,7 @@ class Camera(ABC):
             if param_name in ("gain", "Gain"):
                 try:
                     self.set_gain(value)
-                    logger.info(f"Set gain = {value}")
+                    logger.info(f"Set gain = {self.gain}")
                 except Exception as e:
                     logger.error(f"Error setting gain: {e}")
                 continue
@@ -763,23 +1031,9 @@ class Camera(ABC):
                 if hasattr(self.node_map, param_name):
                     try:
                         node = getattr(self.node_map, param_name)
-
-                        if isinstance(value, str):
-                            if param_name.endswith("Enable") or param_name.endswith("Auto"):
-                                # Check if this is actually a boolean node
-                                try:
-                                    current_val = node.value
-                                    if isinstance(current_val, bool):
-                                        if value.lower() in ["on", "true", "1", "yes"]:
-                                            value = True
-                                        elif value.lower() in ["off", "false", "0", "no"]:
-                                            value = False
-                                except Exception as e:
-                                    logger.debug(
-                                        f"Could not check boolean type for {param_name}: {e}"
-                                    )
-
-                        node.value = value
+                        value = _coerce_for_node(node, value)
+                        with self._device():
+                            node.value = value
                         logger.info(f"Set {param_name} = {value}")
                     except Exception as e:
                         logger.error(f"Error setting {param_name}: {e}")

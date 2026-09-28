@@ -1,16 +1,25 @@
-"""Dash web application for pyBeamprofiler GUI.
+"""The live browser GUI: figure building, the app factory, and callbacks.
 
-Provides a rich browser-based interface with live camera streaming,
-interactive fitting controls, and camera settings management.
+The page's components are built in :mod:`pybeamprofiler.dash_layout`; what is
+here is everything that moves — the heatmap figure rebuilt on each tick, and
+the callbacks behind every control.
+
+One rule governs the whole module: anything that touches the camera or the
+profiler's state holds ``_callback_lock``. The Harvesters backend is a C
+library that will segfault, not raise, if a buffer is fetched while the
+acquirer is being destroyed, so the render tick and the controls that stop,
+reconfigure or replace the camera are strictly serialised. The render tick
+takes the lock without blocking and skips a frame rather than queueing, so a
+slow camera fetch cannot make the controls feel stuck.
 """
 
 from __future__ import annotations
 
 import base64
 import collections
+import functools
 import io
 import logging
-import re
 import threading
 import time
 from typing import TYPE_CHECKING, Any
@@ -19,12 +28,27 @@ import dash
 import dash_bootstrap_components as dbc
 import numpy as np
 import plotly.graph_objs as go
-from dash import MATCH, Input, Output, Patch, State, ctx, dcc, html
+from dash import MATCH, Input, Output, Patch, State, ctx, html
 from PIL import Image
 
 from .constants import (
-    DEFAULT_UPDATE_INTERVAL_MS,
+    MAX_AVG_FRAMES,
     MAX_DISPLAY_DIM,
+)
+from .dash_layout import (
+    GRAY_COLORSCALE,
+    _build_setting_items,
+    _camera_options,
+    _format_results,
+    _page,
+    _play_pause_face,
+    _with_open_camera,
+)
+from .discovery import (
+    CameraOption,
+    describe_open_camera,
+    find_option,
+    open_camera,
 )
 from .fitting import downsample
 
@@ -40,79 +64,46 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-COLORSCALES = list(
-    dict.fromkeys(
-        [
-            "Hot",
-            "Inferno",
-            "Plasma",
-            "Viridis",
-            "Magma",
-            "Cividis",
-            "Turbo",
-            "Jet",
-            "Rainbow",
-            "Portland",
-            "Picnic",
-            "Electric",
-            "Bluered",
-            "RdBu",
-            "YlOrRd",
-            "YlGnBu",
-            "Sunset",
-            "Sunsetdark",
-            "Temps",
-            "Thermal",
-            "Oryel",
-            "Agsunset",
-            "Tealrose",
-            "Blackbody",
-            "Earth",
-            "Dense",
-            "Deep",
-            "Speed",
-            "Amp",
-            "Matter",
-            "Tropic",
-            "Cividis",
-            "Thermal",
-            "YlOrRd",
-        ]
-    )
-)
-GRAY_COLORSCALE = "gray"
 
 _PROFILE_FRACTION = 0.15
 
 # Saturation warning thresholds.
-_SATURATION_PIXEL_FRACTION = 0.001  # 0.1% of pixels at the dtype max ⇒ warn.
-
-# Maximum frames in the rolling-average buffer (memory cap: N×frame size).
-_MAX_AVG_FRAMES = 32
+_SATURATION_PIXEL_FRACTION = 0.001  # 0.1% of pixels at the saturation level ⇒ warn.
 
 
-def _saturation_max(image: np.ndarray) -> float:
-    """Return the saturation level for *image* given its dtype.
+def _saturation_max(image: np.ndarray, bit_depth: int | None = None) -> float:
+    """Return the saturation level for *image*.
 
-    For integer images this is the dtype's largest representable value
-    (e.g. 255 for ``uint8``, 65535 for ``uint16``, 4095 for a 12-bit
-    sensor packed in ``uint16`` is reported as 65535 — we cannot tell
-    "real" bit depth from the dtype alone, so the warning is conservative).
-    For floating-point images we assume normalised ``[0, 1]`` data when the
-    observed max is ≤ 1, otherwise use the observed max as a heuristic.
+    For integer images this is ``2**bit_depth - 1`` when the camera reports
+    its bit depth, and otherwise the dtype's largest value. The dtype alone
+    cannot tell a 12-bit sensor packed in ``uint16`` from a 16-bit one, so
+    without the bit depth the level there is 65535 and a clipped 12-bit
+    frame is never flagged. For floating-point images we assume normalised
+    ``[0, 1]`` data when the observed max is ≤ 1, otherwise use the observed
+    max as a heuristic.
     """
     if np.issubdtype(image.dtype, np.integer):
-        return float(np.iinfo(image.dtype).max)
+        dtype_max = float(np.iinfo(image.dtype).max)
+        if bit_depth:
+            # A Mono8 stream from a 12-bit sensor still clips at 255.
+            return min(float(2**bit_depth - 1), dtype_max)
+        return dtype_max
     obs_max = float(image.max()) if image.size else 1.0
     return 1.0 if obs_max <= 1.0 else obs_max
 
 
-def _saturation_fraction(image: np.ndarray) -> float:
-    """Fraction of pixels at or above the dtype's saturation level."""
+def _saturation_fraction(image: np.ndarray, level: float | None = None) -> float:
+    """Fraction of pixels at or above the saturation level.
+
+    Args:
+        image: The frame to check.
+        level: The saturation level, from :func:`_saturation_max`; derived
+            from the dtype when not given.
+    """
     if image.size == 0:
         return 0.0
-    sat = _saturation_max(image)
-    # For integer images, only the exact dtype max counts as saturated.
+    sat = _saturation_max(image) if level is None else level
+    # For integer images, only the exact saturation value counts.
     # For floating-point images, allow a small epsilon near the inferred max.
     threshold = sat if np.issubdtype(image.dtype, np.integer) else sat - 1e-6
     # A plain max() reduction is several times cheaper than the comparison
@@ -123,769 +114,13 @@ def _saturation_fraction(image: np.ndarray) -> float:
     return float(np.count_nonzero(image >= threshold)) / image.size
 
 
-# ---------------------------------------------------------------------------
-# Layout helpers
-# ---------------------------------------------------------------------------
-
-
-def _fitting_tab(bp: BeamProfiler) -> dbc.Tab:
-    """Build the **Fitting** tab content."""
-    return dbc.Tab(
-        label="Fitting",
-        tab_id="tab-fitting",
-        children=dbc.Card(
-            dbc.CardBody(
-                [
-                    # Row 1 — Play / Pause (full-width) with Spacebar shortcut hint.
-                    dbc.Row(
-                        dbc.Col(
-                            dbc.Button(
-                                [html.I(className="bi bi-pause-fill me-1"), "Pause"],
-                                id="btn-play-pause",
-                                color="primary",
-                                size="sm",
-                                className="w-100",
-                                title="Toggle Play / Pause (Spacebar)",
-                            ),
-                        ),
-                        className="mb-2",
-                    ),
-                    # Row 1b — view + save controls.
-                    dbc.Row(
-                        [
-                            dbc.Col(
-                                dbc.Button(
-                                    [html.I(className="bi bi-aspect-ratio me-1"), "Auto-fit"],
-                                    id="btn-zoom-fit",
-                                    color="secondary",
-                                    size="sm",
-                                    className="w-100",
-                                    title="Zoom to ±3σ around the fit center",
-                                ),
-                                width=4,
-                            ),
-                            dbc.Col(
-                                dbc.Button(
-                                    [html.I(className="bi bi-arrows-fullscreen me-1"), "Reset"],
-                                    id="btn-zoom-reset",
-                                    color="secondary",
-                                    size="sm",
-                                    className="w-100",
-                                    title="Reset zoom to full sensor",
-                                ),
-                                width=4,
-                            ),
-                            dbc.Col(
-                                dbc.DropdownMenu(
-                                    [
-                                        dbc.DropdownMenuItem(
-                                            [html.I(className="bi bi-image me-2"), "PNG"],
-                                            id="btn-save-png",
-                                        ),
-                                        dbc.DropdownMenuItem(
-                                            [
-                                                html.I(className="bi bi-filetype-raw me-2"),
-                                                "NumPy (.npy)",
-                                            ],
-                                            id="btn-save-npy",
-                                        ),
-                                    ],
-                                    label=[html.I(className="bi bi-download me-1"), "Save"],
-                                    color="secondary",
-                                    size="sm",
-                                    # ``className`` only styles the outer
-                                    # ``.dropdown`` wrapper; the toggle <button>
-                                    # stays content-sized unless we target it
-                                    # explicitly.
-                                    className="w-100",
-                                    toggle_class_name="w-100",
-                                    align_end=True,
-                                ),
-                                width=4,
-                            ),
-                        ],
-                        className="mb-3 g-1",
-                    ),
-                    # Row 2 — Color Scale switch + dropdown
-                    dbc.Row(
-                        [
-                            dbc.Col(
-                                [
-                                    dbc.Label("Color", className="small mb-0"),
-                                    dbc.Switch(
-                                        id="switch-color",
-                                        value=True,
-                                        label="",
-                                        className="mt-1",
-                                    ),
-                                ],
-                                width=4,
-                            ),
-                            dbc.Col(
-                                dbc.Select(
-                                    id="dropdown-colorscale",
-                                    options=[{"label": s, "value": s} for s in COLORSCALES],
-                                    value="Hot",
-                                    size="sm",
-                                ),
-                                width=8,
-                            ),
-                        ],
-                        className="mb-3 align-items-center",
-                    ),
-                    # Row 3 — Auto Range switch + Min / Max inputs
-                    dbc.Row(
-                        [
-                            dbc.Col(
-                                [
-                                    dbc.Label("Auto Range", className="small mb-0"),
-                                    dbc.Switch(
-                                        id="switch-autorange",
-                                        value=True,
-                                        label="",
-                                        className="mt-1",
-                                    ),
-                                ],
-                                width=4,
-                            ),
-                            dbc.Col(
-                                dbc.InputGroup(
-                                    [
-                                        dbc.InputGroupText("Min", style={"fontSize": "0.8rem"}),
-                                        dbc.Input(
-                                            id="input-zmin",
-                                            type="number",
-                                            value=0,
-                                            size="sm",
-                                            disabled=True,
-                                        ),
-                                        dbc.InputGroupText("Max", style={"fontSize": "0.8rem"}),
-                                        dbc.Input(
-                                            id="input-zmax",
-                                            type="number",
-                                            value=255,
-                                            size="sm",
-                                            disabled=True,
-                                        ),
-                                    ],
-                                    size="sm",
-                                ),
-                                width=8,
-                            ),
-                        ],
-                        className="mb-3 align-items-center",
-                    ),
-                    # Row 4 — Dark / Light theme
-                    dbc.Row(
-                        [
-                            dbc.Col(
-                                html.I(className="bi bi-sun-fill text-muted"),
-                                width="auto",
-                                className="pe-1",
-                            ),
-                            dbc.Col(
-                                dbc.Switch(
-                                    id="switch-theme",
-                                    value=True,
-                                    label="",
-                                    className="mb-0",
-                                ),
-                                width="auto",
-                                className="px-0",
-                            ),
-                            dbc.Col(
-                                html.I(className="bi bi-moon-stars-fill text-muted"),
-                                width="auto",
-                                className="ps-0",
-                            ),
-                        ],
-                        className="mb-3 align-items-center",
-                    ),
-                    html.Hr(className="my-1"),
-                    # Row 5 — Analysis + Fit function
-                    dbc.Row(
-                        [
-                            dbc.Col(
-                                [
-                                    dbc.Label("Analysis", className="small mb-1"),
-                                    dbc.Select(
-                                        id="dropdown-analysis",
-                                        options=[
-                                            {"label": "1D Integration", "value": "1d"},
-                                            {"label": "2D Gaussian", "value": "2d"},
-                                            {"label": "Linecut", "value": "linecut"},
-                                        ],
-                                        value=bp.fit_method,
-                                        size="sm",
-                                    ),
-                                ],
-                                width=6,
-                            ),
-                            dbc.Col(
-                                [
-                                    dbc.Label("Definition", className="small mb-1"),
-                                    dbc.Select(
-                                        id="dropdown-definition",
-                                        options=[
-                                            {"label": "Gaussian (1/e²)", "value": "gaussian"},
-                                            {"label": "FWHM", "value": "fwhm"},
-                                            {"label": "D4σ", "value": "d4s"},
-                                        ],
-                                        value=bp.definition,
-                                        size="sm",
-                                    ),
-                                ],
-                                width=6,
-                            ),
-                        ],
-                        className="mb-3",
-                    ),
-                    # Row 5 — Pixel scale
-                    dbc.Row(
-                        dbc.Col(
-                            dbc.InputGroup(
-                                [
-                                    dbc.InputGroupText("Scale", style={"fontSize": "0.8rem"}),
-                                    dbc.Input(
-                                        id="input-pixel-scale",
-                                        type="number",
-                                        value=round(bp.pixel_size, 4),
-                                        step=0.01,
-                                        size="sm",
-                                    ),
-                                    dbc.InputGroupText("μm/px", style={"fontSize": "0.8rem"}),
-                                ],
-                                size="sm",
-                            ),
-                        ),
-                        className="mb-3",
-                    ),
-                    # Row 5b — Frame averaging (running mean over N frames).
-                    dbc.Row(
-                        dbc.Col(
-                            html.Div(
-                                dbc.InputGroup(
-                                    [
-                                        dbc.InputGroupText(
-                                            "Average",
-                                            style={"fontSize": "0.8rem"},
-                                        ),
-                                        dbc.Input(
-                                            id="input-avg-n",
-                                            type="number",
-                                            value=1,
-                                            min=1,
-                                            max=_MAX_AVG_FRAMES,
-                                            step=1,
-                                            size="sm",
-                                        ),
-                                        dbc.InputGroupText("frames", style={"fontSize": "0.8rem"}),
-                                    ],
-                                    size="sm",
-                                ),
-                                title="Running mean over the last N frames (1 = off)",
-                            ),
-                        ),
-                        className="mb-3",
-                    ),
-                    # Row 6 — Fitted results
-                    html.Hr(className="my-2"),
-                    html.Div(id="div-results", className="small font-monospace"),
-                ],
-            ),
-            className="border-0",
-        ),
-    )
-
-
-def _is_readonly(node: Any) -> bool:
-    """Return ``True`` if the GenICam node is read-only."""
-    if getattr(node, "_readonly", False):
-        return True
-    if _EAccessMode is None:
-        return False
-    try:
-        access = getattr(node, "get_access_mode", None)
-        if access is not None:
-            mode = access()
-            if mode in (_EAccessMode.RO, _EAccessMode.NA, _EAccessMode.NI):
-                return True
-    except Exception:
-        pass
-    return False
-
-
-def _humanize(name: str) -> str:
-    """``"AcquisitionFrameRate"`` → ``"Acquisition Frame Rate"``."""
-    return re.sub(r"(?<=[a-z])(?=[A-Z])", " ", name)
-
-
-def _slider_with_input(
-    *,
-    slider_id: Any,
-    input_id: Any,
-    min_val: float,
-    max_val: float,
-    value: float,
-    step: float,
-    input_width: str = "110px",
-) -> html.Div:
-    """Render a slider paired with a narrow numeric input box.
-
-    The slider is for quick drag-to-set, the input on the right lets the
-    user type a precise value (debounced — only fires on Enter / blur).
-    Both are kept in sync by a matching callback elsewhere; this helper
-    just lays them out consistently.
-    """
-    return html.Div(
-        dbc.Row(
-            [
-                dbc.Col(
-                    dcc.Slider(
-                        id=slider_id,
-                        min=min_val,
-                        max=max_val,
-                        value=value,
-                        step=step,
-                        tooltip={"placement": "bottom", "always_visible": False},
-                        marks=None,
-                    ),
-                    className="pe-2",
-                ),
-                dbc.Col(
-                    dbc.Input(
-                        id=input_id,
-                        type="number",
-                        value=value,
-                        min=min_val,
-                        max=max_val,
-                        step=step,
-                        size="sm",
-                        debounce=True,
-                    ),
-                    width="auto",
-                    style={"width": input_width},
-                ),
-            ],
-            className="g-0 align-items-center",
-        ),
-        className="mb-2",
-    )
-
-
-def _build_genicam_control(cam: Any, feature_name: str) -> html.Div | None:
-    """Build a Dash control for a single GenICam ``node_map`` feature.
-
-    Returns a ``html.Div`` wrapping a label and the appropriate input widget
-    (slider for numeric, select for enums, switch for booleans), styled
-    consistently with the built-in Exposure & Gain controls.  Returns
-    ``None`` when the feature cannot be rendered.
-    """
-    node_map = getattr(cam, "node_map", None)
-    if node_map is None:
+def _camera_bit_depth(bp: BeamProfiler) -> int | None:
+    """The attached camera's reported bit depth, or ``None`` if unknown."""
+    depth = getattr(bp.camera, "bit_depth", None) if bp.camera is not None else None
+    # Anything but a plausible int (a mock's attribute, a bool) means unknown.
+    if isinstance(depth, bool) or not isinstance(depth, int) or not 1 <= depth <= 32:
         return None
-
-    node = getattr(node_map, feature_name, None)
-    if node is None:
-        return None
-
-    try:
-        current_val = node.value
-    except Exception:
-        return None
-
-    readonly = _is_readonly(node)
-    label = dbc.Label(_humanize(feature_name), className="small mb-1")
-
-    def _readonly_row(value_text: str) -> html.Div:
-        """Render a label/value pair as a flex row so the value is
-        right-aligned with a clear gap from the label (avoids text
-        running together when both fit on one line)."""
-        return html.Div(
-            [
-                dbc.Label(_humanize(feature_name), className="small text-muted mb-0 me-2"),
-                html.Span(
-                    value_text,
-                    className="small text-end",
-                    style={"wordBreak": "break-word"},
-                ),
-            ],
-            className="mb-2 d-flex justify-content-between align-items-baseline",
-        )
-
-    # ── Boolean ───────────────────────────────────────────────────
-    if isinstance(current_val, bool):
-        return html.Div(
-            [
-                label,
-                dbc.Switch(
-                    id={"type": "genicam-sw", "feature": feature_name},
-                    value=current_val,
-                    label="",
-                    disabled=readonly,
-                ),
-            ],
-            className="mb-2",
-        )
-
-    # ── Enumeration (has symbolics) ───────────────────────────────
-    symbolics = getattr(node, "symbolics", None)
-    if symbolics:
-        val_str = str(current_val)
-        return html.Div(
-            [
-                label,
-                dbc.Select(
-                    id={"type": "genicam-sel", "feature": feature_name},
-                    options=[{"label": s, "value": s} for s in symbolics],
-                    value=val_str if val_str in symbolics else symbolics[0],
-                    size="sm",
-                    disabled=readonly,
-                ),
-            ],
-            className="mb-2",
-        )
-
-    # ── Numeric with range ────────────────────────────────────────
-    node_min = getattr(node, "min", None)
-    node_max = getattr(node, "max", None)
-    if node_min is not None and node_max is not None:
-        try:
-            fmin, fmax, fval = float(node_min), float(node_max), float(current_val)
-            if readonly:
-                return _readonly_row(f"{fval:g}")
-            is_int = isinstance(current_val, int) and isinstance(node_min, int)
-            step = 1 if is_int else round((fmax - fmin) / 1000, 6) or 0.001
-            return html.Div(
-                [
-                    label,
-                    _slider_with_input(
-                        slider_id={"type": "genicam-num", "feature": feature_name},
-                        input_id={"type": "genicam-num-input", "feature": feature_name},
-                        min_val=fmin,
-                        max_val=fmax,
-                        value=fval,
-                        step=step,
-                    ),
-                ],
-                className="mb-2",
-            )
-        except (TypeError, ValueError):
-            pass
-
-    # ── Read-only / unknown string → text display ─────────────────
-    if readonly or (isinstance(current_val, str) and not current_val):
-        return _readonly_row(str(current_val))
-
-    # ── String fallback (Enable / Auto without symbolics) ─────────
-    if isinstance(current_val, str):
-        if feature_name.endswith("Enable"):
-            opts = [{"label": s, "value": s} for s in ["On", "Off"]]
-        elif feature_name.endswith("Auto"):
-            opts = [{"label": s, "value": s} for s in ["Off", "Once", "Continuous"]]
-        else:
-            opts = [{"label": current_val, "value": current_val}]
-        return html.Div(
-            [
-                label,
-                dbc.Select(
-                    id={"type": "genicam-sel", "feature": feature_name},
-                    options=opts,  # ty: ignore[invalid-argument-type]
-                    value=current_val,
-                    size="sm",
-                ),
-            ],
-            className="mb-2",
-        )
-
-    return None
-
-
-# ---------------------------------------------------------------------------
-# Dedicated control builders (Exposure / Gain / ROI)
-# ---------------------------------------------------------------------------
-
-
-def _exposure_controls(cam: Any) -> list[Any]:
-    """Build the Exposure (ms) slider + numeric input — always present."""
-    exp_min, exp_max = 0.001, 1.0
-    er = getattr(cam, "exposure_range", None)
-    if er is not None:
-        try:
-            exp_min, exp_max = er
-        except Exception:
-            pass
-    exp_ms = (cam.exposure_time or 0.01) * 1000
-    return [
-        dbc.Label("Exposure (ms)", className="small mb-1"),
-        _slider_with_input(
-            slider_id="slider-exposure",
-            input_id="input-exposure",
-            min_val=round(exp_min * 1000, 3),
-            max_val=round(exp_max * 1000, 3),
-            value=round(exp_ms, 3),
-            step=0.001,
-        ),
-    ]
-
-
-def _gain_controls(cam: Any) -> list[Any]:
-    """Build the Gain slider + numeric input — always present."""
-    gain_min, gain_max = 0.0, 24.0
-    gr = getattr(cam, "gain_range", None)
-    if gr is not None:
-        try:
-            gain_min, gain_max = gr
-        except Exception:
-            pass
-    return [
-        dbc.Label("Gain", className="small mb-1"),
-        _slider_with_input(
-            slider_id="slider-gain",
-            input_id="input-gain",
-            min_val=gain_min,
-            max_val=gain_max,
-            value=cam.gain or 0.0,
-            step=0.1,
-        ),
-    ]
-
-
-def _roi_controls(cam: Any) -> list[Any] | None:
-    """Build the ROI panel, or ``None`` if the camera has no ROI."""
-    if not (hasattr(cam, "roi_info") and hasattr(cam, "set_roi")):
-        return None
-    try:
-        roi: dict[str, int] = getattr(cam, "roi_info")
-    except Exception:
-        return None
-
-    return [
-        html.Hr(className="my-2"),
-        dbc.Label("Region of Interest", className="small fw-bold mb-1"),
-        dbc.Row(
-            [
-                dbc.Col(
-                    [
-                        dbc.Label("Offset X", className="small"),
-                        dbc.Input(
-                            id="input-roi-ox",
-                            type="number",
-                            value=roi.get("offset_x", 0),
-                            size="sm",
-                        ),
-                    ],
-                    width=6,
-                ),
-                dbc.Col(
-                    [
-                        dbc.Label("Offset Y", className="small"),
-                        dbc.Input(
-                            id="input-roi-oy",
-                            type="number",
-                            value=roi.get("offset_y", 0),
-                            size="sm",
-                        ),
-                    ],
-                    width=6,
-                ),
-            ],
-            className="mb-2",
-        ),
-        dbc.Row(
-            [
-                dbc.Col(
-                    [
-                        dbc.Label("Width", className="small"),
-                        dbc.Input(
-                            id="input-roi-w",
-                            type="number",
-                            value=roi.get("width", 1024),
-                            size="sm",
-                        ),
-                    ],
-                    width=6,
-                ),
-                dbc.Col(
-                    [
-                        dbc.Label("Height", className="small"),
-                        dbc.Input(
-                            id="input-roi-h",
-                            type="number",
-                            value=roi.get("height", 1024),
-                            size="sm",
-                        ),
-                    ],
-                    width=6,
-                ),
-            ],
-            className="mb-2",
-        ),
-        dbc.Row(
-            [
-                dbc.Col(
-                    dbc.Button(
-                        "Apply ROI",
-                        id="btn-roi-apply",
-                        color="primary",
-                        size="sm",
-                        className="w-100",
-                    ),
-                    width=6,
-                ),
-                dbc.Col(
-                    dbc.Button(
-                        "Full Sensor",
-                        id="btn-roi-reset",
-                        color="outline-secondary",
-                        size="sm",
-                        className="w-100",
-                    ),
-                    width=6,
-                ),
-            ],
-        ),
-        html.Div(id="div-roi-status", className="small text-muted mt-2"),
-    ]
-
-
-# ---------------------------------------------------------------------------
-# Main settings builder
-# ---------------------------------------------------------------------------
-
-# Categories that always appear (in this order) because they contain
-# dedicated Exposure / Gain / ROI controls even when no GenICam features
-# are discovered.
-_PINNED_CATEGORIES = ["Acquisition Control", "Analog Control", "Image Format Control"]
-
-
-def _build_setting_items(bp: BeamProfiler) -> list[dbc.AccordionItem]:
-    """Build the full Setting accordion driven by GenICam feature discovery.
-
-    The layout mirrors official camera GUIs (SpinView, pylon Viewer):
-
-    * **Camera Info** — device metadata summary
-    * **Acquisition Control** — Exposure slider + discovered features
-    * **Analog Control** — Gain slider + discovered features
-    * **Image Format Control** — ROI panel + discovered features
-    * *remaining categories* — auto-discovered features only
-    """
-    items: list[dbc.AccordionItem] = []
-    cam = bp.camera
-    if cam is None:
-        return items
-
-    # ── Camera Info (always first) ────────────────────────────────
-    info_rows: list[Any] = []
-    for lbl, attr in [
-        ("Model", "device_model"),
-        ("Vendor", "device_vendor"),
-        ("Serial", "serial_number"),
-    ]:
-        val = getattr(cam, attr, None)
-        if val is None and hasattr(cam, "node_map") and cam.node_map is not None:
-            nm = cam.node_map
-            node_attr = {
-                "Model": "DeviceModelName",
-                "Vendor": "DeviceVendorName",
-                "Serial": "DeviceSerialNumber",
-            }.get(lbl)
-            if node_attr and hasattr(nm, node_attr):
-                try:
-                    val = getattr(nm, node_attr).value
-                except Exception:
-                    pass
-        if val:
-            info_rows.append(
-                html.Tr([html.Td(lbl, className="pe-3 text-muted"), html.Td(str(val))])
-            )
-    sensor_w = getattr(cam, "width_pixels", None) or getattr(cam, "width", None)
-    sensor_h = getattr(cam, "height_pixels", None) or getattr(cam, "height", None)
-    if sensor_w and sensor_h:
-        info_rows.append(
-            html.Tr(
-                [
-                    html.Td("Sensor", className="pe-3 text-muted"),
-                    html.Td(f"{sensor_w} × {sensor_h}"),
-                ]
-            )
-        )
-    ps = getattr(cam, "pixel_size", None)
-    if ps:
-        info_rows.append(
-            html.Tr([html.Td("Pixel size", className="pe-3 text-muted"), html.Td(f"{ps} μm")])
-        )
-    items.append(
-        dbc.AccordionItem(
-            html.Table(html.Tbody(info_rows), className="table table-sm table-borderless mb-0"),
-            title="Camera Info",
-        )
-    )
-
-    # ── Discover features ─────────────────────────────────────────
-    discovered: dict[str, list[str]] = {}
-    if hasattr(cam, "_discover_features"):
-        try:
-            discovered = cam._discover_features()
-        except Exception:
-            logger.warning("Feature discovery failed", exc_info=True)
-    logger.debug(
-        "Setting panel: discovered %d features in %d categories: %s",
-        sum(len(v) for v in discovered.values()),
-        len(discovered),
-        list(discovered.keys()),
-    )
-
-    # Build ordered category list: pinned first, then the rest alphabetically
-    category_order: list[str] = list(_PINNED_CATEGORIES)
-    for cat in sorted(discovered):
-        if cat not in category_order:
-            category_order.append(cat)
-
-    # ── Build one accordion item per category ─────────────────────
-    for cat in category_order:
-        children: list[Any] = []
-
-        # Inject dedicated controls into the appropriate category
-        if cat == "Acquisition Control":
-            children.extend(_exposure_controls(cam))
-        elif cat == "Analog Control":
-            children.extend(_gain_controls(cam))
-
-        # Auto-discovered features for this category
-        for fname in discovered.get(cat, []):
-            ctrl = _build_genicam_control(cam, fname)
-            if ctrl is not None:
-                children.append(ctrl)
-
-        # ROI panel at the bottom of Image Format Control
-        if cat == "Image Format Control":
-            roi = _roi_controls(cam)
-            if roi is not None:
-                children.extend(roi)
-
-        if children:
-            items.append(dbc.AccordionItem(children, title=cat))
-
-    return items
-
-
-def _setting_tab(bp: BeamProfiler) -> dbc.Tab:
-    """Build the **Setting** tab content."""
-    items = _build_setting_items(bp)
-    if not items:
-        body = html.P("No camera connected.", className="text-muted p-3")
-    else:
-        body = dbc.Accordion(items, start_collapsed=False, always_open=True)
-
-    return dbc.Tab(
-        label="Setting",
-        tab_id="tab-setting",
-        children=dbc.Card(
-            dbc.CardBody(html.Div(body, id="settings-container")),
-            className="border-0",
-        ),
-    )
+    return depth
 
 
 # ---------------------------------------------------------------------------
@@ -894,12 +129,125 @@ def _setting_tab(bp: BeamProfiler) -> dbc.Tab:
 
 
 def _normalize_profile(
-    data: np.ndarray, span: float, fraction: float = _PROFILE_FRACTION
+    data: np.ndarray,
+    span: float,
+    fraction: float = _PROFILE_FRACTION,
+    reference: np.ndarray | None = None,
 ) -> np.ndarray:
-    """Scale a 1-D profile to occupy *fraction* of *span*."""
-    lo, hi = float(np.min(data)), float(np.max(data))
+    """Scale a 1-D profile to occupy *fraction* of *span*.
+
+    With *reference*, the scale comes from that profile's range instead of
+    *data*'s own. A fit curve is drawn this way, against the data it was fitted
+    to: scaled to its own range, any fit filled the same height as the data, so
+    a wrong amplitude or baseline was invisible on screen.
+    """
+    ref = data if reference is None else reference
+    lo, hi = float(np.min(ref)), float(np.max(ref))
     rng = hi - lo if hi != lo else 1.0
     return (data - lo) / rng * span * fraction
+
+
+def _profile_traces(
+    bp: BeamProfiler,
+    image: np.ndarray,
+    popt_x: np.ndarray | list[Any] | None,
+    popt_y: np.ndarray | list[Any] | None,
+    *,
+    xrange: list[float] | None,
+    yrange: list[float] | None,
+    line_colour: str,
+    fill_x: str,
+    fill_y: str,
+) -> list[Any]:
+    """The X and Y profiles, and their fits, for :func:`build_figure`."""
+    h, w = image.shape
+    ps = bp.pixel_size
+    x_max, y_max = w * ps, h * ps
+    traces: list[Any] = []
+
+    # ── Where the profiles go ───────────────────────────────────
+    # Each profile hugs an edge of whatever is in view -- the X projection
+    # the bottom, the Y projection the left -- and takes a fraction of the
+    # view, not of the sensor. Pinned to the sensor's own edges, as they
+    # used to be, they were left behind by any zoom: after Auto-fit none of
+    # either curve was on screen. When the view extends past the sensor the
+    # profile stays on the sensor's edge, where its fill ends.
+    view_x = xrange if xrange is not None else [0.0, x_max]
+    view_y = yrange if yrange is not None else [0.0, y_max]
+    x_base, x_span = max(view_y[0], 0.0), view_y[1] - view_y[0]
+    y_base, y_span = max(view_x[0], 0.0), view_x[1] - view_x[0]
+
+    # ── The profiles to draw ────────────────────────────────────
+    # Whatever the fit was run on, which analyze() caches: the projections,
+    # or in linecut mode the row and column through the peak. Drawing the
+    # full-frame sums there put the fit of one row over the projection of the
+    # whole frame -- on a tilted beam a 575 um curve under a 327 um fit.
+    cached_proj_x = getattr(bp, "_last_proj_x", None)
+    cached_proj_y = getattr(bp, "_last_proj_y", None)
+    proj_x = (cached_proj_x if cached_proj_x is not None else np.sum(image, axis=0)).astype(float)
+    proj_y = (cached_proj_y if cached_proj_y is not None else np.sum(image, axis=1)).astype(float)
+
+    # ── X profile (bottom edge) ─────────────────────────────────
+    x_ax = np.arange(w)
+    norm_x = x_base + _normalize_profile(proj_x, x_span)
+
+    traces.append(
+        go.Scatter(
+            x=x_ax * ps,
+            y=norm_x,
+            mode="lines",
+            line=dict(color=line_colour, width=1.5),
+            fill="tozeroy",
+            fillcolor=fill_x,
+            showlegend=False,
+            hoverinfo="skip",
+        )
+    )
+    if popt_x is not None:
+        fit_x = bp.gaussian(x_ax, *popt_x).astype(float)
+        norm_fit_x = x_base + _normalize_profile(fit_x, x_span, reference=proj_x)
+        traces.append(
+            go.Scatter(
+                x=x_ax * ps,
+                y=norm_fit_x,
+                mode="lines",
+                line=dict(color="#FF4444", width=2),
+                showlegend=False,
+                hoverinfo="skip",
+            )
+        )
+
+    # ── Y profile (left edge) ──────────────────────────────────
+    y_ax = np.arange(h)
+    norm_y = y_base + _normalize_profile(proj_y, y_span)
+
+    traces.append(
+        go.Scatter(
+            x=norm_y,
+            y=y_ax * ps,
+            mode="lines",
+            line=dict(color=line_colour, width=1.5),
+            fill="tozerox",
+            fillcolor=fill_y,
+            showlegend=False,
+            hoverinfo="skip",
+        )
+    )
+    if popt_y is not None:
+        fit_y = bp.gaussian(y_ax, *popt_y).astype(float)
+        norm_fit_y = y_base + _normalize_profile(fit_y, y_span, reference=proj_y)
+        traces.append(
+            go.Scatter(
+                x=norm_fit_y,
+                y=y_ax * ps,
+                mode="lines",
+                line=dict(color="#FF4444", width=2),
+                showlegend=False,
+                hoverinfo="skip",
+            )
+        )
+
+    return traces
 
 
 def build_figure(
@@ -919,7 +267,9 @@ def build_figure(
 
     The X projection is drawn along the bottom edge and the Y projection
     along the left edge, similar to LaseView.  Returns an empty figure
-    when *image* is ``None``.
+    when *image* is ``None``. With the profiler's heatmap-only flag set
+    (``--heatmap-only``) the profiles and their fits are left out; the
+    heatmap, the beam ellipse and the linecut crosshair stay.
 
     Args:
         bp: BeamProfiler instance (used for pixel size and cached projections).
@@ -948,7 +298,7 @@ def build_figure(
     x_max = w * ps
     y_max = h * ps
 
-    fig = go.Figure()
+    traces: list[Any] = []
 
     # ── Heatmap ─────────────────────────────────────────────────
     heat_kwargs: dict[str, Any] = {
@@ -963,13 +313,18 @@ def build_figure(
         heat_kwargs["zmin"] = zmin
     if zmax is not None:
         heat_kwargs["zmax"] = zmax
-    fig.add_trace(go.Heatmap(**heat_kwargs))
+    traces.append(go.Heatmap(**heat_kwargs))
 
     # ── Linecut crosshairs ──────────────────────────────────────
-    if bp.fit_method == "linecut" and hasattr(bp, "_linecut_x") and hasattr(bp, "_linecut_y"):
-        lx, ly = bp._linecut_x * ps, bp._linecut_y * ps
+    # Only where the last frame was actually cut: the coordinates are absent
+    # or None before the first linecut, and after any frame that was not one
+    # (another fit method, or FWHM/D4σ, which skip the fit altogether).
+    cut_x = getattr(bp, "_linecut_x", None)
+    cut_y = getattr(bp, "_linecut_y", None)
+    if bp.fit_method == "linecut" and cut_x is not None and cut_y is not None:
+        lx, ly = cut_x * ps, cut_y * ps
         for xs, ys in [([lx, lx], [0, y_max]), ([0, x_max], [ly, ly])]:
-            fig.add_trace(
+            traces.append(
                 go.Scatter(
                     x=xs,
                     y=ys,
@@ -983,7 +338,7 @@ def build_figure(
     # ── Ellipse overlay ─────────────────────────────────────────
     ellipse = bp._ellipse_points()
     if ellipse is not None:
-        fig.add_trace(
+        traces.append(
             go.Scatter(
                 x=ellipse[0],
                 y=ellipse[1],
@@ -1010,148 +365,58 @@ def build_figure(
         bg_paper = "#ffffff"
         fg = "#333"
 
-    # ── X profile (bottom edge) ─────────────────────────────────
-    x_ax = np.arange(w)
-    cached_proj_x = getattr(bp, "_last_proj_x", None)
-    proj_x = (cached_proj_x if cached_proj_x is not None else np.sum(image, axis=0)).astype(float)
-    norm_x = _normalize_profile(proj_x, y_max)
-
-    fig.add_trace(
-        go.Scatter(
-            x=x_ax * ps,
-            y=norm_x,
-            mode="lines",
-            line=dict(color=prof_line, width=1.5),
-            fill="tozeroy",
-            fillcolor=fill_x,
-            showlegend=False,
-            hoverinfo="skip",
-        )
-    )
-    if popt_x is not None:
-        fit_x = bp.gaussian(x_ax, *popt_x).astype(float)
-        norm_fit_x = _normalize_profile(fit_x, y_max)
-        fig.add_trace(
-            go.Scatter(
-                x=x_ax * ps,
-                y=norm_fit_x,
-                mode="lines",
-                line=dict(color="#FF4444", width=2),
-                showlegend=False,
-                hoverinfo="skip",
-            )
-        )
-
-    # ── Y profile (left edge) ──────────────────────────────────
-    y_ax = np.arange(h)
-    cached_proj_y = getattr(bp, "_last_proj_y", None)
-    proj_y = (cached_proj_y if cached_proj_y is not None else np.sum(image, axis=1)).astype(float)
-    norm_y = _normalize_profile(proj_y, x_max)
-
-    fig.add_trace(
-        go.Scatter(
-            x=norm_y,
-            y=y_ax * ps,
-            mode="lines",
-            line=dict(color=prof_line, width=1.5),
-            fill="tozerox",
-            fillcolor=fill_y,
-            showlegend=False,
-            hoverinfo="skip",
-        )
-    )
-    if popt_y is not None:
-        fit_y = bp.gaussian(y_ax, *popt_y).astype(float)
-        norm_fit_y = _normalize_profile(fit_y, x_max)
-        fig.add_trace(
-            go.Scatter(
-                x=norm_fit_y,
-                y=y_ax * ps,
-                mode="lines",
-                line=dict(color="#FF4444", width=2),
-                showlegend=False,
-                hoverinfo="skip",
+    # ── Profiles ────────────────────────────────────────────────
+    # Heatmap-only mode (--heatmap-only) leaves the curves out. The flag used
+    # to be stored and then ignored here, so it changed nothing in the GUI.
+    # Checked with ``is True`` because an unknown attribute on the profiler
+    # is looked up on the camera, and a mock camera's would be truthy.
+    if getattr(bp, "_heatmap_only", False) is not True:
+        traces.extend(
+            _profile_traces(
+                bp,
+                image,
+                popt_x,
+                popt_y,
+                xrange=xrange,
+                yrange=yrange,
+                line_colour=prof_line,
+                fill_x=fill_x,
+                fill_y=fill_y,
             )
         )
 
     # ── Layout ──────────────────────────────────────────────────
-    fig.update_layout(
-        uirevision="constant",
-        autosize=True,
-        showlegend=False,
-        margin=dict(l=30, r=5, t=5, b=30),
-        plot_bgcolor=bg_plot,
-        paper_bgcolor=bg_paper,
-        font_color=fg,
-        yaxis=dict(
-            scaleanchor="x",
-            scaleratio=1,
-            range=yrange if yrange is not None else [0, y_max],
-            showgrid=False,
-            title="Y (μm)",
-            title_font_size=11,
-        ),
-        xaxis=dict(
-            constrain="domain",
-            range=xrange if xrange is not None else [0, x_max],
-            showgrid=False,
-            title="X (μm)",
-            title_font_size=11,
-        ),
-    )
+    # Built as a plain dict and handed to the Figure constructor rather than
+    # applied with update_layout(). update_layout parses every nested key as
+    # a magic-underscore path and re-validates the whole tree, which costs
+    # more than everything else in this function combined; the constructor
+    # produces byte-identical JSON for ~2.6x less work.
+    layout = {
+        "uirevision": "constant",
+        "autosize": True,
+        "showlegend": False,
+        "margin": {"l": 30, "r": 5, "t": 5, "b": 30},
+        "plot_bgcolor": bg_plot,
+        "paper_bgcolor": bg_paper,
+        "font_color": fg,
+        "yaxis": {
+            "scaleanchor": "x",
+            "scaleratio": 1,
+            "range": yrange if yrange is not None else [0, y_max],
+            "showgrid": False,
+            "title": "Y (μm)",
+            "title_font_size": 11,
+        },
+        "xaxis": {
+            "constrain": "domain",
+            "range": xrange if xrange is not None else [0, x_max],
+            "showgrid": False,
+            "title": "X (μm)",
+            "title_font_size": 11,
+        },
+    }
 
-    return fig
-
-
-def _format_results(bp: BeamProfiler) -> list[Any]:
-    """Format fitted beam parameters for the results panel."""
-    rows: list[Any] = []
-
-    def _row(label: str, val: float) -> Any:
-        return html.Div(
-            [html.Span(f"{label}: ", className="text-muted"), html.Span(f"{val:.1f} μm")],
-            className="mb-1",
-        )
-
-    if bp.width_x > 0:
-        rows.append(_row("FW@1/e² X", bp.fw_1e2_x))
-        rows.append(_row("FW@1/e² Y", bp.fw_1e2_y))
-        rows.append(_row("FW@1/e X", bp.fw_1e_x))
-        rows.append(_row("FW@1/e Y", bp.fw_1e_y))
-        rows.append(_row("FWHM X", bp.fwhm_x))
-        rows.append(_row("FWHM Y", bp.fwhm_y))
-
-        rows.append(html.Hr(className="my-1"))
-        ps = bp.pixel_size
-        rows.append(
-            html.Div(
-                [
-                    html.Span("Center: ", className="text-muted"),
-                    html.Span(f"({bp.center_x * ps:.1f}, {bp.center_y * ps:.1f}) μm"),
-                ],
-                className="mb-1",
-            )
-        )
-        rows.append(
-            html.Div(
-                [html.Span("Peak: ", className="text-muted"), html.Span(f"{bp.peak_value:.0f}")],
-                className="mb-1",
-            )
-        )
-        if bp.fit_method == "2d":
-            rows.append(
-                html.Div(
-                    [
-                        html.Span("Angle: ", className="text-muted"),
-                        html.Span(f"{bp.angle_deg:.1f}°"),
-                    ],
-                    className="mb-1",
-                )
-            )
-    else:
-        rows.append(html.Span("No fit data", className="text-muted"))
-
-    return rows
+    return go.Figure(data=traces, layout=layout)
 
 
 # ---------------------------------------------------------------------------
@@ -1179,6 +444,10 @@ def create_app(bp: BeamProfiler) -> dash.Dash:
         # (otherwise the "Dash is running on..." banner appears twice -- once
         # from Dash's handler and once propagated to the root logger).
         add_log_handler=False,
+        # The Setting panel is rebuilt from scratch every time the camera
+        # changes, so the ids its callbacks target are not all present in the
+        # initial layout. Without this Dash refuses to register them.
+        suppress_callback_exceptions=True,
     )
 
     app.index_string = """<!DOCTYPE html>
@@ -1215,84 +484,56 @@ window.addEventListener('load', function() {
         initial_img = bp.last_img
 
     if initial_img is not None:
-        popt_x, popt_y = bp.analyze(initial_img)
-        initial_fig = build_figure(bp, initial_img, popt_x, popt_y)
-    else:
-        initial_fig = go.Figure()
+        bp.analyze(initial_img)
+        # Kept so the first page load has a frame to show; the page is built
+        # from the profiler's state (see _serve_page).
+        bp.last_img = initial_img
 
     # ── Layout ──────────────────────────────────────────────────
-    # The two-column split is implemented with explicit pixel widths so a
-    # draggable divider (``#col-divider``) can resize them on the client.
-    # Defaults match the original 75/25% Bootstrap row.
-    app.layout = html.Div(
-        [
-            html.Div(
-                [
-                    html.Div(
-                        dcc.Graph(
-                            id="live-graph",
-                            figure=initial_fig,
-                            style={"height": "100vh"},
-                            config={"responsive": True, "displaylogo": False},
-                        ),
-                        id="col-graph",
-                        style={"flex": "1 1 0", "minWidth": "200px", "overflow": "hidden"},
-                    ),
-                    html.Div(
-                        id="col-divider",
-                        title="Drag to resize",
-                        style={
-                            "width": "5px",
-                            "cursor": "col-resize",
-                            "backgroundColor": "#444",
-                            "flex": "0 0 5px",
-                        },
-                    ),
-                    html.Div(
-                        [
-                            html.H6(
-                                "pyBeamprofiler",
-                                className="text-center mb-2 mt-1 fw-bold",
-                            ),
-                            dbc.Tabs(
-                                [
-                                    _fitting_tab(bp),
-                                    _setting_tab(bp),
-                                ],
-                                id="tabs",
-                                active_tab="tab-fitting",
-                            ),
-                            html.Div(
-                                id="status-bar",
-                                className="small text-muted text-center mt-2",
-                            ),
-                        ],
-                        id="col-side",
-                        className="ps-1",
-                        style={
-                            "flex": "0 0 320px",
-                            "minWidth": "240px",
-                            "maxWidth": "60%",
-                            "height": "100vh",
-                            "overflowY": "auto",
-                        },
-                    ),
-                ],
-                style={"display": "flex", "width": "100%", "height": "100vh"},
-            ),
-            dcc.Interval(id="interval", interval=DEFAULT_UPDATE_INTERVAL_MS, n_intervals=0),
-            dcc.Store(id="store-paused", data=False),
-            dcc.Store(id="store-frame", data=0),
-            dcc.Store(id="store-dark-theme", data=True),
-            dcc.Download(id="download-png"),
-            dcc.Download(id="download-npy"),
-        ],
-        id="main-container",
-        style={"backgroundColor": "#222"},
-    )
+    # One enumeration at start-up, shared by the dropdown and the cache the
+    # switch callback resolves against. Scanning twice would double a
+    # multi-second GenTL walk on a machine with hardware attached.
+    camera_options, _ = _camera_options(bp)
+
+    # A function rather than a component tree, so Dash builds the page for
+    # each load. A tree built here kept serving the start-up state: after a
+    # camera switch, a reloaded page named the old camera and pixel pitch
+    # and offered Pause on a stopped stream -- and merely tabbing out of the
+    # Scale box wrote the stale pitch back into the profiler.
+    app.layout = functools.partial(_serve_page, bp)
 
     _register_callbacks(app, bp)
+    # Seeded only now: _register_callbacks clears the module state, this
+    # cache included, so filling it any earlier leaves it empty and every
+    # camera switch falls back to a full rescan with the lock held.
+    global _known_options  # noqa: PLW0603
+    _known_options = camera_options
     return app
+
+
+def _serve_page(bp: BeamProfiler) -> Any:
+    """Build the page from what is in force right now.
+
+    Runs on every page load, under the lock: the Setting panel reads the
+    camera's node map, and the figure and the controls read profiler state
+    that a callback might be replacing.
+    """
+    with _callback_lock:
+        options, current = _with_open_camera(bp, _known_options)
+        figure: Any = go.Figure()
+        results = None
+        if bp.last_img is not None:
+            xrange, yrange = _zoom_in_um(bp)
+            figure = build_figure(
+                bp,
+                bp.last_img,
+                bp._last_popt_x,
+                bp._last_popt_y,
+                xrange=xrange,
+                yrange=yrange,
+            )
+            results = _format_results(bp)
+        return _page(bp, figure, options, current, paused=_server_paused, results=results)
 
 
 # ---------------------------------------------------------------------------
@@ -1313,12 +554,113 @@ _avg_buffer: collections.deque[np.ndarray] = collections.deque(maxlen=1)
 _avg_buffer_shape: tuple[int, ...] | None = None
 _avg_running_sum: np.ndarray | None = None
 
-# Authoritative zoom state, mutated by Auto-fit / Reset under
-# ``_callback_lock`` and read by ``update_live``. Using a module
-# variable (rather than a Dash ``State``) avoids a 50–100 ms
-# stale-snapshot race that would otherwise blink the previous zoom
-# for one frame whenever a click landed mid-tick.
+# The camera list currently shown in the dropdown. Populated when the
+# selector is built and refreshed by the rescan button, so switching cameras
+# does not have to re-enumerate: a GenTL scan opens every producer and walks
+# the network, which takes seconds on a GigE setup and would block the render
+# loop for the whole switch.
+_known_options: list[CameraOption] = []
+
+# Authoritative zoom state, in sensor *pixels*, mutated by Auto-fit, Reset
+# and mouse zooms under ``_callback_lock`` and read by ``update_live``. Using
+# a module variable (rather than a Dash ``State``) avoids a 50–100 ms
+# stale-snapshot race that would otherwise blink the previous zoom for one
+# frame whenever a click landed mid-tick. Pixels rather than micrometres so
+# that correcting the pixel scale keeps the same part of the sensor in view;
+# a box stored in micrometres framed a different region after the change.
 _zoom_range: dict[str, list[float]] | None = None
+
+
+def _zoom_in_um(bp: BeamProfiler) -> tuple[list[float] | None, list[float] | None]:
+    """The current zoom as ``(xrange, yrange)`` in micrometres, or Nones.
+
+    The caller must hold ``_callback_lock``.
+    """
+    if _zoom_range is None:
+        return None, None
+    ps = bp.pixel_size
+    return [v * ps for v in _zoom_range["x"]], [v * ps for v in _zoom_range["y"]]
+
+
+def _zoom_after_relayout(
+    relayout: dict[str, Any],
+    zoom: dict[str, list[float]] | None,
+    frame_shape: tuple[int, ...] | None,
+    pixel_size: float,
+) -> dict[str, list[float]] | None:
+    """Fold a Plotly ``relayoutData`` event into the zoom, in pixels.
+
+    A box zoom or pan reports ``xaxis.range[0]``/``[1]`` (sometimes a
+    ``xaxis.range`` pair) for the axes it moved, and the modebar's autoscale
+    reports ``autorange``. An axis the event doesn't mention keeps its current
+    range. Anything else -- ``autosize`` on a resize, a mode change -- leaves
+    the zoom as it was.
+
+    Returns:
+        The new zoom, or ``None`` for the full frame.
+    """
+
+    def axis(name: str) -> list[float] | None:
+        pair: Any = relayout.get(f"{name}.range")
+        if pair is None:
+            pair = (relayout.get(f"{name}.range[0]"), relayout.get(f"{name}.range[1]"))
+        if len(pair) != 2 or pair[0] is None or pair[1] is None:
+            return None
+        return sorted([float(pair[0]) / pixel_size, float(pair[1]) / pixel_size])
+
+    if relayout.get("xaxis.autorange") or relayout.get("yaxis.autorange"):
+        return None
+    x, y = axis("xaxis"), axis("yaxis")
+    if (x is None and y is None) or frame_shape is None:
+        return zoom
+    full = {"x": [0.0, float(frame_shape[1])], "y": [0.0, float(frame_shape[0])]}
+    new = {"x": x or list((zoom or full)["x"]), "y": y or list((zoom or full)["y"])}
+    # A double-click reports the full extent as explicit ranges rather than
+    # as autorange. Treat that as no zoom, so the view keeps following the
+    # frame's own extent.
+    if np.allclose(new["x"], full["x"], atol=0.5) and np.allclose(new["y"], full["y"], atol=0.5):
+        return None
+    return new
+
+
+# Consecutive ticks on which the camera raised something other than a
+# timeout. After _MAX_CAMERA_FAILURES in a row the stream is paused: a device
+# that has gone away does not come back for being asked twenty times a
+# second, and each of those attempts used to log a full traceback while the
+# page went on showing the last good frame as if nothing had happened.
+_camera_failures = 0
+_MAX_CAMERA_FAILURES = 10
+
+# The last error a render tick logged and when, plus how many repeats have
+# been held back since, so a persistent fault is reported every so often
+# rather than on every tick.
+_last_tick_error: tuple[str, float] | None = None
+_suppressed_tick_errors = 0
+_TICK_ERROR_LOG_INTERVAL_S = 10.0
+
+
+def _error_status(message: str) -> Any:
+    """A status-bar line that reports *message* as an error."""
+    return html.Span(
+        [html.I(className="bi bi-exclamation-triangle-fill me-1"), message],
+        className="text-danger fw-bold",
+    )
+
+
+def _log_tick_error(message: str, exc: BaseException) -> None:
+    """Log a render-tick failure, at most once an interval while it repeats."""
+    global _last_tick_error, _suppressed_tick_errors  # noqa: PLW0603
+    now = time.monotonic()
+    if _last_tick_error is not None:
+        last_message, last_time = _last_tick_error
+        if last_message == message and now - last_time < _TICK_ERROR_LOG_INTERVAL_S:
+            _suppressed_tick_errors += 1
+            return
+    repeats = _suppressed_tick_errors
+    note = f" (repeated {repeats} times since last logged)" if repeats else ""
+    logger.error("%s%s", message, note, exc_info=exc)
+    _last_tick_error = (message, now)
+    _suppressed_tick_errors = 0
 
 
 def _measured_fps() -> float:
@@ -1331,8 +673,20 @@ def _measured_fps() -> float:
     return (len(_recent_frame_times) - 1) / span
 
 
-def _build_status(bp: BeamProfiler, img: np.ndarray, frame_count: int) -> Any:
-    """Build the status bar contents (frame, fps, exposure, gain, saturation)."""
+def _build_status(
+    bp: BeamProfiler, img: np.ndarray, frame_count: int, raw: np.ndarray | None = None
+) -> Any:
+    """Build the status bar contents (frame, fps, exposure, gain, saturation).
+
+    Args:
+        bp: The profiler, read for the camera's exposure, gain and bit depth.
+        img: The frame as displayed.
+        frame_count: Frames shown so far.
+        raw: The frame as the camera delivered it, if *img* is an average.
+            Saturation is judged on this one: the beam jitters, so a core
+            clipped in every raw frame rarely stays at the maximum in all of
+            them, and the averaged frame hid the clipping entirely.
+    """
     pieces: list[Any] = [f"Frame #{frame_count}"]
 
     fps = _measured_fps()
@@ -1354,7 +708,9 @@ def _build_status(bp: BeamProfiler, img: np.ndarray, frame_count: int) -> Any:
             children.append(html.Span(" · ", className="text-muted mx-1"))
         children.append(html.Span(p))
 
-    sat = _saturation_fraction(img)
+    frame = img if raw is None else raw
+    level = _saturation_max(frame, _camera_bit_depth(bp))
+    sat = _saturation_fraction(frame, level)
     if sat >= _SATURATION_PIXEL_FRACTION:
         children.append(html.Span(" · ", className="text-muted mx-1"))
         children.append(
@@ -1366,12 +722,51 @@ def _build_status(bp: BeamProfiler, img: np.ndarray, frame_count: int) -> Any:
                 className="text-danger fw-bold",
                 title=(
                     f"{sat * 100:.2f}% of pixels reached the saturation level "
-                    f"({_saturation_max(img):.0f}). Reduce exposure or gain."
+                    f"({level:.0f}). Reduce exposure or gain."
                 ),
             )
         )
 
     return children
+
+
+def _png_bytes(image: np.ndarray) -> bytes:
+    """Encode a frame as a greyscale PNG without wrapping or clipping it.
+
+    uint8 and uint16 frames, which is everything a camera delivers (averaged
+    or not), are written exactly as 8- and 16-bit greyscale. Anything else
+    came from a file: integers that fit 0..65535 are written exactly as 16
+    bit, and wider integers and floats are scaled linearly onto the 16-bit
+    range -- their shape survives but not their units, which the .npy
+    download keeps. Handed straight to Pillow, a float frame could not be
+    written at all ("cannot write mode F as PNG") and a 32-bit one was
+    silently clipped at 65535.
+    """
+    if image.dtype in (np.uint8, np.uint16):
+        data = image
+    elif image.dtype == np.bool_:
+        data = image.astype(np.uint8) * 255
+    elif (
+        np.issubdtype(image.dtype, np.integer)
+        and image.size
+        and image.min() >= 0
+        and image.max() <= np.iinfo(np.uint16).max
+    ):
+        data = image.astype(np.uint16)
+    else:
+        values = image.astype(np.float64)
+        finite = np.isfinite(values)
+        if finite.any():
+            lo, hi = float(values[finite].min()), float(values[finite].max())
+            values[~finite] = lo
+        else:
+            lo = hi = 0.0
+            values[:] = 0.0
+        scale = 65535.0 / (hi - lo) if hi > lo else 0.0
+        data = np.rint((values - lo) * scale).astype(np.uint16)
+    buf = io.BytesIO()
+    Image.fromarray(data).save(buf, format="PNG")
+    return buf.getvalue()
 
 
 def _reset_avg_state() -> None:
@@ -1398,7 +793,7 @@ def _averaged_image(image: np.ndarray, n: int) -> np.ndarray:
     """
     global _avg_buffer, _avg_buffer_shape, _avg_running_sum  # noqa: PLW0603
 
-    n = max(1, min(int(n), _MAX_AVG_FRAMES))
+    n = max(1, min(int(n), MAX_AVG_FRAMES))
     if n == 1:
         if _avg_buffer.maxlen != 1:
             _avg_buffer = collections.deque(maxlen=1)
@@ -1431,11 +826,184 @@ def _averaged_image(image: np.ndarray, n: int) -> np.ndarray:
     return mean.astype(image.dtype)
 
 
+def _discard_frame_history(bp: BeamProfiler) -> None:
+    """Forget everything measured from frames the next frame won't match.
+
+    Needed whenever the coordinate system of the frames changes under us: an
+    ROI moves the origin and usually the shape, and a camera switch changes
+    both along with the pixel pitch. The fitter warm-starts from the previous
+    frame, so a centre measured before the change seeds the next fit outside
+    the new frame; the averaging buffer would blend two different windows;
+    the zoom box would frame the wrong region; and the fps window would span
+    two different frame sizes.
+
+    The caller must hold ``_callback_lock``.
+    """
+    global _zoom_range  # noqa: PLW0603
+    bp.reset_analysis()
+    _reset_avg_state()
+    _recent_frame_times.clear()
+    _zoom_range = None
+
+
+def _paired_values(requested: Any, actual: Any, *, from_slider: bool) -> tuple[Any, Any]:
+    """``(slider, box)`` outputs after a write that may not have stuck as asked.
+
+    The control that was not touched always shows *actual*, the value read
+    back from the device. The one that was touched is left alone when the
+    device took the value as given -- echoing it back only costs a redraw --
+    and corrected when the device clamped, quantised or refused it. Echoing
+    the request unconditionally, as this used to, showed values the camera
+    did not have.
+    """
+    if actual is None:
+        actual = requested
+    took = actual == requested or (
+        isinstance(actual, (int, float))
+        and isinstance(requested, (int, float))
+        and np.isclose(actual, requested, rtol=1e-9, atol=1e-9)
+    )
+    touched = dash.no_update if took else actual
+    return (touched, actual) if from_slider else (actual, touched)
+
+
 def _register_callbacks(app: dash.Dash, bp: BeamProfiler) -> None:
-    """Wire up all Dash callbacks."""
-    global _server_paused, _zoom_range  # noqa: PLW0603
+    """Wire up all Dash callbacks, and reset the state they share.
+
+    The state is module-level, so every app built in this process sees it.
+    Without the reset a second ``create_app`` -- a test, or a notebook that
+    relaunches the GUI -- would inherit the previous session's pause flag,
+    zoom, fps window and averaged frames.
+    """
+    global _known_options, _server_paused, _zoom_range, _camera_failures  # noqa: PLW0603
+    global _last_tick_error, _suppressed_tick_errors  # noqa: PLW0603
     _server_paused = False
     _zoom_range = None
+    _known_options = []
+    _reset_avg_state()
+    _recent_frame_times.clear()
+    _camera_failures = 0
+    _last_tick_error = None
+    _suppressed_tick_errors = 0
+
+    # -- Camera selection -----------------------------------------------------
+    # Rescanning and switching both take ``_callback_lock``: swapping the
+    # camera out from under an in-flight ``ia.fetch`` would hand the
+    # Harvesters C library a destroyed acquirer, which segfaults rather than
+    # raising.
+
+    def _settings_body(items: list[Any]) -> Any:
+        """Wrap freshly built accordion items, or say why there are none."""
+        if items:
+            return dbc.Accordion(items, start_collapsed=False, always_open=True)
+        return html.P("No camera connected.", className="text-muted p-3")
+
+    @app.callback(
+        Output("dropdown-camera", "options"),
+        Output("dropdown-camera", "value"),
+        Output("div-camera-status", "children", allow_duplicate=True),
+        Input("btn-camera-refresh", "n_clicks"),
+        prevent_initial_call=True,
+    )
+    def refresh_cameras(_n: int | None) -> tuple[Any, Any, Any]:
+        """Rescan for connected cameras and repopulate the dropdown.
+
+        Enumeration runs under ``_callback_lock``, so the live view freezes
+        for as long as it takes. That is deliberate: a GenTL rescan can take a
+        second or two on a GigE network, and doing it concurrently with an
+        in-flight fetch is exactly the kind of thing the Harvesters C library
+        is unhappy about. A rescan is an explicit click, so a brief pause is
+        the right trade against a crash.
+        """
+        global _known_options  # noqa: PLW0603
+        with _callback_lock:
+            options, current = _camera_options(bp)
+            # What the dropdown now offers is what a switch resolves against.
+            _known_options = options
+        listed = [{"label": o.label, "value": o.key} for o in options]
+        real = sum(1 for o in options if not o.is_simulated)
+        if real:
+            status = f"{real} camera{'s' if real != 1 else ''} found"
+        else:
+            status = "No hardware found - simulated only"
+        return listed, current, status
+
+    @app.callback(
+        Output("div-camera-status", "children"),
+        Output("store-paused", "data", allow_duplicate=True),
+        Output("btn-play-pause", "children", allow_duplicate=True),
+        Output("btn-play-pause", "color", allow_duplicate=True),
+        Output("settings-container", "children", allow_duplicate=True),
+        Output("input-pixel-scale", "value", allow_duplicate=True),
+        Output("dropdown-camera", "value", allow_duplicate=True),
+        Input("dropdown-camera", "value"),
+        prevent_initial_call=True,
+    )
+    def switch_camera(key: str | None) -> tuple[Any, ...]:
+        """Open the selected camera and hand the profiler over to it.
+
+        The new camera is opened *before* the old one is closed, so a device
+        that is unplugged or already claimed by another application leaves the
+        current stream untouched instead of dropping the user into a dead app.
+
+        Streaming is left paused afterwards: the caller picked a camera, and
+        starting it is the next deliberate click.
+
+        When the switch fails, the selection goes back to the camera that is
+        still open. Left on the one that failed, the dropdown named the wrong
+        camera, and picking it again to retry could not fire at all: Dash only
+        calls back when the value changes.
+        """
+        global _server_paused, _camera_failures  # noqa: PLW0603
+        nothing = (dash.no_update,) * 7
+
+        if not key:
+            return nothing
+
+        with _callback_lock:
+            current = describe_open_camera(bp.camera).key if bp.camera is not None else ""
+            if key == current:
+                return nothing
+
+            def refuse(message: str) -> tuple[Any, ...]:
+                # Back to the open camera -- or to no selection, when a file
+                # is being shown and there is no camera open.
+                return (message, *(dash.no_update,) * 5, current)
+
+            # Resolve against what the dropdown last offered. Re-running
+            # discovery here would put a multi-second GenTL enumeration on the
+            # critical path of every switch, with _callback_lock held.
+            option = find_option(key, _known_options)
+            if option is None:
+                option = find_option(key, _camera_options(bp)[0])
+            if option is None:
+                return refuse(f"Unknown camera: {key}")
+
+            try:
+                camera = open_camera(option)
+            except Exception as e:
+                logger.warning("Could not switch to %s: %s", option.label, e)
+                # open_camera's message already names the camera.
+                return refuse(str(e) or f"Could not open {option.label}")
+
+            bp.attach_camera(camera)
+            _discard_frame_history(bp)
+            _server_paused = True
+            _camera_failures = 0
+
+            items = _build_setting_items(bp)
+            scale = round(bp.pixel_size, 4)
+
+        button_children, button_color = _play_pause_face(True)
+        return (
+            f"{option.label} ready - press Play",
+            True,
+            button_children,
+            button_color,
+            _settings_body(items),
+            scale,
+            dash.no_update,
+        )
 
     # -- Play / Pause toggle --------------------------------------------------
     @app.callback(
@@ -1443,13 +1011,25 @@ def _register_callbacks(app: dash.Dash, bp: BeamProfiler) -> None:
         Output("btn-play-pause", "children"),
         Output("btn-play-pause", "color"),
         Output("settings-container", "children"),
+        Output("status-bar", "children", allow_duplicate=True),
         Input("btn-play-pause", "n_clicks"),
         State("store-paused", "data"),
         prevent_initial_call=True,
     )
-    def toggle_pause(n: int, paused: bool) -> tuple[bool, list[Any], str, Any]:
-        global _server_paused  # noqa: PLW0603
+    def toggle_pause(n: int, paused: bool) -> tuple[Any, ...]:
+        """Start or stop streaming, and relabel the button to match.
+
+        Also rebuilds the Setting panel: values the camera changed on its
+        own while running (auto-exposure, temperature) are only worth
+        re-reading when the stream is not competing for the lock.
+
+        A camera that refuses to start leaves the stream paused, with the
+        reason in the status bar, rather than failing the callback and
+        leaving the button and the server disagreeing about the state.
+        """
+        global _server_paused, _camera_failures  # noqa: PLW0603
         new_paused = not paused
+        status: Any = dash.no_update
 
         with _callback_lock:
             _server_paused = new_paused
@@ -1457,25 +1037,24 @@ def _register_callbacks(app: dash.Dash, bp: BeamProfiler) -> None:
                 if new_paused:
                     bp.camera.stop_acquisition()
                 else:
-                    bp.camera.start_acquisition()
+                    try:
+                        bp.camera.start_acquisition()
+                    except Exception as e:
+                        logger.warning("Could not start the camera: %s", e)
+                        new_paused = _server_paused = True
+                        status = _error_status(
+                            f"Could not start the camera: {str(e) or type(e).__name__}"
+                        )
+            # Play is also the retry after the stream paused itself, so it
+            # starts a fresh count of camera failures.
+            _camera_failures = 0
             _recent_frame_times.clear()
             _reset_avg_state()
 
             items = _build_setting_items(bp)
 
-        if new_paused:
-            label = [html.I(className="bi bi-play-fill me-1"), "Play"]
-            color = "success"
-        else:
-            label = [html.I(className="bi bi-pause-fill me-1"), "Pause"]
-            color = "primary"
-
-        if items:
-            settings_body = dbc.Accordion(items, start_collapsed=False, always_open=True)
-        else:
-            settings_body = html.P("No camera connected.", className="text-muted p-3")
-
-        return new_paused, label, color, settings_body
+        label, color = _play_pause_face(new_paused)
+        return new_paused, label, color, _settings_body(items), status
 
     # -- Save current frame as PNG -------------------------------------------
     @app.callback(
@@ -1484,12 +1063,11 @@ def _register_callbacks(app: dash.Dash, bp: BeamProfiler) -> None:
         prevent_initial_call=True,
     )
     def save_frame_png(_n: int) -> dict[str, Any] | None:
+        """Download the current frame as a PNG."""
         img = bp.last_img
         if img is None:
             return None
-        buf = io.BytesIO()
-        Image.fromarray(img).save(buf, format="PNG")
-        b64 = base64.b64encode(buf.getvalue()).decode()
+        b64 = base64.b64encode(_png_bytes(img)).decode()
         ts = time.strftime("%Y%m%d_%H%M%S")
         return {
             "content": b64,
@@ -1504,6 +1082,11 @@ def _register_callbacks(app: dash.Dash, bp: BeamProfiler) -> None:
         prevent_initial_call=True,
     )
     def save_frame_npy(_n: int) -> dict[str, Any] | None:
+        """Download the current frame as a raw ``.npy`` array.
+
+        Unlike the PNG this keeps the original dtype, so 12- and 16-bit
+        sensor data survives for later analysis.
+        """
         img = bp.last_img
         if img is None:
             return None
@@ -1523,6 +1106,7 @@ def _register_callbacks(app: dash.Dash, bp: BeamProfiler) -> None:
         Input("switch-color", "value"),
     )
     def toggle_colorscale(color_on: bool) -> bool:
+        """Grey out the colorscale picker when colour is switched off."""
         return not color_on
 
     # -- Auto-range toggle disables min/max inputs ----------------------------
@@ -1532,6 +1116,7 @@ def _register_callbacks(app: dash.Dash, bp: BeamProfiler) -> None:
         Input("switch-autorange", "value"),
     )
     def toggle_autorange(auto: bool) -> tuple[bool, bool]:
+        """Grey out the manual min/max boxes while auto-range is on."""
         return auto, auto
 
     # -- Dark / Light theme toggle --------------------------------------------
@@ -1581,27 +1166,33 @@ def _register_callbacks(app: dash.Dash, bp: BeamProfiler) -> None:
         prevent_initial_call=True,
     )
     def auto_fit_zoom(n_clicks: int | None) -> Any:
+        """Zoom to a +/-3 sigma box around the fitted beam centre.
+
+        The fit is read under the lock along with the write. Reading it
+        outside let a camera switch land in between, leaving the new camera
+        zoomed onto where the old one's beam had been.
+        """
         global _zoom_range  # noqa: PLW0603
         if not n_clicks:
             return dash.no_update
-        popt_x = bp._last_popt_x
-        popt_y = bp._last_popt_y
-        if popt_x is None or popt_y is None:
-            return dash.no_update
-        ps = bp.pixel_size
-        cx, cy = popt_x[1] * ps, popt_y[1] * ps
-        # 1/e² semi-axis = 2σ.  Pad by 1.5× → ±3σ box around the beam.
-        rx, ry = 2 * abs(popt_x[2]) * ps, 2 * abs(popt_y[2]) * ps
-        pad = 1.5
-        zoom = {
-            "x": [cx - pad * rx, cx + pad * rx],
-            "y": [cy - pad * ry, cy + pad * ry],
-        }
         with _callback_lock:
-            _zoom_range = zoom
+            popt_x, popt_y = bp._last_popt_x, bp._last_popt_y
+            if popt_x is None or popt_y is None:
+                return dash.no_update
+            cx, cy = float(popt_x[1]), float(popt_y[1])
+            # 1/e² semi-axis = 2σ.  Pad by 1.5× → ±3σ box around the beam.
+            rx, ry = 2 * abs(float(popt_x[2])), 2 * abs(float(popt_y[2]))
+            if not np.all(np.isfinite([cx, cy, rx, ry])) or rx == 0 or ry == 0:
+                return dash.no_update
+            pad = 1.5
+            _zoom_range = {
+                "x": [cx - pad * rx, cx + pad * rx],
+                "y": [cy - pad * ry, cy + pad * ry],
+            }
+            xrange, yrange = _zoom_in_um(bp)
         patch = Patch()
-        patch["layout"]["xaxis"]["range"] = zoom["x"]
-        patch["layout"]["yaxis"]["range"] = zoom["y"]
+        patch["layout"]["xaxis"]["range"] = xrange
+        patch["layout"]["yaxis"]["range"] = yrange
         return patch
 
     @app.callback(
@@ -1610,18 +1201,43 @@ def _register_callbacks(app: dash.Dash, bp: BeamProfiler) -> None:
         prevent_initial_call=True,
     )
     def reset_zoom(n_clicks: int | None) -> Any:
+        """Zoom back out to the full sensor."""
         global _zoom_range  # noqa: PLW0603
         if not n_clicks:
             return dash.no_update
         with _callback_lock:
             _zoom_range = None
-        patch = Patch()
-        img = bp.last_img
-        if img is not None:
+            img = bp.last_img
             ps = bp.pixel_size
+        patch = Patch()
+        if img is not None:
             patch["layout"]["xaxis"]["range"] = [0, img.shape[1] * ps]
             patch["layout"]["yaxis"]["range"] = [0, img.shape[0] * ps]
         return patch
+
+    # -- Mouse zoom and pan ---------------------------------------------------
+    # No output: the zoom becomes part of the state every tick draws from.
+    @app.callback(
+        Input("live-graph", "relayoutData"),
+        prevent_initial_call=True,
+    )
+    def follow_mouse_zoom(relayout: dict[str, Any] | None) -> None:
+        """Adopt a zoom or pan made with the mouse, so the next frame keeps it.
+
+        The layout's ``uirevision`` is supposed to preserve this across figure
+        updates, and in Dash 4 it doesn't: right after the user zooms, the
+        Graph component re-plots its own figure with the zoomed range, Plotly
+        takes that as the app setting the range and forgets the user's edit,
+        and the next tick's explicit full-sensor range wins. A mouse zoom
+        lasted one frame. Recording it server-side makes it behave like
+        Auto-fit.
+        """
+        global _zoom_range  # noqa: PLW0603
+        if not relayout:
+            return
+        with _callback_lock:
+            shape = bp.last_img.shape if bp.last_img is not None else None
+            _zoom_range = _zoom_after_relayout(relayout, _zoom_range, shape, bp.pixel_size)
 
     # -- Draggable column divider (clientside) -------------------------------
     # Keeps the layout state purely in the DOM — no Dash store round-trip
@@ -1669,8 +1285,13 @@ def _register_callbacks(app: dash.Dash, bp: BeamProfiler) -> None:
         prevent_initial_call=True,
     )
     def set_pixel_scale(_n_submit: int | None, _n_blur: int | None, val: float | None) -> float:
+        """Override the pixel pitch used to convert pixels to micrometers."""
         if val is not None and val > 0:
-            bp.pixel_size = val
+            # build_figure reads pixel_size several times per frame (heatmap
+            # extent, ellipse, axis ranges). Changing it mid-render would
+            # leave those disagreeing for one frame.
+            with _callback_lock:
+                bp.pixel_size = val
         return round(bp.pixel_size, 4)
 
     # -- Exposure slider + input (kept in sync) -------------------------------
@@ -1682,10 +1303,18 @@ def _register_callbacks(app: dash.Dash, bp: BeamProfiler) -> None:
         prevent_initial_call=True,
     )
     def set_exposure(slider_val: float | None, input_val: float | None) -> tuple[Any, Any]:
+        """Apply an exposure change from either the slider or the box.
+
+        Both controls end up showing the exposure the camera reports after
+        the write, which is its clamped, quantised value -- or the old one,
+        if the write failed.
+        """
         trigger = ctx.triggered_id
-        val = slider_val if trigger == "slider-exposure" else input_val
+        from_slider = trigger == "slider-exposure"
+        val = slider_val if from_slider else input_val
         if val is None:
             return dash.no_update, dash.no_update
+        actual = None
         if bp.camera is not None:
             with _callback_lock:
                 try:
@@ -1696,13 +1325,12 @@ def _register_callbacks(app: dash.Dash, bp: BeamProfiler) -> None:
                     _recent_frame_times.clear()
                     _reset_avg_state()
                 except Exception as e:
-                    logger.warning(f"Failed to set exposure: {e}")
-        # Mirror the committed value to the *other* control only — echoing
-        # the triggering control would cause a pointless second callback
-        # round-trip and can jitter the slider thumb while the user drags.
-        if trigger == "slider-exposure":
-            return dash.no_update, val
-        return val, dash.no_update
+                    logger.warning("Failed to set exposure: %s", e)
+                exposure = bp.camera.exposure_time
+                # Rounded to the controls' 1 us step, so float noise in the
+                # read-back doesn't count as the camera changing the value.
+                actual = None if exposure is None else round(exposure * 1000.0, 3)
+        return _paired_values(val, actual, from_slider=from_slider)
 
     # -- Gain slider + input (kept in sync) -----------------------------------
     @app.callback(
@@ -1713,10 +1341,14 @@ def _register_callbacks(app: dash.Dash, bp: BeamProfiler) -> None:
         prevent_initial_call=True,
     )
     def set_gain(slider_val: float | None, input_val: float | None) -> tuple[Any, Any]:
+        """Apply a gain change from either the slider or the box, showing
+        the gain the camera reports afterwards (see set_exposure)."""
         trigger = ctx.triggered_id
-        val = slider_val if trigger == "slider-gain" else input_val
+        from_slider = trigger == "slider-gain"
+        val = slider_val if from_slider else input_val
         if val is None:
             return dash.no_update, dash.no_update
+        actual = None
         if bp.camera is not None:
             with _callback_lock:
                 try:
@@ -1727,170 +1359,183 @@ def _register_callbacks(app: dash.Dash, bp: BeamProfiler) -> None:
                     _recent_frame_times.clear()
                     _reset_avg_state()
                 except Exception as e:
-                    logger.warning(f"Failed to set gain: {e}")
-        if trigger == "slider-gain":
-            return dash.no_update, val
-        return val, dash.no_update
+                    logger.warning("Failed to set gain: %s", e)
+                actual = bp.camera.gain
+        return _paired_values(val, actual, from_slider=from_slider)
 
-    # -- ROI apply (conditional) ----------------------------------------------
-    has_roi = bp.camera is not None and hasattr(bp.camera, "set_roi")
-    if has_roi:
+    # -- ROI apply ------------------------------------------------------------
+    # Registered unconditionally: the attached camera can change at runtime,
+    # so whether one supports ROI is not a question that can be settled once
+    # at start-up. Each callback re-checks the live camera instead.
 
-        @app.callback(
-            Output("div-roi-status", "children"),
-            Input("btn-roi-apply", "n_clicks"),
-            State("input-roi-ox", "value"),
-            State("input-roi-oy", "value"),
-            State("input-roi-w", "value"),
-            State("input-roi-h", "value"),
-            prevent_initial_call=True,
+    @app.callback(
+        Output("div-roi-status", "children"),
+        Input("btn-roi-apply", "n_clicks"),
+        State("input-roi-ox", "value"),
+        State("input-roi-oy", "value"),
+        State("input-roi-w", "value"),
+        State("input-roi-h", "value"),
+        prevent_initial_call=True,
+    )
+    def apply_roi(_n: int, ox: int, oy: int, w: int, h: int) -> str:
+        """Apply the requested region of interest and report what stuck.
+
+        Cameras quantise ROI values to their own granularity, so the status
+        line reports what the device accepted, not what was asked for.
+        Stopping and restarting acquisition around the change is the
+        camera's job (``set_roi`` knows whether its device needs it), and a
+        rejection comes back as an exception whose message is shown as is.
+        """
+        if bp.camera is None:
+            return "No camera"
+        if ox is None or oy is None or w is None or h is None:
+            return "Please enter offset/width/height"
+        with _callback_lock:
+            try:
+                getattr(bp.camera, "set_roi")(
+                    offset_x=int(ox), offset_y=int(oy), width=int(w), height=int(h)
+                )
+                roi = getattr(bp.camera, "roi_info")
+            except Exception as e:
+                logger.warning("ROI not applied: %s", e)
+                return str(e) or type(e).__name__
+            finally:
+                # Even a rejected ROI may have been half applied (an offset
+                # accepted before the width was refused), so the old frames'
+                # coordinates can't be trusted either way.
+                _discard_frame_history(bp)
+        return f"ROI: {roi['width']}×{roi['height']} at ({roi['offset_x']},{roi['offset_y']})"
+
+    @app.callback(
+        Output("input-roi-ox", "value"),
+        Output("input-roi-oy", "value"),
+        Output("input-roi-w", "value"),
+        Output("input-roi-h", "value"),
+        Output("div-roi-status", "children", allow_duplicate=True),
+        Input("btn-roi-reset", "n_clicks"),
+        prevent_initial_call=True,
+    )
+    def reset_roi(_n: int) -> tuple[Any, ...]:
+        """Restore the full sensor and refresh the ROI boxes.
+
+        On failure the boxes are left alone. Writing zeros into them, as this
+        used to, set up the next Apply to request a 0×0 ROI.
+        """
+        unchanged = (dash.no_update,) * 4
+        if bp.camera is None:
+            return (*unchanged, "No camera")
+        with _callback_lock:
+            try:
+                getattr(bp.camera, "set_roi")(offset_x=0, offset_y=0, width=None, height=None)
+                roi = getattr(bp.camera, "roi_info")
+            except Exception as e:
+                logger.warning("Could not restore the full sensor: %s", e)
+                return (*unchanged, str(e) or type(e).__name__)
+            finally:
+                _discard_frame_history(bp)
+        return (
+            roi["offset_x"],
+            roi["offset_y"],
+            roi["width"],
+            roi["height"],
+            "Reset to full sensor",
         )
-        def apply_roi(_n: int, ox: int, oy: int, w: int, h: int) -> str:
-            if bp.camera is None:
-                return "No camera"
-            if ox is None or oy is None or w is None or h is None:
-                return "Please enter offset/width/height"
-            with _callback_lock:
-                try:
-                    offset_x = int(ox)
-                    offset_y = int(oy)
-                    width = int(w)
-                    height = int(h)
-                    was_acquiring = bp.camera.is_acquiring
-                    if was_acquiring:
-                        bp.camera.stop_acquisition()
-                    getattr(bp.camera, "set_roi")(
-                        offset_x=offset_x, offset_y=offset_y, width=width, height=height
-                    )
-                    if was_acquiring:
-                        bp.camera.start_acquisition()
-                    roi = getattr(bp.camera, "roi_info")
-                    return f"ROI: {roi['width']}×{roi['height']} at ({roi['offset_x']},{roi['offset_y']})"
-                except Exception as e:
-                    logger.warning(f"Failed to set ROI: {e}")
-                    return f"Error: {e}"
-
-        @app.callback(
-            Output("input-roi-ox", "value"),
-            Output("input-roi-oy", "value"),
-            Output("input-roi-w", "value"),
-            Output("input-roi-h", "value"),
-            Output("div-roi-status", "children", allow_duplicate=True),
-            Input("btn-roi-reset", "n_clicks"),
-            prevent_initial_call=True,
-        )
-        def reset_roi(_n: int) -> tuple[int, int, int, int, str]:
-            if bp.camera is None:
-                return 0, 0, 0, 0, "No camera"
-            with _callback_lock:
-                try:
-                    was_acquiring = bp.camera.is_acquiring
-                    if was_acquiring:
-                        bp.camera.stop_acquisition()
-                    getattr(bp.camera, "set_roi")(offset_x=0, offset_y=0, width=None, height=None)
-                    if was_acquiring:
-                        bp.camera.start_acquisition()
-                    roi = getattr(bp.camera, "roi_info")
-                    return 0, 0, roi["max_width"], roi["max_height"], "Reset to full sensor"
-                except Exception as e:
-                    logger.warning(f"Failed to reset ROI: {e}")
-                    return 0, 0, 0, 0, f"Error: {e}"
 
     # -- GenICam feature callbacks (pattern-matching) -------------------------
-    has_genicam = (
-        bp.camera is not None
-        and hasattr(bp.camera, "_discover_features")
-        and bp.camera._discover_features()
+    # Also unconditional. Pattern-matching callbacks happily target components
+    # that appear later, which is exactly what happens when a camera switch
+    # rebuilds the Setting panel with a different feature set.
+
+    def _write_node(feature: str, value: Any) -> Any:
+        """Write a GenICam feature and return what it holds afterwards.
+
+        The read-back is what the controls show: a write can be refused (many
+        features are locked while the camera streams) or clamped, and
+        showing the request instead left the control claiming a setting the
+        camera did not have. Refusals are logged as warnings; they used to go
+        to DEBUG, where nobody sees them. Returns ``None`` when there is no
+        such node, or it cannot be read back. The caller holds the lock.
+        """
+        camera = bp.camera
+        nm = getattr(camera, "node_map", None)
+        node = getattr(nm, feature, None) if nm is not None else None
+        if camera is None or node is None:
+            return None
+        try:
+            was_acquiring = camera.is_acquiring
+            node.value = value
+            if was_acquiring and not camera.is_acquiring and not _server_paused:
+                camera.start_acquisition()
+        except Exception as e:
+            logger.warning("Camera did not accept %s = %r: %s", feature, value, e)
+        try:
+            return node.value
+        except Exception:
+            logger.debug("Could not read %s back", feature, exc_info=True)
+            return None
+
+    @app.callback(
+        Output({"type": "genicam-num", "feature": MATCH}, "value"),
+        Output({"type": "genicam-num-input", "feature": MATCH}, "value"),
+        Input({"type": "genicam-num", "feature": MATCH}, "value"),
+        Input({"type": "genicam-num-input", "feature": MATCH}, "value"),
+        prevent_initial_call=True,
     )
-    if has_genicam:
+    def set_genicam_numeric(slider_val: float | None, input_val: float | None) -> tuple[Any, Any]:
+        """Write a numeric GenICam feature from its slider or box."""
+        trigger = ctx.triggered_id
+        source = trigger.get("type") if isinstance(trigger, dict) else None
+        value = slider_val if source == "genicam-num" else input_val
+        if value is None or bp.camera is None or not isinstance(trigger, dict):
+            return dash.no_update, dash.no_update
+        feature = trigger.get("feature")
+        if feature is None:
+            return dash.no_update, dash.no_update
+        with _callback_lock:
+            actual = _write_node(feature, value)
+        return _paired_values(value, actual, from_slider=source == "genicam-num")
 
-        @app.callback(
-            Output({"type": "genicam-num", "feature": MATCH}, "value"),
-            Output({"type": "genicam-num-input", "feature": MATCH}, "value"),
-            Input({"type": "genicam-num", "feature": MATCH}, "value"),
-            Input({"type": "genicam-num-input", "feature": MATCH}, "value"),
-            prevent_initial_call=True,
-        )
-        def set_genicam_numeric(
-            slider_val: float | None, input_val: float | None
-        ) -> tuple[Any, Any]:
-            trigger = ctx.triggered_id
-            source = trigger.get("type") if isinstance(trigger, dict) else None
-            value = slider_val if source == "genicam-num" else input_val
-            if value is None or bp.camera is None or not isinstance(trigger, dict):
-                return dash.no_update, dash.no_update
-            feature = trigger.get("feature")
-            if feature is None:
-                return dash.no_update, dash.no_update
-            with _callback_lock:
-                nm = getattr(bp.camera, "node_map", None)
-                if nm is not None:
-                    node = getattr(nm, feature, None)
-                    if node is not None:
-                        try:
-                            was_acquiring = bp.camera.is_acquiring
-                            node.value = value
-                            if was_acquiring and not bp.camera.is_acquiring and not _server_paused:
-                                bp.camera.start_acquisition()
-                        except Exception as e:
-                            logger.debug("Failed to set %s: %s", feature, e)
-            # Mirror to the other control only (see set_exposure for rationale).
-            if source == "genicam-num":
-                return dash.no_update, value
-            return value, dash.no_update
+    @app.callback(
+        Output({"type": "genicam-sel", "feature": MATCH}, "value"),
+        Input({"type": "genicam-sel", "feature": MATCH}, "value"),
+        prevent_initial_call=True,
+    )
+    def set_genicam_select(value: str | None) -> Any:
+        """Write an enumerated GenICam feature from its dropdown."""
+        if value is None or bp.camera is None:
+            return dash.no_update
+        feature = ctx.triggered_id["feature"]
+        with _callback_lock:
+            actual = _write_node(feature, value)
+        return value if actual is None else str(actual)
 
-        @app.callback(
-            Output({"type": "genicam-sel", "feature": MATCH}, "value"),
-            Input({"type": "genicam-sel", "feature": MATCH}, "value"),
-            prevent_initial_call=True,
-        )
-        def set_genicam_select(value: str | None) -> Any:
-            if value is None or bp.camera is None:
-                return dash.no_update
-            feature = ctx.triggered_id["feature"]
-            with _callback_lock:
-                nm = getattr(bp.camera, "node_map", None)
-                if nm is not None:
-                    node = getattr(nm, feature, None)
-                    if node is not None:
-                        try:
-                            was_acquiring = bp.camera.is_acquiring
-                            node.value = value
-                            if was_acquiring and not bp.camera.is_acquiring and not _server_paused:
-                                bp.camera.start_acquisition()
-                        except Exception as e:
-                            logger.debug("Failed to set %s: %s", feature, e)
-            return value
-
-        @app.callback(
-            Output({"type": "genicam-sw", "feature": MATCH}, "value"),
-            Input({"type": "genicam-sw", "feature": MATCH}, "value"),
-            prevent_initial_call=True,
-        )
-        def set_genicam_switch(value: bool) -> Any:
-            if bp.camera is None:
-                return dash.no_update
-            feature = ctx.triggered_id["feature"]
-            with _callback_lock:
-                nm = getattr(bp.camera, "node_map", None)
-                if nm is not None:
-                    node = getattr(nm, feature, None)
-                    if node is not None:
-                        try:
-                            was_acquiring = bp.camera.is_acquiring
-                            node.value = value
-                            if was_acquiring and not bp.camera.is_acquiring and not _server_paused:
-                                bp.camera.start_acquisition()
-                        except Exception as e:
-                            logger.debug("Failed to set %s: %s", feature, e)
-            return value
+    @app.callback(
+        Output({"type": "genicam-sw", "feature": MATCH}, "value"),
+        Input({"type": "genicam-sw", "feature": MATCH}, "value"),
+        prevent_initial_call=True,
+    )
+    def set_genicam_switch(value: bool) -> Any:
+        """Write a boolean GenICam feature from its switch."""
+        if bp.camera is None:
+            return dash.no_update
+        feature = ctx.triggered_id["feature"]
+        with _callback_lock:
+            actual = _write_node(feature, value)
+        return value if actual is None else bool(actual)
 
     # -- Main update loop -----------------------------------------------------
+    # Registered last: other test suites find this callback as the final one.
     @app.callback(
         Output("live-graph", "figure"),
         Output("div-results", "children"),
         Output("status-bar", "children"),
         Output("store-frame", "data"),
+        # The tick can stop the stream (a failing camera) or find it stopped
+        # from elsewhere (another tab, a camera switch), and the button has
+        # to say so, or its first click would only repeat the pause.
+        Output("store-paused", "data", allow_duplicate=True),
+        Output("btn-play-pause", "children", allow_duplicate=True),
+        Output("btn-play-pause", "color", allow_duplicate=True),
         Input("interval", "n_intervals"),
         State("store-paused", "data"),
         State("switch-color", "value"),
@@ -1903,6 +1548,7 @@ def _register_callbacks(app: dash.Dash, bp: BeamProfiler) -> None:
         State("dropdown-definition", "value"),
         State("store-dark-theme", "data"),
         State("input-avg-n", "value"),
+        prevent_initial_call="initial_duplicate",
     )
     def update_live(
         _n: int,
@@ -1918,23 +1564,61 @@ def _register_callbacks(app: dash.Dash, bp: BeamProfiler) -> None:
         dark_theme: bool,
         avg_n: int | None,
     ) -> tuple[Any, ...]:
-        if paused or _server_paused:
-            return (dash.no_update,) * 4
+        """Grab a frame, fit it, and redraw — once per interval tick.
+
+        Almost every control on the page arrives here as ``State`` rather than
+        ``Input``: they should change what the *next* frame looks like, not
+        force an extra redraw of their own.
+
+        The tick is skipped rather than queued if the previous one is still
+        running. Queueing would let a camera slower than the interval build an
+        unbounded backlog of stale frames, and would leave the controls (which
+        share the lock) waiting behind all of them.
+        """
+        global _camera_failures, _server_paused  # noqa: PLW0603
+        # Outputs: figure, results, status, frame count, pause flag, and the
+        # Play/Pause button's children and colour.
+        nothing = (dash.no_update,) * 7
+
+        def show_status(status: Any) -> tuple[Any, ...]:
+            return (dash.no_update, dash.no_update, status, *(dash.no_update,) * 4)
+
+        def show_paused(status: Any = dash.no_update) -> tuple[Any, ...]:
+            children, color = _play_pause_face(True)
+            return (dash.no_update, dash.no_update, status, dash.no_update, True, children, color)
+
+        if paused:
+            return nothing
+        if _server_paused:
+            # Stopped by something this page didn't see: bring its button
+            # into line.
+            return show_paused()
 
         if not _callback_lock.acquire(blocking=False):
             # A previous tick is still running; skip this one and let the
             # next interval fire. Keeps the UI responsive when a camera
             # fetch takes longer than the tick interval.
-            return (dash.no_update,) * 4
+            return nothing
 
         try:
+            if _server_paused:
+                # A Pause or a camera switch completed between the check
+                # above and taking the lock. Fetching now would restart the
+                # acquisition it just stopped: HarvesterCamera.get_image
+                # starts a stopped stream by itself.
+                return show_paused()
+
+            # Either change starts the fits from scratch. A new fit method
+            # fits different data, so the old warm start is meaningless; a
+            # model-free definition (FWHM, D4σ) skips the 2D fit and the
+            # linecut altogether, so without the reset their last results
+            # stayed on screen, frozen, as the ellipse and the crosshair.
             if analysis and bp.fit_method != analysis:
                 bp.fit_method = analysis
-                bp._last_popt_x = None
-                bp._last_popt_y = None
-                bp._last_popt_2d = None
+                bp.reset_analysis()
             if definition and bp.definition != definition:
                 bp.definition = definition
+                bp.reset_analysis()
 
             if bp._mode == "camera" and bp.camera is not None:
                 # Cap fetch at one tick so sliders/buttons (which share
@@ -1944,29 +1628,46 @@ def _register_callbacks(app: dash.Dash, bp: BeamProfiler) -> None:
                 try:
                     img = bp.camera.get_image(timeout=0.1)
                 except TimeoutError:
-                    return (dash.no_update,) * 4
+                    return nothing
+                except Exception as exc:
+                    # Anything else is the device failing, or gone.
+                    _camera_failures += 1
+                    message = f"Camera error: {str(exc) or type(exc).__name__}"
+                    _log_tick_error(message, exc)
+                    if _camera_failures < _MAX_CAMERA_FAILURES:
+                        return show_status(_error_status(message))
+                    logger.warning(
+                        "Pausing the stream after %d camera errors in a row", _camera_failures
+                    )
+                    _server_paused = True
+                    _recent_frame_times.clear()
+                    try:
+                        bp.camera.stop_acquisition()
+                    except Exception:
+                        logger.debug("Stopping a failed camera also failed", exc_info=True)
+                    return show_paused(_error_status(f"{message} - paused; press Play to retry"))
             else:
                 img = bp.last_img
 
             if img is None:
-                return (dash.no_update,) * 4
+                return nothing
+            _camera_failures = 0
 
+            raw = img
             img = _averaged_image(img, avg_n or 1)
             bp.last_img = img
             popt_x, popt_y = bp.analyze(img)
 
             cs = cs_name if color_on else GRAY_COLORSCALE
             zmin = None if auto_range else (zmin_val if zmin_val is not None else 0)
-            zmax_default = _saturation_max(img)
+            zmax_default = _saturation_max(raw, _camera_bit_depth(bp))
             zmax = None if auto_range else (zmax_val if zmax_val is not None else zmax_default)
-            # Read the live source of truth (mutated by Auto-fit / Reset
-            # under ``_callback_lock``) instead of capturing it as Dash
-            # ``State``: a State snapshot can be 50–100 ms stale if a
-            # zoom click fires after this tick started, which would
-            # cause a one-frame blink to the previous zoom.
-            current_zoom = _zoom_range
-            xrange = current_zoom["x"] if current_zoom else None
-            yrange = current_zoom["y"] if current_zoom else None
+            # Read the live source of truth (mutated by Auto-fit, Reset and
+            # mouse zooms under ``_callback_lock``) instead of capturing it as
+            # Dash ``State``: a State snapshot can be 50–100 ms stale if a
+            # zoom click fires after this tick started, which would cause a
+            # one-frame blink to the previous zoom.
+            xrange, yrange = _zoom_in_um(bp)
             fig = build_figure(
                 bp,
                 img,
@@ -1985,11 +1686,13 @@ def _register_callbacks(app: dash.Dash, bp: BeamProfiler) -> None:
             return (
                 fig,
                 _format_results(bp),
-                _build_status(bp, img, frame_count),
+                _build_status(bp, img, frame_count, raw=raw),
                 frame_count,
+                *(dash.no_update,) * 3,
             )
-        except Exception:
-            logger.exception("Update error")
-            return (dash.no_update,) * 4
+        except Exception as exc:
+            message = f"Update error: {str(exc) or type(exc).__name__}"
+            _log_tick_error(message, exc)
+            return show_status(_error_status(message))
         finally:
             _callback_lock.release()

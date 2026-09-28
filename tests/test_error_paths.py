@@ -7,7 +7,10 @@ a flaky camera and a crashed session.
 
 from __future__ import annotations
 
+import logging
 import signal
+import sys
+import threading
 import types
 from typing import Any, NamedTuple
 from unittest.mock import MagicMock, patch
@@ -78,47 +81,115 @@ class TestStaticImageEdgeCases:
 class TestInitGuards:
     def test_no_camera_and_no_file_is_an_error(self):
         """If camera setup silently yields nothing, say so rather than limp on."""
-        with patch.object(BeamProfiler, "_initialize_camera", lambda self, camera: None):
+        with patch.object(
+            BeamProfiler, "_initialize_camera", lambda self, camera, serial=None: None
+        ):
             with pytest.raises(ValueError, match="Either camera or file"):
                 BeamProfiler(camera="simulated")
 
 
-class TestSigintHandlerOffMainThread:
-    """``signal.signal`` raises ValueError outside the main thread; the Dash
-    branch must degrade gracefully instead of taking the server down."""
+class TestDashShutdown:
+    """How plot() starts and stops the Dash server outside a notebook."""
 
-    def test_plot_stream_survives_when_handler_cannot_be_installed(self):
-        bp = BeamProfiler(camera="simulated")
+    @staticmethod
+    def _serve(bp: BeamProfiler, run: Any = None) -> MagicMock:
         fake_app = MagicMock()
-
-        with (
-            patch("pybeamprofiler.dash_app.create_app", return_value=fake_app),
-            patch("pybeamprofiler.beamprofiler.signal.signal", side_effect=ValueError("not main")),
-            patch("pybeamprofiler.beamprofiler.webbrowser.open"),
-        ):
-            # Force the non-Jupyter path.
-            with patch.dict("sys.modules", {"IPython": None}):
-                bp._plot_stream()
-
-        fake_app.run.assert_called_once()
-        assert bp.camera is not None
-        bp.camera.close()
-
-    def test_handler_is_restored_on_the_main_thread(self):
-        bp = BeamProfiler(camera="simulated")
-        fake_app = MagicMock()
-        original = signal.getsignal(signal.SIGINT)
-
+        if run is not None:
+            fake_app.run = MagicMock(side_effect=run)
         with (
             patch("pybeamprofiler.dash_app.create_app", return_value=fake_app),
             patch("pybeamprofiler.beamprofiler.webbrowser.open"),
             patch.dict("sys.modules", {"IPython": None}),
         ):
             bp._plot_stream()
+        return fake_app
 
-        assert signal.getsignal(signal.SIGINT) is original
+    def test_the_server_only_listens_on_localhost(self, monkeypatch):
+        """Dash takes the host from $HOST when none is given; HOST=0.0.0.0
+        would open an unauthenticated GUI that writes camera settings to the
+        whole network."""
+        monkeypatch.setenv("HOST", "0.0.0.0")
+        bp = BeamProfiler(camera="simulated")
+        fake_app = self._serve(bp)
+        assert fake_app.run.call_args.kwargs["host"] == "127.0.0.1"
+
+    @pytest.mark.parametrize("ending", ["returns", "interrupted"])
+    def test_the_camera_is_released_under_the_tick_lock(self, ending):
+        """werkzeug swallows Ctrl+C, so the old signal handler closed the
+        camera from outside the lock, mid-fetch, and main() closed it again."""
+        from pybeamprofiler import dash_app
+
+        bp = BeamProfiler(camera="simulated")
         assert bp.camera is not None
-        bp.camera.close()
+        seen: list[tuple[str, bool, bool]] = []
+        real_close = bp.camera.close
+
+        def spy_close() -> None:
+            seen.append(("close", dash_app._callback_lock.locked(), dash_app._server_paused))
+            real_close()
+
+        bp.camera.close = MagicMock(side_effect=spy_close)
+        self._serve(bp, run=KeyboardInterrupt if ending == "interrupted" else None)
+        assert seen == [("close", True, True)]
+        assert not bp.camera.is_acquiring
+
+    def test_binding_does_not_wait_on_a_reverse_lookup_of_localhost(self, monkeypatch):
+        """http.server resolves the bound address back to a name. Where that
+        lookup is slow (35 s on some Macs), the server was unreachable for
+        the whole of it."""
+        import socket
+        import time
+
+        from werkzeug.serving import make_server
+
+        from pybeamprofiler.beamprofiler import _without_loopback_reverse_dns
+
+        asked: list[str] = []
+
+        def slow_getfqdn(name: str = "") -> str:
+            asked.append(name)
+            time.sleep(3)
+            return name
+
+        monkeypatch.setattr(socket, "getfqdn", slow_getfqdn)
+        start = time.monotonic()
+        with _without_loopback_reverse_dns():
+            server = make_server("127.0.0.1", 0, lambda environ, start_response: [])
+        server.server_close()
+        assert time.monotonic() - start < 1.0
+        assert asked == []
+        assert socket.getfqdn is slow_getfqdn, "the real function must be put back"
+
+    def test_the_gui_is_served_without_the_lookup(self):
+        import socket
+
+        bp = BeamProfiler(camera="simulated")
+        during: list[str] = []
+        self._serve(bp, run=lambda *a, **k: during.append(socket.getfqdn("127.0.0.1")))
+        assert during == ["localhost"]
+        assert socket.getfqdn.__module__ == "socket"
+
+    def test_ctrl_c_is_acknowledged(self, capsys):
+        """werkzeug swallows the interrupt, so nothing else would say so."""
+        self._serve(BeamProfiler(camera="simulated"), run=KeyboardInterrupt)
+        assert "Stopped." in capsys.readouterr().out
+
+    def test_a_server_that_fails_to_start_is_not_reported_as_stopped(self, capsys):
+        with pytest.raises(OSError, match="in use"):
+            self._serve(BeamProfiler(camera="simulated"), run=OSError("Address already in use"))
+        assert "Stopped." not in capsys.readouterr().out
+
+    def test_serving_from_a_worker_thread_works(self):
+        """No signal handler is installed any more, so nothing can refuse to
+        install off the main thread."""
+        bp = BeamProfiler(camera="simulated")
+        before = signal.getsignal(signal.SIGINT)
+        result: dict[str, MagicMock] = {}
+        worker = threading.Thread(target=lambda: result.update(app=self._serve(bp)))
+        worker.start()
+        worker.join(10)
+        result["app"].run.assert_called_once()
+        assert signal.getsignal(signal.SIGINT) is before
 
 
 class TestHarvesterCameraFallbacks:
@@ -187,20 +258,22 @@ class TestHarvesterCameraFallbacks:
         assert cam.is_acquiring is False
 
     def test_default_timeout_tracks_exposure(self):
+        """With no timeout given, a 3 s exposure is waited for for 5 s."""
         cam, mocks = _mock_harvester_camera()
         cam.is_acquiring = True
         cam.exposure_time = 3.0
+        clock = [100.0]
 
-        frame = MagicMock()
-        component = MagicMock()
-        component.width, component.height = 4, 2
-        component.data = np.arange(8, dtype=np.uint8)
-        frame.payload.components = [component]
-        mocks.ia.fetch.return_value.__enter__.return_value = frame
+        def silent(timeout):
+            clock[0] += timeout
+            return None
 
-        cam.get_image()
+        mocks.ia.try_fetch.side_effect = silent
+        with patch("pybeamprofiler.gen_camera.time.monotonic", side_effect=lambda: clock[0]):
+            with pytest.raises(TimeoutError, match="within 5.0 s"):
+                cam.get_image()
 
-        assert mocks.ia.fetch.call_args.kwargs["timeout"] == pytest.approx(5.0)
+        assert clock[0] - 100.0 == pytest.approx(5.0, abs=0.11)
 
     def test_stall_recovery_failure_does_not_escape(self):
         """If the restart itself fails we still try the fetch — the producer
@@ -215,7 +288,7 @@ class TestHarvesterCameraFallbacks:
         component.width, component.height = 2, 2
         component.data = np.arange(4, dtype=np.uint8)
         frame.payload.components = [component]
-        mocks.ia.fetch.return_value.__enter__.return_value = frame
+        mocks.ia.try_fetch.return_value.__enter__.return_value = frame
 
         with (
             patch("pybeamprofiler.gen_camera.time.monotonic", return_value=1_000.0),
@@ -238,7 +311,7 @@ class TestHarvesterCameraFallbacks:
         component.width, component.height = 2, 2
         component.data = np.arange(4, dtype=np.uint8)
         frame.payload.components = [component]
-        mocks.ia.fetch.return_value.__enter__.return_value = frame
+        mocks.ia.try_fetch.return_value.__enter__.return_value = frame
 
         with patch("pybeamprofiler.gen_camera.time.monotonic", return_value=1_000.0):
             cam.get_image(timeout=0.1)
@@ -436,10 +509,8 @@ class TestGenicamControlBuilders:
 class TestCliCleanup:
     """``main()`` must release the camera even when plotting blows up."""
 
-    def test_camera_is_closed_after_a_plot_failure(self):
-        import sys
-
-        from pybeamprofiler.beamprofiler import main
+    def test_camera_is_closed_after_a_plot_failure(self, capsys):
+        from pybeamprofiler.cli import main
 
         def start_then_fail(self, *args, **kwargs):
             self.camera.is_acquiring = True
@@ -452,15 +523,13 @@ class TestCliCleanup:
             patch.object(SimulatedCamera, "close") as close,
             patch.object(SimulatedCamera, "stop_acquisition") as stop,
         ):
-            main()  # the error is logged, not re-raised
-
+            assert main() == 1
         stop.assert_called_once()
         close.assert_called_once()
+        assert "pybeamprofiler: error: render died" in capsys.readouterr().err
 
     def test_cleanup_errors_are_swallowed(self):
-        import sys
-
-        from pybeamprofiler.beamprofiler import main
+        from pybeamprofiler.cli import main
 
         argv = ["pybeamprofiler", "--camera", "simulated"]
         with (
@@ -468,17 +537,72 @@ class TestCliCleanup:
             patch.object(BeamProfiler, "plot"),
             patch.object(SimulatedCamera, "close", side_effect=RuntimeError("already gone")),
         ):
-            main()  # must not raise
+            assert main() == 0
 
     def test_keyboard_interrupt_is_reported_cleanly(self, capsys):
-        import sys
-
-        from pybeamprofiler.beamprofiler import main
+        from pybeamprofiler.cli import main
 
         argv = ["pybeamprofiler", "--camera", "simulated"]
         with (
             patch.object(sys, "argv", argv),
             patch.object(BeamProfiler, "plot", side_effect=KeyboardInterrupt),
         ):
-            main()
+            assert main() == 0
         assert "Stopped by user" in capsys.readouterr().out
+
+    def test_a_camera_that_will_not_open_is_one_line_not_a_traceback(self, capsys):
+        from pybeamprofiler.cli import main
+
+        argv = ["pybeamprofiler", "--camera", "flir"]
+        with (
+            patch.object(sys, "argv", argv),
+            patch.object(
+                BeamProfiler, "_initialize_camera", side_effect=RuntimeError("no FLIR camera")
+            ),
+        ):
+            assert main() == 1
+        err = capsys.readouterr().err
+        assert "pybeamprofiler: error: no FLIR camera" in err
+        assert "Traceback" not in err
+
+    def test_verbose_shows_the_traceback(self, caplog):
+        """The traceback was logged at DEBUG, which -v (INFO) never shows."""
+        from pybeamprofiler.cli import main
+
+        argv = ["pybeamprofiler", "--camera", "flir", "-v"]
+        with (
+            patch.object(sys, "argv", argv),
+            patch.object(
+                BeamProfiler, "_initialize_camera", side_effect=RuntimeError("no FLIR camera")
+            ),
+            patch("logging.basicConfig"),
+            caplog.at_level(logging.INFO, logger="pybeamprofiler.cli"),
+        ):
+            assert main() == 1
+        assert [r.levelno for r in caplog.records if r.exc_info] == [logging.INFO]
+
+
+class TestConstructorReleasesTheCamera:
+    """A GenICam device stays claimed until closed. Raising out of the
+    constructor with the camera open kept it busy until the kernel restarted."""
+
+    def test_a_failing_exposure_write_closes_the_camera(self):
+        with (
+            patch.object(SimulatedCamera, "set_exposure", side_effect=RuntimeError("out of range")),
+            patch.object(SimulatedCamera, "close") as close,
+            pytest.raises(RuntimeError, match="out of range"),
+        ):
+            BeamProfiler(camera="simulated", exposure_time=100.0)
+        close.assert_called_once()
+
+    def test_a_camera_that_fails_to_open_is_closed_before_raising(self):
+        from pybeamprofiler.flir import FlirCamera
+
+        with (
+            patch.object(FlirCamera, "__init__", return_value=None),
+            patch.object(FlirCamera, "open", side_effect=RuntimeError("busy")),
+            patch.object(FlirCamera, "close") as close,
+            pytest.raises(RuntimeError, match="Failed to open flir camera: busy"),
+        ):
+            BeamProfiler(camera="flir")
+        close.assert_called_once()

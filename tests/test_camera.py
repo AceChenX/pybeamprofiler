@@ -7,6 +7,7 @@ from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pytest
+from conftest import requires_genicam, requires_harvesters
 
 from pybeamprofiler import BeamProfiler, SimulatedCamera
 from pybeamprofiler.camera import _categorize_feature
@@ -86,6 +87,173 @@ class TestSimulatedCamera:
         assert np.max(img2) > np.max(img1)
         cam.close()
 
+    def test_consecutive_frames_differ(self):
+        """The jitter is what makes the live view look live."""
+        cam = SimulatedCamera(seed=1)
+        assert not np.array_equal(cam.get_image(), cam.get_image())
+
+    def test_a_seed_reproduces_the_frames(self):
+        a, b = SimulatedCamera(seed=7), SimulatedCamera(seed=7)
+        for _ in range(3):
+            np.testing.assert_array_equal(a.get_image(), b.get_image())
+
+    def test_a_long_exposure_does_not_slow_the_frames(self):
+        """Exposure scales the signal and nothing else. The first simulator
+        slept for it, up to 0.1 s a frame, which capped the frame rate and
+        hid how fast the rest of the pipeline was. Five frames took at least
+        0.5 s then; they take about 35 ms now."""
+        cam = SimulatedCamera(seed=3)
+        cam.set_exposure(1.0)
+        cam.get_image()
+        start = time.perf_counter()
+        for _ in range(5):
+            cam.get_image()
+        assert time.perf_counter() - start < 0.4
+
+
+class TestSimulatedExposureContract:
+    """The simulator clamps like a camera, and each profile keeps its own
+    brightness."""
+
+    def test_exposure_is_clamped_to_its_range(self):
+        cam = SimulatedCamera()
+        cam.set_exposure(5.0)
+        assert cam.exposure_time == cam.exposure_range[1]
+        cam.set_exposure(1e-6)
+        assert cam.exposure_time == cam.exposure_range[0]
+
+    def test_gain_is_clamped_to_its_range(self):
+        cam = SimulatedCamera()
+        cam.set_gain(99.0)
+        assert cam.gain == cam.gain_range[1]
+        cam.set_gain(-1.0)
+        assert cam.gain == cam.gain_range[0]
+
+    def test_a_profile_keeps_its_brightness(self):
+        """Exposure and gain scaled the *default* camera's amplitude, so
+        touching either snapped sim-2 (180 counts) to sim-1's 200."""
+        from pybeamprofiler.constants import DEFAULT_EXPOSURE_TIME
+        from pybeamprofiler.simulated import SIMULATED_PROFILES
+
+        profile = SIMULATED_PROFILES[1]
+        cam = SimulatedCamera(profile)
+        cam.set_exposure(DEFAULT_EXPOSURE_TIME)
+        cam.set_gain(0.0)
+        assert cam._amplitude == pytest.approx(profile.amplitude)
+        cam.set_gain(10.0)
+        assert cam._amplitude == pytest.approx(2 * profile.amplitude)
+
+
+class TestSimulatedCloseContract:
+    """A closed simulator refuses frames like a closed camera, so code that
+    keeps using a released camera fails in tests instead of on hardware."""
+
+    def test_a_closed_simulator_refuses(self):
+        cam = SimulatedCamera()
+        cam.open()
+        cam.close()
+        with pytest.raises(RuntimeError, match="Camera not opened"):
+            cam.get_image()
+        assert not cam.is_acquiring
+
+    def test_it_opens_again(self):
+        cam = SimulatedCamera()
+        cam.open()
+        cam.close()
+        cam.open()
+        assert cam.get_image().shape == (1024, 1024)
+        cam.close()
+
+    def test_one_never_opened_still_works(self):
+        assert SimulatedCamera().get_image().shape == (1024, 1024)
+
+
+class TestIsOpen:
+    """``BeamProfiler(camera=...)`` opens a camera it is handed only if this
+    says it isn't open already."""
+
+    def test_the_simulator_follows_open_and_close(self):
+        cam = SimulatedCamera()
+        assert not cam.is_open
+        cam.open()
+        assert cam.is_open
+        cam.close()
+        assert not cam.is_open
+        cam.open()
+        assert cam.is_open
+        cam.close()
+
+    def test_the_default_goes_by_the_node_map(self):
+        from pybeamprofiler.camera import Camera
+
+        class Minimal(Camera):
+            def open(self):
+                self.node_map = object()
+
+            def close(self):
+                self.node_map = None
+
+            def start_acquisition(self):
+                pass
+
+            def stop_acquisition(self):
+                pass
+
+            def get_image(self, timeout=None):
+                return np.zeros((4, 4), dtype=np.uint8)
+
+            def set_exposure(self, exposure_time):
+                pass
+
+            def set_gain(self, gain):
+                pass
+
+        cam = Minimal()
+        assert not cam.is_open
+        cam.open()
+        assert cam.is_open
+        cam.close()
+        assert not cam.is_open
+
+
+class TestSimulatedRoiContract:
+    """The simulator must refuse what a real camera refuses, or code that
+    passes against it fails on hardware."""
+
+    @pytest.mark.parametrize(
+        ("args", "message"),
+        [
+            ((0, 0, 100.5, 100), "width must be a whole number"),
+            ((0, 0, 0, 100), "width must be at least 1"),
+            ((0, 0, 100, 0), "height must be at least 1"),
+            ((0.5, 0, 100, 100), "offset_x must be a whole number"),
+            ((0, None, 100, 100), "offset_y must be a whole number"),
+        ],
+    )
+    def test_meaningless_geometry_is_a_value_error(self, args, message):
+        cam = SimulatedCamera()
+        with pytest.raises(ValueError, match=message):
+            cam.set_roi(*args)
+        assert cam.roi_info["width"] == cam.roi_info["max_width"]
+
+    def test_an_offset_too_far_right_keeps_the_size(self):
+        """Same planner as HarvesterCamera: the ROI moves back onto the sensor.
+
+        The simulator used to keep the offset and shrink the width instead,
+        so the same request gave a different ROI than a real camera would.
+        """
+        cam = SimulatedCamera()  # 1024 x 1024
+        cam.set_roi(900, 0, 400, 300)
+        roi = cam.roi_info
+        assert (roi["offset_x"], roi["width"]) == (624, 400)
+        assert cam.get_image().shape == (300, 400)
+
+    def test_integral_floats_are_accepted(self):
+        cam = SimulatedCamera()
+        whole: Any = (10.0, 20.0, 64.0, 32.0)  # e.g. read back from a float widget
+        cam.set_roi(*whole)
+        assert cam.get_image().shape == (32, 64)
+
 
 class TestCameraIntegration:
     """Test camera integration with BeamProfiler."""
@@ -149,11 +317,40 @@ class TestApplySettingsFromKwargs:
         cam.close()
 
     def test_set_exposure_alias(self):
-        """Test setting ExposureTime alias."""
+        """ExposureTime is the GenICam node, so it is in microseconds.
+
+        It used to be read as seconds: ExposureTime=5000 -- 5 ms to anyone
+        who knows GenICam -- asked for 5000 s.
+        """
         cam = SimulatedCamera()
         cam.open()
-        cam._apply_settings_from_kwargs({"ExposureTime": 0.02})
-        assert cam.exposure_time == 0.02
+        cam._apply_settings_from_kwargs({"ExposureTime": 20_000})
+        assert cam.exposure_time == pytest.approx(0.02)
+        cam.close()
+
+    def test_integral_float_for_an_integer_node(self):
+        cam = SimulatedCamera()
+        cam.open()
+        cam._apply_settings_from_kwargs({"BlackLevel": 12.0})
+        assert cam.node_map is not None
+        value = cam.node_map.BlackLevel.value
+        assert value == 12 and isinstance(value, int)
+        cam.close()
+
+    def test_numeric_string_for_a_float_node(self):
+        cam = SimulatedCamera()
+        cam.open()
+        cam._apply_settings_from_kwargs({"Gamma": "1.5"})
+        assert cam.node_map is not None
+        assert cam.node_map.Gamma.value == 1.5
+        cam.close()
+
+    def test_boolean_word_for_a_boolean_node(self):
+        cam = SimulatedCamera()
+        cam.open()
+        cam._apply_settings_from_kwargs({"ReverseX": "on"})
+        assert cam.node_map is not None
+        assert cam.node_map.ReverseX.value is True
         cam.close()
 
     def test_set_gain_alias(self):
@@ -328,8 +525,11 @@ class TestGenCameraInit:
         f2.touch()
 
         mock_harvester = MagicMock()
+        mock_harvester.return_value.device_info_list = []
         with patch("pybeamprofiler.gen_camera.Harvester", mock_harvester):
-            HarvesterCamera(cti_file=[str(f1), str(f2)])
+            cam = HarvesterCamera(cti_file=[str(f1), str(f2)])
+            with pytest.raises(RuntimeError, match="No GenICam cameras found"):
+                cam.open()
             assert mock_harvester.return_value.add_file.call_count == 2
 
 
@@ -418,12 +618,16 @@ class TestGenCameraExposureGain:
         assert cam.exposure_time == 0.01
 
     def test_set_exposure_fallback(self):
-        """Test set_exposure falls back to ExposureTimeAbs."""
+        """Cameras without ExposureTime (older Basler GigE) use ExposureTimeAbs."""
+        from types import SimpleNamespace
+
         cam = self._make_mock_camera()
-        cam.node_map.ExposureTime = MagicMock()
-        type(cam.node_map.ExposureTime).value = property(fset=MagicMock(side_effect=AttributeError))
+        cam.node_map = SimpleNamespace(
+            ExposureTimeAbs=SimpleNamespace(value=5000.0, min=20.0, max=1e6)
+        )
         cam.set_exposure(0.01)
-        assert cam.exposure_time == 0.01
+        assert cam.node_map.ExposureTimeAbs.value == pytest.approx(10_000.0)
+        assert cam.exposure_time == pytest.approx(0.01)
 
     def test_set_gain_primary(self):
         """Test set_gain using Gain node."""
@@ -432,11 +636,13 @@ class TestGenCameraExposureGain:
         assert cam.gain == 5.0
 
     def test_set_gain_fallback(self):
-        """Test set_gain falls back to GainRaw."""
+        """Cameras without Gain use GainRaw, an integer in ADC steps."""
+        from types import SimpleNamespace
+
         cam = self._make_mock_camera()
-        cam.node_map.Gain = MagicMock()
-        type(cam.node_map.Gain).value = property(fset=MagicMock(side_effect=AttributeError))
-        cam.set_gain(10.0)
+        cam.node_map = SimpleNamespace(GainRaw=SimpleNamespace(value=0, min=0, max=511, inc=1))
+        cam.set_gain(10.4)
+        assert cam.node_map.GainRaw.value == 10
         assert cam.gain == 10.0
 
     def test_exposure_range_property(self):
@@ -467,20 +673,27 @@ class TestGenCameraExposureGain:
         assert info["max_width"] == 1024
 
     def test_close_with_ia(self):
-        """Test close destroys image acquirer."""
+        """close() destroys the acquirer and resets a Harvester it was given."""
         cam = self._make_mock_camera()
         mock_ia = MagicMock()
+        mock_h = MagicMock()
         cam.ia = mock_ia
+        cam.h = mock_h
         cam.close()
         mock_ia.destroy.assert_called_once()
-        cam.h.reset.assert_called_once()
+        mock_h.reset.assert_called_once()
+        assert cam.ia is None
+        assert cam.node_map is None
+        assert cam.h is None
 
     def test_close_without_ia(self):
         """Test close with no image acquirer."""
         cam = self._make_mock_camera()
+        mock_h = MagicMock()
         cam.ia = None
+        cam.h = mock_h
         cam.close()  # Should not raise
-        cam.h.reset.assert_called_once()
+        mock_h.reset.assert_called_once()
 
     def test_start_acquisition(self):
         """Test start_acquisition calls ia.start."""
@@ -512,14 +725,28 @@ class TestGenCameraExposureGain:
             cam.get_image()
 
     def test_set_roi(self):
-        """Test set_roi sets node_map values."""
+        """set_roi writes the nodes and reads the geometry back.
+
+        GenICam write-order and increment rules are covered against the real
+        GenApi engine in test_harvester_camera.py; this only checks the
+        plumbing with plain attribute-backed nodes.
+        """
+        from types import SimpleNamespace
+
         cam = self._make_mock_camera()
-        cam._roi_max_width = 1024
-        cam._roi_max_height = 768
+        cam.node_map = SimpleNamespace(
+            Width=SimpleNamespace(value=1024, min=1, max=1024, inc=1),
+            Height=SimpleNamespace(value=768, min=1, max=768, inc=1),
+            OffsetX=SimpleNamespace(value=0, min=0, max=0, inc=1),
+            OffsetY=SimpleNamespace(value=0, min=0, max=0, inc=1),
+            WidthMax=SimpleNamespace(value=1024),
+            HeightMax=SimpleNamespace(value=768),
+        )
         cam.set_roi(offset_x=10, offset_y=20, width=640, height=480)
         assert cam.width == 640
         assert cam.height == 480
         assert cam._roi_offset_x == 10
+        assert cam.node_map.OffsetY.value == 20
 
     def test_set_roi_defaults_to_max(self):
         """Test set_roi uses max dimensions when not specified."""
@@ -531,10 +758,11 @@ class TestGenCameraExposureGain:
         assert cam.height == 768
 
     def test_set_roi_no_node_map(self):
-        """Test set_roi warns when camera not opened."""
+        """An unopened camera refuses rather than pretending to succeed."""
         cam = self._make_mock_camera()
         cam.node_map = None
-        cam.set_roi()  # Should not raise
+        with pytest.raises(RuntimeError, match="not opened"):
+            cam.set_roi()
 
 
 class TestGenCameraSensorLookup:
@@ -579,6 +807,7 @@ class TestGenCameraSensorLookup:
         assert result is None
 
 
+@requires_harvesters
 class TestGenCameraGetImage:
     """Test HarvesterCamera.get_image timeout normalisation and stall recovery."""
 
@@ -598,21 +827,21 @@ class TestGenCameraGetImage:
         from harvesters.core import TimeoutException
 
         cam = self._make_mock_camera()
-        cam.ia.fetch.side_effect = TimeoutException
+        cam.ia.try_fetch.side_effect = TimeoutException
         with pytest.raises(TimeoutError, match="did not deliver a frame"):
             cam.get_image(timeout=0.1)
 
     def test_builtin_timeout_error_normalised(self):
         """Python's built-in ``TimeoutError`` is also normalised (re-wrapped)."""
         cam = self._make_mock_camera()
-        cam.ia.fetch.side_effect = TimeoutError("slow")
+        cam.ia.try_fetch.side_effect = TimeoutError("slow")
         with pytest.raises(TimeoutError, match="did not deliver a frame"):
             cam.get_image(timeout=0.1)
 
     def test_non_timeout_exception_propagates(self):
         """Non-timeout errors bubble up unchanged."""
         cam = self._make_mock_camera()
-        cam.ia.fetch.side_effect = RuntimeError("bad buffer")
+        cam.ia.try_fetch.side_effect = RuntimeError("bad buffer")
         with pytest.raises(RuntimeError, match="bad buffer"):
             cam.get_image(timeout=0.1)
 
@@ -627,7 +856,7 @@ class TestGenCameraGetImage:
         comp.width, comp.height = 4, 4
         comp.data = np.zeros(16, dtype=np.uint8)
         buf.__enter__.return_value.payload.components = [comp]
-        cam.ia.fetch.return_value = buf
+        cam.ia.try_fetch.return_value = buf
 
         img = cam.get_image(timeout=0.1)
         assert img.shape == (4, 4)
@@ -635,11 +864,11 @@ class TestGenCameraGetImage:
         assert cam._last_successful_fetch > 0.0
 
     def test_stall_recovery_restarts_acquisition(self):
-        """Consecutive timeouts beyond the stall window trigger stop/start."""
+        """Silence beyond the stall window triggers a stop/start."""
         from harvesters.core import TimeoutException
 
         cam = self._make_mock_camera()
-        cam.ia.fetch.side_effect = TimeoutException
+        cam.ia.try_fetch.side_effect = TimeoutException
         # Simulate a successful fetch 10s ago — beyond the 5s stall window
         # at a 10 ms exposure.
         cam._last_successful_fetch = time.monotonic() - 10.0
@@ -651,30 +880,82 @@ class TestGenCameraGetImage:
         cam.ia.start.assert_called()
 
     def test_stall_recovery_is_one_shot(self):
-        """A second timeout within the same stall window doesn't re-trigger recovery."""
-        from harvesters.core import TimeoutException
+        """One restart per silence, not one every stall window.
+
+        The restart called start_acquisition(), which re-armed the recovery,
+        so a camera that stayed silent was restarted every five seconds for
+        as long as it stayed silent.
+        """
+        clock = [1000.0]
+
+        def silent(timeout):
+            clock[0] += timeout
+            return None
 
         cam = self._make_mock_camera()
-        cam.ia.fetch.side_effect = TimeoutException
-        cam._last_successful_fetch = time.monotonic() - 10.0
+        cam.ia.try_fetch.side_effect = silent
+        cam._last_successful_fetch = 990.0
+
+        with patch("pybeamprofiler.gen_camera.time.monotonic", side_effect=lambda: clock[0]):
+            with pytest.raises(TimeoutError):
+                cam.get_image(timeout=0.2)
+            assert cam.ia.start.call_count == 1
+            clock[0] += 60.0
+            with pytest.raises(TimeoutError):
+                cam.get_image(timeout=0.2)
+
+        assert cam.ia.start.call_count == 1
+
+    def test_a_long_exposure_is_not_aborted_by_recovery(self):
+        """An 8 s exposure the camera already had at open() used to be
+        restarted every 5 s and so never delivered a frame."""
+        clock = [0.0]
+        started = [0.0]
+
+        def exposing(timeout):
+            clock[0] += timeout
+            if clock[0] - started[0] >= 8.0:
+                started[0] = clock[0]
+                buf = MagicMock()
+                comp = MagicMock()
+                comp.width, comp.height = 2, 2
+                comp.data = np.zeros(4, dtype=np.uint8)
+                buf.__enter__.return_value.payload.components = [comp]
+                return buf
+            return None
+
+        cam = self._make_mock_camera()
+        cam.ia.try_fetch.side_effect = exposing
+        cam.ia.start.side_effect = lambda: started.__setitem__(0, clock[0])
+
+        frames = 0
+        with patch("pybeamprofiler.gen_camera.time.monotonic", side_effect=lambda: clock[0]):
+            while clock[0] < 60.0:
+                try:
+                    cam.get_image(timeout=0.1)
+                    frames += 1
+                except TimeoutError:
+                    pass
+        assert frames >= 6
+
+    def test_a_triggered_camera_is_not_restarted(self):
+        cam = self._make_mock_camera()
+        cam.node_map = MagicMock()
+        cam.node_map.TriggerMode.value = "On"
+        cam.ia.try_fetch.return_value = None
+        cam._last_successful_fetch = time.monotonic() - 60.0
 
         with pytest.raises(TimeoutError):
-            cam.get_image(timeout=0.1)
-        stop_calls = cam.ia.stop.call_count
-        start_calls = cam.ia.start.call_count
+            cam.get_image(timeout=0.05)
 
-        with pytest.raises(TimeoutError):
-            cam.get_image(timeout=0.1)
-
-        assert cam.ia.stop.call_count == stop_calls
-        assert cam.ia.start.call_count == start_calls
+        cam.ia.stop.assert_not_called()
 
     def test_first_timeout_seeds_stall_timer(self):
         """The very first fetch timing out should NOT trigger recovery."""
         from harvesters.core import TimeoutException
 
         cam = self._make_mock_camera()
-        cam.ia.fetch.side_effect = TimeoutException
+        cam.ia.try_fetch.side_effect = TimeoutException
         assert cam._last_successful_fetch == 0.0
 
         with pytest.raises(TimeoutError):
@@ -724,63 +1005,6 @@ class TestBaslerCameraInit:
             BaslerCamera()
         mock_parse.assert_called_once_with("/some/path")
 
-    @patch("pybeamprofiler.basler.platform.system")
-    @patch("pybeamprofiler.basler.os.path.isdir")
-    @patch("pybeamprofiler.basler.os.path.exists")
-    def test_find_basler_cti_linux(self, mock_exists, mock_isdir, mock_system):
-        """Test _find_basler_cti on Linux."""
-        from pybeamprofiler.basler import BaslerCamera
-
-        mock_system.return_value = "Linux"
-        mock_isdir.side_effect = lambda p: p == "/opt/pylon/lib/gentlproducer/gtl"
-        mock_exists.side_effect = lambda p: p == "/opt/pylon/lib/gentlproducer/gtl/ProducerGEV.cti"
-
-        result = BaslerCamera._find_basler_cti()
-        assert result is not None
-        assert any("ProducerGEV.cti" in f for f in result)
-
-    @patch("pybeamprofiler.basler.platform.system")
-    @patch("pybeamprofiler.basler.os.path.isdir")
-    def test_find_basler_cti_not_installed(self, mock_isdir, mock_system):
-        """Test _find_basler_cti returns None when SDK not installed."""
-        from pybeamprofiler.basler import BaslerCamera
-
-        mock_system.return_value = "Linux"
-        mock_isdir.return_value = False
-
-        result = BaslerCamera._find_basler_cti()
-        assert result is None
-
-    @patch("pybeamprofiler.basler.platform.system")
-    @patch("pybeamprofiler.basler.os.path.isdir")
-    @patch("pybeamprofiler.basler.os.path.exists")
-    def test_find_basler_cti_darwin(self, mock_exists, mock_isdir, mock_system):
-        """Test _find_basler_cti on macOS."""
-        from pybeamprofiler.basler import BaslerCamera
-
-        mock_system.return_value = "Darwin"
-        base = "/Library/Frameworks/pylon.framework/Libraries/gentlproducer/gtl"
-        mock_isdir.side_effect = lambda p: p == base
-        mock_exists.side_effect = lambda p: p == f"{base}/ProducerU3V.cti"
-
-        result = BaslerCamera._find_basler_cti()
-        assert result is not None
-
-    @patch("pybeamprofiler.basler.platform.system")
-    @patch("pybeamprofiler.basler.os.path.isdir")
-    @patch("pybeamprofiler.basler.os.path.exists")
-    def test_find_basler_cti_windows(self, mock_exists, mock_isdir, mock_system):
-        """Test _find_basler_cti on Windows."""
-        from pybeamprofiler.basler import BaslerCamera
-
-        mock_system.return_value = "Windows"
-        base = r"C:\Program Files\Basler\pylon 7\Runtime\x64"
-        mock_isdir.side_effect = lambda p: p == base
-        mock_exists.side_effect = lambda p: p == os.path.join(base, "ProducerGEV.cti")
-
-        result = BaslerCamera._find_basler_cti()
-        assert result is not None
-
 
 class TestFlirCameraInit:
     """Test FlirCamera initialization and CTI discovery."""
@@ -810,102 +1034,31 @@ class TestFlirCameraInit:
             FlirCamera()
         mock_parse.assert_called_once_with("/flir/path")
 
-    @patch("pybeamprofiler.flir.platform.system")
-    @patch("pybeamprofiler.flir.os.path.isdir")
-    @patch("pybeamprofiler.flir.os.listdir")
-    def test_find_flir_cti_linux(self, mock_listdir, mock_isdir, mock_system):
-        """Test _find_flir_cti on Linux."""
-        from pybeamprofiler.flir import FlirCamera
-
-        mock_system.return_value = "Linux"
-        mock_isdir.side_effect = lambda p: p == "/opt/spinnaker/lib/flir-gentl"
-        mock_listdir.return_value = ["FLIR_GenTL_v140.cti"]
-
-        result = FlirCamera._find_flir_cti()
-        assert result is not None
-        assert "FLIR_GenTL_v140.cti" in result
-
-    @patch("pybeamprofiler.flir.platform.system")
-    @patch("pybeamprofiler.flir.os.path.isdir")
-    def test_find_flir_cti_not_installed(self, mock_isdir, mock_system):
-        """Test _find_flir_cti returns None when SDK not installed."""
-        from pybeamprofiler.flir import FlirCamera
-
-        mock_system.return_value = "Linux"
-        mock_isdir.return_value = False
-
-        result = FlirCamera._find_flir_cti()
-        assert result is None
-
-    @patch("pybeamprofiler.flir.platform.system")
-    @patch("pybeamprofiler.flir.os.path.isdir")
-    @patch("pybeamprofiler.flir.os.listdir")
-    def test_find_flir_cti_darwin(self, mock_listdir, mock_isdir, mock_system):
-        """Test _find_flir_cti on macOS."""
-        from pybeamprofiler.flir import FlirCamera
-
-        mock_system.return_value = "Darwin"
-        mock_isdir.side_effect = lambda p: p == "/usr/local/lib/spinnaker-gentl"
-        mock_listdir.return_value = ["FLIR_GenTL.cti"]
-
-        result = FlirCamera._find_flir_cti()
-        assert result is not None
-
-    @patch("pybeamprofiler.flir.platform.system")
-    @patch("pybeamprofiler.flir.os.path.exists")
-    @patch("pybeamprofiler.flir.os.path.isdir")
-    @patch("pybeamprofiler.flir.os.listdir")
-    def test_find_flir_cti_windows(self, mock_listdir, mock_isdir, mock_exists, mock_system):
-        """Test _find_flir_cti on Windows."""
-        from pybeamprofiler.flir import FlirCamera
-
-        mock_system.return_value = "Windows"
-        base = r"C:\Program Files\Teledyne\Spinnaker\cti64"
-        mock_exists.return_value = True
-        mock_isdir.side_effect = lambda p: True
-        mock_listdir.side_effect = lambda p: ["vs2015"] if p == base else ["FLIR_GenTL_v140.cti"]
-
-        result = FlirCamera._find_flir_cti()
-        assert result is not None
-
-    @patch("pybeamprofiler.flir.platform.system")
-    @patch("pybeamprofiler.flir.os.path.exists")
-    @patch("pybeamprofiler.flir.os.path.isdir")
-    @patch("pybeamprofiler.flir.os.listdir")
-    def test_find_flir_cti_windows_oserror(
-        self, mock_listdir, mock_isdir, mock_exists, mock_system
-    ):
-        """Test _find_flir_cti handles OSError on Windows listdir."""
-        from pybeamprofiler.flir import FlirCamera
-
-        mock_system.return_value = "Windows"
-        mock_exists.return_value = True
-        mock_listdir.side_effect = OSError("Access denied")
-
-        result = FlirCamera._find_flir_cti()
-        assert result is None
-
     @patch("pybeamprofiler.flir.os.environ", {})
     @patch("pybeamprofiler.flir.FlirCamera._find_flir_cti")
-    def test_flir_init_no_cti_found(self, mock_find):
+    def test_flir_init_no_cti_found(self, mock_find, caplog):
         """Test FlirCamera warns when no CTI found."""
         from pybeamprofiler.flir import FlirCamera
 
         mock_find.return_value = None
         mock_harvester = MagicMock()
         with patch("pybeamprofiler.gen_camera.Harvester", mock_harvester):
-            FlirCamera()
+            with caplog.at_level("WARNING"):
+                FlirCamera()
+        assert "FLIR Spinnaker CTI not found" in caplog.text
 
     @patch("pybeamprofiler.basler.os.environ", {})
     @patch("pybeamprofiler.basler.BaslerCamera._find_basler_cti")
-    def test_basler_init_no_cti_found(self, mock_find):
+    def test_basler_init_no_cti_found(self, mock_find, caplog):
         """Test BaslerCamera warns when no CTI found."""
         from pybeamprofiler.basler import BaslerCamera
 
         mock_find.return_value = None
         mock_harvester = MagicMock()
         with patch("pybeamprofiler.gen_camera.Harvester", mock_harvester):
-            BaslerCamera()
+            with caplog.at_level("WARNING"):
+                BaslerCamera()
+        assert "Basler Pylon CTI not found" in caplog.text
 
     @patch("pybeamprofiler.basler.os.environ", {})
     @patch("pybeamprofiler.basler.BaslerCamera._find_basler_cti")
@@ -920,21 +1073,6 @@ class TestFlirCameraInit:
         with patch("pybeamprofiler.gen_camera.Harvester", mock_harvester):
             BaslerCamera()
         mock_find.assert_called_once()
-
-    @patch("pybeamprofiler.flir.platform.system")
-    @patch("pybeamprofiler.flir.os.path.isdir")
-    @patch("pybeamprofiler.flir.os.listdir")
-    def test_find_flir_cti_linux_listdir_oserror(self, mock_listdir, mock_isdir, mock_system):
-        """Per-directory ``os.listdir`` failure on Linux must be swallowed
-        and allow the search to continue (line 88-89)."""
-        from pybeamprofiler.flir import FlirCamera
-
-        mock_system.return_value = "Linux"
-        mock_isdir.return_value = True  # claims dir exists
-        mock_listdir.side_effect = OSError("EACCES")
-
-        # No exception propagates, we just get None back.
-        assert FlirCamera._find_flir_cti() is None
 
 
 class TestGenCameraDetection:
@@ -1067,11 +1205,15 @@ class TestGenCameraDetection:
         assert cam.node_map.GammaEnable.value is False
         cam._reset_roi_to_full_sensor.assert_called_once()
 
+    @requires_genicam
     def test_reset_roi_to_full_sensor(self):
-        """Test _reset_roi_to_full_sensor sets offset and max dimensions."""
+        """A camera left with an offset ROI is reset in a legal order."""
+        from _genapi_device import make_node_map
+
         cam = self._make_cam()
-        cam.node_map.WidthMax.value = 2048
-        cam.node_map.HeightMax.value = 1536
+        cam.node_map = make_node_map()
+        cam.node_map.Width.value = 400
+        cam.node_map.OffsetX.value = 1500  # only legal once Width is small
         cam._reset_roi_to_full_sensor()
         assert cam.node_map.OffsetX.value == 0
         assert cam.node_map.OffsetY.value == 0
@@ -1232,27 +1374,35 @@ class TestGenCameraDetection:
 
         assert cam.width == 1024
 
-    def test_set_exposure_both_fail(self):
-        """Test set_exposure when both ExposureTime and ExposureTimeAbs fail."""
+    def test_set_exposure_refused(self):
+        """A refused write is an error, and exposure_time keeps the old value.
+
+        It used to be logged and then recorded anyway, so the GUI showed an
+        exposure the camera was not using.
+        """
         cam = self._make_cam()
+        cam.exposure_time = 0.02
         type(cam.node_map.ExposureTime).value = property(
             fset=MagicMock(side_effect=AttributeError("no"))
         )
-        type(cam.node_map.ExposureTimeAbs).value = property(
-            fset=MagicMock(side_effect=AttributeError("no"))
-        )
-        cam.set_exposure(0.01)
-        assert cam.exposure_time == 0.01
+        with pytest.raises(RuntimeError, match="refused an exposure"):
+            cam.set_exposure(0.01)
+        assert cam.exposure_time == 0.02
 
-    def test_set_gain_both_fail(self):
-        """Test set_gain when both Gain and GainRaw fail."""
+    def test_set_gain_refused(self):
         cam = self._make_cam()
+        cam.gain = 1.0
         type(cam.node_map.Gain).value = property(fset=MagicMock(side_effect=AttributeError("no")))
-        type(cam.node_map.GainRaw).value = property(
-            fset=MagicMock(side_effect=AttributeError("no"))
-        )
-        cam.set_gain(5.0)
-        assert cam.gain == 5.0
+        with pytest.raises(RuntimeError, match="refused a gain"):
+            cam.set_gain(5.0)
+        assert cam.gain == 1.0
+
+    def test_no_exposure_feature_leaves_exposure_alone(self):
+        cam = self._make_cam()
+        cam.node_map = MagicMock(spec=[])
+        cam.exposure_time = 0.02
+        cam.set_exposure(0.5)
+        assert cam.exposure_time == 0.02
 
     def test_set_roi_error_handling(self):
         """Test set_roi handles exceptions."""
@@ -1272,14 +1422,16 @@ class TestGenCameraDetection:
         cam.ia = mock_ia
 
         mock_component = MagicMock()
-        mock_component.data.reshape.return_value.copy.return_value = np.zeros((480, 640))
+        # A real array, not a mock of one: the payload is reshaped by size, so
+        # mocking .reshape() away would hide whether that maths is right.
+        mock_component.data = np.zeros(640 * 480, dtype=np.uint8)
         mock_component.width = 640
         mock_component.height = 480
 
         mock_buffer = MagicMock()
         mock_buffer.payload.components = [mock_component]
-        mock_ia.fetch.return_value.__enter__ = MagicMock(return_value=mock_buffer)
-        mock_ia.fetch.return_value.__exit__ = MagicMock(return_value=False)
+        mock_ia.try_fetch.return_value.__enter__ = MagicMock(return_value=mock_buffer)
+        mock_ia.try_fetch.return_value.__exit__ = MagicMock(return_value=False)
 
         try:
             img = cam.get_image(timeout=1.0)
@@ -2133,6 +2285,7 @@ class TestDiscoverFeatures:
         assert "Gamma" in all_features
         assert "BadNode" not in all_features
 
+    @requires_genicam
     def test_nodes_api_with_interface_type_and_visibility(self):
         """Simulate a real GenICam ``node_map`` that exposes a ``.nodes``
         iterable where each entry has ``principal_interface_type`` /

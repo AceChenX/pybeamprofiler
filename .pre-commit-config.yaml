@@ -12,10 +12,14 @@ repos:
       - id: trailing-whitespace
 
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.14.0
+    rev: v0.16.9
+    # Python only. Releases after 0.16.4 also format code blocks in
+    # Markdown, which would flatten the aligned comments in the README.
     hooks:
       - id: ruff-format
+        types_or: [python, pyi]
       - id: ruff
+        types_or: [python, pyi]
         args: [
           --fix,
           --exit-non-zero-on-fix,

@@ -4,6 +4,7 @@ from unittest.mock import MagicMock, Mock, patch
 
 import numpy as np
 import pytest
+from conftest import requires_harvesters
 
 
 class TestHarvesterCamera:
@@ -21,7 +22,13 @@ class TestHarvesterCamera:
 
         camera = HarvesterCamera(cti_file="/path/to/test.cti")
 
-        assert camera.h == mock_h
+        # Nothing is loaded until open(): the process-wide Harvester is
+        # only taken when a device is actually claimed.
+        assert camera.h is None
+        mock_h.add_file.assert_not_called()
+        mock_h.device_info_list = []
+        with pytest.raises(RuntimeError, match="No GenICam cameras found"):
+            camera.open()
         mock_h.add_file.assert_called_once_with("/path/to/test.cti")
 
     @patch("pybeamprofiler.gen_camera.Harvester")
@@ -122,13 +129,20 @@ class TestFlirCamera:
         # Verify parent class initialization was called
         assert mock_super_init.called
 
-    def test_find_flir_cti(self):
-        """Test FLIR CTI path search."""
+    def test_find_flir_cti(self, tmp_path, monkeypatch):
+        """None with no SDK installed; otherwise the first Spinnaker producer."""
+        from pybeamprofiler import cti
         from pybeamprofiler.flir import FlirCamera
 
-        # Returns None when CTI files are not found, or path string if available
-        cti_path = FlirCamera._find_flir_cti()
-        assert cti_path is None or isinstance(cti_path, str)
+        assert FlirCamera._find_flir_cti() is None  # the suite blanks the SDK tables
+
+        (tmp_path / "FLIR_GenTL.cti").write_bytes(b"")
+        monkeypatch.setattr(
+            cti, "_VENDOR_DIRS", {"TestOS": {cti.SPINNAKER: (cti._SearchDir(str(tmp_path)),)}}
+        )
+        monkeypatch.setattr(cti.platform, "system", lambda: "TestOS")
+        found = FlirCamera._find_flir_cti()
+        assert isinstance(found, str) and found.endswith("FLIR_GenTL.cti")
 
 
 class TestBaslerCamera:
@@ -148,13 +162,25 @@ class TestBaslerCamera:
         # Verify parent class initialization was called
         assert mock_super_init.called
 
-    def test_find_basler_cti(self):
-        """Test Basler CTI path search."""
+    def test_find_basler_cti(self, tmp_path, monkeypatch):
+        """None with no SDK installed; otherwise every Pylon producer."""
+        from pybeamprofiler import cti
         from pybeamprofiler.basler import BaslerCamera
 
-        # Returns None when CTI files are not found, or list of paths if available
-        cti_path = BaslerCamera._find_basler_cti()
-        assert cti_path is None or isinstance(cti_path, list)
+        assert BaslerCamera._find_basler_cti() is None  # the suite blanks the SDK tables
+
+        for name in ("ProducerGEV.cti", "ProducerU3V.cti"):
+            (tmp_path / name).write_bytes(b"")
+        monkeypatch.setattr(
+            cti, "_VENDOR_DIRS", {"TestOS": {cti.PYLON: (cti._SearchDir(str(tmp_path)),)}}
+        )
+        monkeypatch.setattr(cti.platform, "system", lambda: "TestOS")
+        found = BaslerCamera._find_basler_cti()
+        assert isinstance(found, list)
+        assert [p.rsplit("/", 1)[-1].rsplit("\\", 1)[-1] for p in found] == [
+            "ProducerGEV.cti",
+            "ProducerU3V.cti",
+        ]
 
     def test_pylon_producers_constant(self):
         """Test that PYLON_PRODUCERS constant is defined and contains expected producers."""
@@ -177,12 +203,8 @@ class TestCameraUtils:
 
     def test_list_cameras(self):
         """Test camera listing."""
-        import sys
-
         from pybeamprofiler.utils import list_cameras
 
-        mock_harvesters = Mock()
-        mock_core = Mock()
         mock_harvester_class = Mock()
 
         mock_h = Mock()
@@ -194,12 +216,10 @@ class TestCameraUtils:
         mock_h.device_info_list = [mock_device]
 
         mock_harvester_class.return_value = mock_h
-        mock_core.Harvester = mock_harvester_class
-        mock_harvesters.core = mock_core
 
-        # Mock harvesters module for testing without hardware dependency
-        with patch.dict(sys.modules, {"harvesters": mock_harvesters, "harvesters.core": mock_core}):
-            with patch("pybeamprofiler.utils.find_cti_files", return_value=["/fake/path.cti"]):
+        # Discovery builds its Harvester through gen_camera, like the cameras.
+        with patch("pybeamprofiler.gen_camera.Harvester", mock_harvester_class):
+            with patch("pybeamprofiler.discovery.find_cti_files", return_value=["/fake/path.cti"]):
                 cameras = list_cameras()
 
                 assert len(cameras) == 1
@@ -292,6 +312,7 @@ class TestHarvesterCameraErrors:
             assert "not found" in str(e)
 
 
+@requires_harvesters
 class TestHarvesterCameraGetImage:
     """Test get_image auto-start and timeout wrapping."""
 
@@ -318,7 +339,7 @@ class TestHarvesterCameraGetImage:
         mock_buffer.payload.components = [mock_component]
         mock_buffer.__enter__ = lambda s: mock_buffer
         mock_buffer.__exit__ = lambda s, *a: None
-        cam.ia.fetch.return_value = mock_buffer
+        cam.ia.try_fetch.return_value = mock_buffer
 
         try:
             cam.get_image(timeout=1.0)
@@ -339,7 +360,7 @@ class TestHarvesterCameraGetImage:
 
         cam = self._make_camera()
         cam.is_acquiring = True
-        cam.ia.fetch.side_effect = TimeoutException
+        cam.ia.try_fetch.side_effect = TimeoutException
 
         try:
             with pytest.raises(TimeoutError, match="did not deliver a frame"):

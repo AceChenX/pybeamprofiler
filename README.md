@@ -10,11 +10,12 @@ Real-time laser beam profiler with Gaussian fitting for GenICam cameras.
 
 - **Real-time Gaussian fitting** — 1D projections (230+ fps), 2D with rotation (50+ fps), linecut (300+ fps)
 - **Browser-based GUI** — Dash web interface with live heatmap, fits, dark/light theme, 30+ color scales, and camera controls
+- **Multi-camera** — discover attached cameras, pick one from the dropdown, press Play; switch devices without restarting
 - **Multiple width definitions** — Gaussian (1/e²), FWHM, D4σ (ISO 11146)
 - **GenICam hardware support** — FLIR (Spinnaker) and Basler (Pylon) via [Harvesters](https://github.com/genicam/harvesters); auto-discovered features grouped by SFNC category
 - **Jupyter support** — Live streaming with `bp.setting()` interactive widgets
 - **Simulated camera** — Gaussian beam with noise, no hardware needed
-- **Auto-configuration** — Pixel size detection for 40+ sensor models
+- **Auto-configuration** — pixel size read from the camera, or looked up for 30 common sensors and models when the camera doesn't report it
 
 ## Quick Start
 
@@ -32,24 +33,54 @@ pybeamprofiler --camera basler     # Basler / Pylon
 The browser opens automatically at http://127.0.0.1:8050. Press **Ctrl+C** in
 the terminal to stop the server and exit.
 
+### Switching cameras
+
+The **Camera** dropdown at the top of the Fitting tab lists every camera found
+on the machine, plus the built-in simulators. Press ⟳ to rescan after plugging
+something in. Selecting a camera opens it and leaves the stream stopped — press
+**Play** (or the spacebar) to start acquiring.
+
+Switching releases the previous device, so nothing stays claimed. If the camera
+you pick cannot be opened — unplugged, or held by Spinnaker/pylon Viewer — the
+current stream keeps running and the reason is shown under the dropdown.
+
+A camera plugged in *while a real camera is open* shows up only after that
+camera is closed: listing new devices means re-enumerating the GenTL producer,
+which would tear down the open one. Switch to a simulator, press ⟳, and the new
+camera is offered.
+
+Two simulated cameras are always offered. They have different sensor sizes,
+pixel pitches and beam shapes (the second is tilted 35°), so the selector and
+the 2D fit can both be exercised with no hardware attached.
+
 ## Installation
 
 ```bash
 pip install pybeamprofiler
 ```
 
-For real hardware (FLIR or Basler), also install the corresponding SDK and set the CTI path:
+For real hardware (FLIR or Basler), also install the vendor's SDK
+([Spinnaker](https://www.teledynevisionsolutions.com/products/spinnaker-sdk/) or
+[Pylon](https://www.baslerweb.com/en-us/software/pylon/sdk/)). It provides the
+GenTL producer, a `.cti` file, that the camera is reached through. Its standard
+install location is searched automatically, and so is everything listed in
+`GENICAM_GENTL64_PATH`, which the Spinnaker installer sets:
 
-| Vendor | SDK | `GENICAM_GENTL64_PATH` |
-|--------|-----|------------------------|
-| FLIR | [Spinnaker](https://www.teledynevisionsolutions.com/products/spinnaker-sdk/) | `/usr/local/lib/spinnaker-gentl` (macOS/Linux) |
-| Basler (macOS) | [Pylon](https://www.baslerweb.com/en-us/software/pylon/sdk/) | `/Library/Frameworks/pylon.framework/Libraries/gentlproducer/gtl` |
-| Basler (Linux) | [Pylon](https://www.baslerweb.com/en-us/software/pylon/sdk/) | `/opt/pylon/lib64/gentlproducer/gtl` |
-| Basler (Windows) | [Pylon](https://www.baslerweb.com/en-us/software/pylon/sdk/) | `C:\Program Files\Basler\pylon\Runtime\x64` |
+| | FLIR (Spinnaker) | Basler (Pylon) |
+|---|---|---|
+| Windows | `C:\Program Files\Teledyne\Spinnaker\cti64\*` (`FLIR Systems` for `Teledyne` on older installs) | `C:\Program Files\Basler\pylon\Runtime\x64`, or `pylon 8` … `pylon 5` for `pylon` |
+| Linux | `/opt/spinnaker/lib/flir-gentl` | `/opt/pylon/lib64/gentlproducer/gtl` (or `lib`; also `/opt/pylon5`) |
+| macOS | `/usr/local/lib/spinnaker-gentl` | `/Library/Frameworks/pylon.framework/Libraries/gentlproducer/gtl` |
+
+The complete list is in `src/pybeamprofiler/cti.py`. For a producer
+anywhere else, add its directory (or the `.cti` itself) to the variable,
+separating entries with `;` on Windows and `:` elsewhere:
 
 ```bash
 export GENICAM_GENTL64_PATH=/path/to/cti/files
 ```
+
+or hand it to the camera directly, as shown under [Python API](#python-api).
 
 > **Note:** GenICam cameras allow only one application to connect at a time — close Spinnaker GUI / Pylon Viewer first.
 
@@ -76,11 +107,14 @@ Press **Ctrl+C** in the terminal to stop streaming and exit.
 ### Python API
 
 ```python
-from pybeamprofiler import BeamProfiler, print_camera_info
+from pybeamprofiler import BaslerCamera, BeamProfiler, discover_cameras, print_camera_info
 
 print_camera_info()                    # list connected cameras
+discover_cameras()                     # the same list the GUI dropdown shows
 
 bp = BeamProfiler(camera="simulated")
+bp = BeamProfiler(camera="flir", serial_number="12345678")   # pick a device
+bp = BeamProfiler(camera=BaslerCamera(cti_file="/path/to/ProducerU3V.cti"))  # pick a producer
 bp.plot()                              # open browser GUI
 bp.plot(num_img=1)                     # single shot
 
@@ -94,12 +128,15 @@ bp.setting(exposure_time=0.05, Gain=10.0)
 bp.setting()
 ```
 
-See [the API docs](https://github.com/acechenx/pybeamprofiler) for fitting methods (`1d`, `2d`, `linecut`), width definitions (`gaussian`, `fwhm`, `d4s`), ROI control, and more.
+The docstrings (`help(BeamProfiler)`, `help(bp.analyze)`) cover the rest: fitting methods (`1d`, `2d`, `linecut`), width definitions (`gaussian`, `fwhm`, `d4s`; also below), ROI control (`bp.set_roi(offset_x, offset_y, width, height)`), and more.
 
 ### Width definitions
 
-`width_x` / `width_y` are reported in whichever definition you select, and the
-derived properties convert between them from the fitted Gaussian sigma:
+`width_x` / `width_y` are reported in whichever definition you select. The
+derived properties convert that width to the other thresholds as a Gaussian
+beam would have them, through σ (the width over 4 for `gaussian` and `d4s`,
+over 2.3548 for `fwhm`), so on a beam that is not Gaussian they are estimates
+rather than measurements:
 
 | Property | Threshold | Multiple of σ |
 |----------|-----------|---------------|
@@ -112,16 +149,24 @@ order as FWHM < FW@1/e < FW@1/e². `d4s` is the ISO 11146 second-moment width,
 which equals 4σ for a Gaussian but — unlike a fit — stays meaningful for
 flat-top and multi-lobed beams.
 
-Choosing `fwhm` or `d4s` measures directly off the integrated profile with no
-model, so it takes precedence over `fit`; the Gaussian fit still runs, but only
-to draw the overlay.
+Choosing `fwhm` or `d4s` measures directly off the frame with no model, so it
+takes precedence over `fit`: whatever `fit` is set to, only the 1D fits of the
+projections run, to draw the curves over the profiles, and `angle_deg` stays 0.
+`d4s` follows ISO 11146: the background is removed and the moments are taken
+inside a window three beam widths across, iterated until it settles. `fwhm` is
+read off profiles summed over just the band the beam occupies, which keeps the
+noise of the rest of the sensor out of it.
+
+A frame with no beam standing clear of the noise (a blocked beam, a blank
+sensor) reports NaN widths rather than a fit to the noise, and the next frame
+with a beam is measured afresh.
 
 ## Troubleshooting
 
-- **Camera not found** — verify SDK install, `GENICAM_GENTL64_PATH`, and run `print_camera_info()`.
+- **Camera not found** — verify the SDK install and `GENICAM_GENTL64_PATH` (see [Installation](#installation)), and run `print_camera_info()`.
 - **Access denied** — close other camera software (Spinnaker GUI, Pylon Viewer).
-- **Jupyter camera stuck** — restart the kernel to release the hardware lock.
-- **Basler USB3** — pass the USB3 CTI explicitly: `BaslerCamera(cti_file="/path/to/ProducerU3V.cti")`.
+- **Jupyter camera stuck** — `bp.stop()`, then `bp.camera.close()`, releases the device (a `with BeamProfiler(...) as bp:` block does both on exit); restart the kernel only if that fails.
+- **`GenTL producer does not implement DS…` in the terminal** — harmless. genicam 1.6 prints these lines whenever it scans a producer that predates the newest GenTL functions; the camera still works.
 
 ---
 
@@ -152,16 +197,26 @@ uv run pytest --cov-report=html        # HTML coverage report
 uv run pytest tests/test_profiler.py   # single file
 ```
 
+Two scripts measure what the tests only bound (pytest doesn't collect them):
+
+```bash
+uv run python tests/benchmarks/analyze_timing.py    # time per frame, every fit and definition
+uv run python tests/benchmarks/accuracy_matrix.py   # width error against the true beam
+```
+
 ### Architecture
 
 - `fitting.py` — Gaussian models, direct width measurements, curve fits, decimation (pure functions over arrays; no camera or plotting state)
-- `beamprofiler.py` — `BeamProfiler` class, figure building, streaming, CLI entry point
+- `cti.py` — one table of GenTL producer (`.cti`) search paths, shared by every vendor
+- `discovery.py` — enumerating cameras and opening the selected one (`utils.py` re-exports it)
+- `beamprofiler.py` — `BeamProfiler` class: analysis state, the Jupyter figures and stream, serving the GUI
+- `cli.py` — the `pybeamprofiler` command (also `python -m pybeamprofiler`)
 - `camera.py` — abstract `Camera` base class + Jupyter widget builder
 - `gen_camera.py` — `HarvesterCamera` for GenICam devices
 - `flir.py` / `basler.py` — vendor-specific subclasses
-- `simulated.py` — `SimulatedCamera` (no hardware)
-- `dash_app.py` — browser GUI with live updates, settings panel, pattern-matching callbacks
-- `utils.py` — camera discovery helpers
+- `simulated.py` — `SimulatedCamera` and its beam profiles (no hardware)
+- `dash_layout.py` — what the browser GUI looks like: the page and its component builders
+- `dash_app.py` — what it does: the live figure, the app factory, and every callback
 - `constants.py` — shared constants and conversion factors
 
 ### Contributing
@@ -173,7 +228,8 @@ uv run pytest tests/test_profiler.py   # single file
 
 ### Performance notes
 
-- 2D fits downsample to 256 px on the longest edge and warm-start Levenberg-Marquardt from the previous frame; a failed fit is retried from a fresh estimate rather than left stuck on stale parameters
+- 2D fits run on at most 128 px along the longest edge: a large beam is downsampled, a small one is cropped out of the sensor instead. They warm-start Levenberg-Marquardt from the previous frame, and a fit that fails or lands on something that is not a beam is retried from a fresh estimate rather than left stuck on stale parameters
+- FWHM and D4σ are computed from row and column sums of the raw frame inside the ISO 11146 integration window, never from a full-frame floating-point copy
 - Display decimation is nearest-neighbour fancy indexing (~4× faster than interpolated zoom at 1024 px, and it shows real sensor counts rather than blended ones)
 - Projection profiles are cached between `analyze()` and figure rendering
 - GenICam feature discovery is memoised per node map — the `.value` probe it relies on is a register read per node, which costs hundreds of round trips on a GigE camera
@@ -182,7 +238,7 @@ uv run pytest tests/test_profiler.py   # single file
 
 ### Supported sensors
 
-Auto-detected pixel sizes (40+ models) — Sony IMX174, IMX183, IMX226, IMX249, IMX250, IMX252, IMX253, IMX255, IMX264, IMX265, IMX273, IMX287, IMX290, IMX291, IMX304, IMX392, IMX412, IMX477, IMX485, IMX530, IMX531, IMX540, IMX541, IMX542, IMX547, and direct Basler model lookups (acA4024-8gm, acA4024-29um, acA1920-155um, acA2440-75um, acA3800-14um).
+When a camera doesn't report its pixel size (`SensorPixelWidth`, `SensorPixelHeight` or `PixelSize`), it is looked up from the sensor named in `SensorDescription` or the model in `DeviceModelName`. Known sensors: Sony IMX174, IMX183, IMX226, IMX249, IMX250, IMX252, IMX253, IMX255, IMX264, IMX265, IMX273, IMX287, IMX290, IMX291, IMX304, IMX392, IMX412, IMX477, IMX485, IMX530, IMX531, IMX540, IMX541, IMX542, IMX547; and Basler models acA4024-8gm, acA4024-29um, acA1920-155um, acA2440-75um, acA3800-14um. Anything else falls back to 1 μm, with a warning — pass `pixel_size` then.
 
 ---
 

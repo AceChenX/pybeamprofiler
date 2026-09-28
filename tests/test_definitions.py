@@ -41,7 +41,7 @@ class TestFWHMDefinition:
         assert bp.camera is not None
         # Remove simulation noise for tight bounds
         setattr(bp.camera, "_noise_center", 0.0)
-        setattr(bp.camera, "_noise_sigma", 0.0)
+        setattr(bp.camera, "_noise_sigma_frac", 0.0)
         setattr(bp.camera, "_noise_amp", 0.0)
         setattr(bp.camera, "_noise_bg", 0.0)
         setattr(bp.camera, "_noise_image", 0.0)
@@ -71,7 +71,7 @@ class TestD4SigmaDefinition:
         assert bp.camera is not None
         # Remove simulation noise for tight bounds
         setattr(bp.camera, "_noise_center", 0.0)
-        setattr(bp.camera, "_noise_sigma", 0.0)
+        setattr(bp.camera, "_noise_sigma_frac", 0.0)
         setattr(bp.camera, "_noise_amp", 0.0)
         setattr(bp.camera, "_noise_bg", 0.0)
         setattr(bp.camera, "_noise_image", 0.0)
@@ -183,14 +183,14 @@ class TestDefinitionEdgeCases:
 
     @pytest.mark.parametrize("definition", ["gaussian", "fwhm", "d4s"])
     def test_empty_image_all_definitions(self, definition):
-        """Test empty images don't crash with any definition."""
+        """An empty frame reports no beam with every definition."""
         bp = BeamProfiler(camera="simulated", definition=definition)
         assert bp.camera is not None
         empty_img = np.zeros((100, 100))
 
         popt_x, popt_y = bp.analyze(empty_img)
-        assert popt_x is not None
-        assert popt_y is not None
+        assert popt_x is None and popt_y is None
+        assert np.isnan(bp.width_x) and np.isnan(bp.width_y)
 
         bp.camera.close()
 
@@ -226,7 +226,7 @@ class TestWidthDefinitions:
         bp = BeamProfiler(camera="simulated", fit="1d", definition="fwhm")
         assert bp.camera is not None
         setattr(bp.camera, "_noise_center", 0.0)
-        setattr(bp.camera, "_noise_sigma", 0.0)
+        setattr(bp.camera, "_noise_sigma_frac", 0.0)
         setattr(bp.camera, "_noise_amp", 0.0)
         setattr(bp.camera, "_noise_bg", 0.0)
         setattr(bp.camera, "_noise_image", 0.0)
@@ -255,7 +255,7 @@ class TestWidthDefinitions:
         for bp_inst in [bp_gaussian, bp_fwhm, bp_d4s]:
             for attr in [
                 "_noise_center",
-                "_noise_sigma",
+                "_noise_sigma_frac",
                 "_noise_amp",
                 "_noise_bg",
                 "_noise_image",
@@ -298,7 +298,11 @@ class TestWidthDefinitions:
 
             assert bp.width_x > 0, f"Failed for definition={definition}"
             assert bp.width_y > 0, f"Failed for definition={definition}"
-            assert hasattr(bp, "angle_deg"), f"No angle for definition={definition}"
+            # Only the 2D Gaussian fit measures an angle; FWHM and D4σ skip it.
+            if definition == "gaussian":
+                assert 0 <= bp.angle_deg < 180, f"angle {bp.angle_deg} for {definition}"
+            else:
+                assert bp.angle_deg == 0.0, f"angle {bp.angle_deg} for {definition}"
 
             bp.camera.close()
 
@@ -436,23 +440,18 @@ class TestHarvesterIntegration:
         assert bp.camera is not None
         bp.camera.close()
 
-        # FLIR/Basler will fall back to simulated if hardware not available
-        # But should not crash
-        try:
-            bp_flir = BeamProfiler(camera="flir")
-            if bp_flir.camera:
-                bp_flir.camera.close()
-        except Exception:
-            # Camera initialization fails without hardware or drivers
-            pass
+        # A physical camera that cannot be opened is an error, never a quiet
+        # fall-back to simulated data that would pass for a measurement.
+        # Harvester is patched to a bus with no devices, so this holds on any
+        # machine, with or without an SDK or the binary bindings installed.
+        from unittest.mock import MagicMock, patch
 
-        try:
-            bp_basler = BeamProfiler(camera="basler")
-            if bp_basler.camera:
-                bp_basler.camera.close()
-        except Exception:
-            # Camera initialization fails without hardware or drivers
-            pass
+        empty_bus = MagicMock()
+        empty_bus.return_value.device_info_list = []
+        with patch("pybeamprofiler.gen_camera.Harvester", empty_bus):
+            for kind in ("flir", "basler"):
+                with pytest.raises(RuntimeError, match=f"Failed to open {kind} camera"):
+                    BeamProfiler(camera=kind)
 
 
 class TestEdgeCases:
@@ -463,11 +462,9 @@ class TestEdgeCases:
         for definition in ["gaussian", "fwhm", "d4s"]:
             bp = BeamProfiler(definition=definition)
             img = np.zeros((100, 100))
-            # Should not crash, even if it returns some fit (scipy can fit zeros)
             popt_x, popt_y = bp.analyze(img)
-            # Just verify it doesn't crash and returns something
-            assert popt_x is not None
-            assert popt_y is not None
+            assert popt_x is None and popt_y is None
+            assert np.isnan(bp.width_x)
 
     def test_definition_switching(self):
         """Test switching definition on the fly."""

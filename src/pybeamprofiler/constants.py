@@ -19,9 +19,31 @@ SIMULATED_BACKGROUND = 10  # baseline intensity
 # Fitting parameters
 MAX_FIT_ITERATIONS = 100
 # Longest edge a 2D fit is allowed to see. curve_fit over a megapixel grid
-# takes hundreds of ms; 256² keeps it interactive with no measurable loss of
-# accuracy for beams that span more than a handful of pixels.
-MAX_FIT_2D_DIM = 256
+# takes hundreds of ms. Sweeping grid size against known beams showed the
+# recovered widths flat from 256 down to 128 (0.3% -> 0.7% error) while the
+# fit got 3.5x faster, so 128 it is -- at 256 a single frame cost more than
+# the 50 ms render tick and the GUI could not keep up.
+MAX_FIT_2D_DIM = 128
+
+# Smallest beam sigma, in pixels, that the fit grid must still resolve.
+# Below roughly one pixel the fit degrades badly (7% error) and then stops
+# converging, so a beam that would decimate below this is cropped to a window
+# around itself instead of being fitted blind.
+MIN_FIT_2D_SIGMA_PX = 3.0
+
+# Half-width of that crop window, in beam sigmas. Four sigma already contains
+# 99.99% of the beam; five leaves a ring of baseline for the offset term to
+# key on without dragging in the whole sensor.
+FIT_2D_WINDOW_SIGMAS = 5.0
+
+# Never crop below this, or there is too little data behind seven free
+# parameters for the fit to be meaningful.
+MIN_FIT_2D_WINDOW_PX = 32
+
+# Hard cap on model evaluations per 2D fit. This bounds the worst case a
+# single render tick can cost; scipy's own default for the bounded solver is
+# 100x the parameter count, which is 700 here.
+MAX_FIT_2D_EVALS = 200
 
 # Width conversion factors, all relative to the Gaussian sigma of an
 # *intensity* profile I(x) = A·exp(-(x-x₀)²/2σ²).  Solving for the full
@@ -40,6 +62,10 @@ D4SIGMA_FACTOR = 4.0
 # Web interface
 DEFAULT_DASH_PORT = 8050
 DEFAULT_UPDATE_INTERVAL_MS = 50  # milliseconds
+
+# Maximum frames in the rolling-average buffer. Caps memory at N x frame
+# size, and bounds the input the GUI offers.
+MAX_AVG_FRAMES = 32
 
 # Display
 MAX_DISPLAY_DIM = 1024

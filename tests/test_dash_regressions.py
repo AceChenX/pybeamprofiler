@@ -1,0 +1,1218 @@
+"""Regression tests for defects found reviewing the Dash GUI.
+
+One class per defect, each saying what used to go wrong, in the style of
+``test_regressions.py``. The callbacks are driven directly, as in the rest of
+the Dash suite; the few behaviours that only a browser can show (the page
+served on reload, mouse zoom) are covered here at the level the server
+controls, and were checked end to end in headless Chrome as well.
+"""
+
+from __future__ import annotations
+
+import warnings
+from collections.abc import Iterator
+from typing import Any
+from unittest.mock import patch
+
+import dash
+import numpy as np
+import plotly.graph_objs as go
+import pytest
+from dash import html
+from dash.development.base_component import Component
+
+from pybeamprofiler import dash_app, dash_layout, discovery
+from pybeamprofiler.beamprofiler import BeamProfiler
+from pybeamprofiler.simulated import SimulatedCamera, profile_for
+
+
+def _callbacks(bp: BeamProfiler) -> dict[str, Any]:
+    """Register the app's callbacks and return them keyed by function name."""
+    app = dash.Dash(__name__)
+    app.layout = html.Div()
+    captured: dict[str, Any] = {}
+    original = app.callback
+
+    def tracking(*args, **kwargs):
+        def decorator(f):
+            captured[f.__name__] = f
+            return original(*args, **kwargs)(f)
+
+        return decorator
+
+    app.callback = tracking  # ty: ignore[invalid-assignment]
+    dash_app._register_callbacks(app, bp)
+    return captured
+
+
+def _registered(app: dash.Dash, name: str) -> Any:
+    """The undecorated function behind one of a real app's callbacks."""
+    for spec in app.callback_map.values():
+        fn = spec.get("callback")
+        if fn is not None and getattr(fn, "__wrapped__", fn).__name__ == name:
+            return fn.__wrapped__
+    raise KeyError(name)
+
+
+def _by_id(page: Any) -> dict[str, Any]:
+    """Every component in *page* that has a plain string id, keyed by it."""
+    found: dict[str, Any] = {}
+
+    def walk(node: Any) -> None:
+        if isinstance(node, Component):
+            cid = getattr(node, "id", None)
+            if isinstance(cid, str):
+                found[cid] = node
+            walk(getattr(node, "children", None))
+            walk(getattr(node, "label", None))
+        elif isinstance(node, (list, tuple)):
+            for child in node:
+                walk(child)
+
+    walk(page)
+    return found
+
+
+def _page_load(app: dash.Dash) -> Any:
+    """What Dash serves for one page load, whether the layout is a tree or a
+    function that builds one."""
+    return app._layout_value()
+
+
+def _tick(
+    cbs: dict[str, Any],
+    *,
+    analysis: str = "1d",
+    definition: str = "gaussian",
+    avg_n: int = 1,
+    paused: bool = False,
+    color_on: bool = True,
+    auto_range: bool = True,
+    zmin: float | None = None,
+    zmax: float | None = None,
+) -> tuple[Any, ...]:
+    """One render tick, with the State bundle the browser would send."""
+    return cbs["update_live"](
+        1, paused, color_on, "Hot", auto_range, zmin, zmax, 0, analysis, definition, True, avg_n
+    )
+
+
+def _profiler(profile: str = "sim-1", seed: int = 11) -> BeamProfiler:
+    """A profiler streaming from a seeded simulator, so beam shapes repeat."""
+    bp = BeamProfiler(camera="simulated")
+    camera = SimulatedCamera(profile_for(profile), seed=seed)
+    camera.open()
+    bp.attach_camera(camera)
+    camera.start_acquisition()
+    return bp
+
+
+@pytest.fixture(autouse=True)
+def _quiet_fits() -> Iterator[None]:
+    """Cold fits on cropped frames warn about covariance; that is noise here."""
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        yield
+
+
+class TestRoiChangeForgetsTheOldFrames:
+    """Applying an ROI used to leave every frame-derived value in place.
+
+    The ROI moves the frame's origin, so the fitter's warm start pointed
+    outside the new frame. In 2D mode every ROI tried -- including one
+    centred on the beam -- left the reported centre stuck outside the frame
+    for as long as anyone watched; in 1D a 200x200 window pinned it at about
+    3e10 px. The averaging buffer blended two windows into a ghost beam, and
+    the zoom box framed the wrong region.
+    """
+
+    @staticmethod
+    def _primed(method: str = "2d") -> tuple[BeamProfiler, dict[str, Any]]:
+        bp = _profiler()
+        cbs = _callbacks(bp)
+        for _ in range(3):
+            _tick(cbs, analysis=method, avg_n=4)
+        cbs["auto_fit_zoom"](1)
+        assert bp._last_popt_x is not None
+        assert len(dash_app._avg_buffer) == 3
+        assert dash_app._zoom_range is not None
+        return bp, cbs
+
+    @pytest.mark.parametrize("callback", ["apply_roi", "reset_roi"])
+    def test_every_frame_derived_value_is_dropped(self, callback):
+        bp, cbs = self._primed()
+        if callback == "apply_roi":
+            cbs["apply_roi"](1, 412, 412, 200, 200)
+        else:
+            cbs["reset_roi"](1)
+
+        assert bp._last_popt_x is None
+        assert bp._last_popt_y is None
+        assert bp._last_popt_2d is None
+        assert len(dash_app._avg_buffer) == 0
+        assert dash_app._zoom_range is None
+        assert len(dash_app._recent_frame_times) == 0
+
+    @pytest.mark.parametrize("method", ["1d", "2d"])
+    def test_the_fit_follows_the_beam_into_the_new_window(self, method):
+        bp, cbs = self._primed(method)
+        # A 200x200 window with its corner at (412, 412): the beam, jittering
+        # around (512, 512) on the sensor, sits near (100, 100) in it.
+        assert "200×200" in cbs["apply_roi"](1, 412, 412, 200, 200)
+
+        centres = []
+        for _ in range(10):
+            _tick(cbs, analysis=method)
+            centres.append((bp.center_x, bp.center_y))
+
+        assert bp.last_img is not None and bp.last_img.shape == (200, 200)
+        for cx, cy in centres:
+            assert abs(cx - 100) < 60 and abs(cy - 100) < 60, centres
+
+    def test_a_same_size_move_does_not_blend_the_two_windows(self):
+        bp = _profiler(seed=5)
+        cbs = _callbacks(bp)
+        cbs["apply_roi"](1, 312, 312, 400, 400)  # a window on the beam
+        for _ in range(8):
+            _tick(cbs, avg_n=8)
+        assert bp.last_img is not None and bp.last_img.max() > 150
+
+        cbs["apply_roi"](1, 0, 0, 400, 400)  # same shape, an empty corner
+        _tick(cbs, avg_n=8)
+
+        # Background plus noise only. The blend used to show a beam at 175.
+        assert bp.last_img.max() < 100
+
+    def test_the_camera_does_its_own_stop_and_restart(self):
+        """``set_roi`` knows whether the device needs acquisition stopped;
+        a second stop/start from the GUI would only restart it twice."""
+        bp = _profiler()
+        cbs = _callbacks(bp)
+        assert bp.camera is not None
+        with (
+            patch.object(bp.camera, "stop_acquisition") as stop,
+            patch.object(bp.camera, "start_acquisition") as start,
+        ):
+            cbs["apply_roi"](1, 0, 0, 512, 512)
+            cbs["reset_roi"](1)
+        stop.assert_not_called()
+        start.assert_not_called()
+
+    def test_a_rejected_roi_shows_the_cameras_reason(self):
+        bp = _profiler()
+        cbs = _callbacks(bp)
+        assert bp.camera is not None
+        reason = "Width 333 is not a multiple of the 16 px increment"
+        with patch.object(bp.camera, "set_roi", side_effect=ValueError(reason)):
+            assert cbs["apply_roi"](1, 0, 0, 333, 333) == reason
+            boxes_and_status = cbs["reset_roi"](1)
+
+        # The boxes keep what the user typed rather than being zeroed, which
+        # used to turn the next Apply into a request for a 0x0 ROI.
+        assert all(v is dash.no_update for v in boxes_and_status[:4])
+        assert boxes_and_status[4] == reason
+        # Half-applied or not, the old frames are no longer trusted.
+        assert bp._last_popt_x is None
+
+
+class TestTheCameraListIsCachedForSwitching:
+    """The cache the camera switch resolves against was always empty.
+
+    ``create_app`` filled it and ``_register_callbacks`` emptied it again
+    straight afterwards, and the rescan button never refilled it. Every
+    switch therefore fell back to a full GenTL enumeration with the lock
+    held -- seconds of frozen stream on a GigE setup, the stall an earlier
+    commit had fixed.
+    """
+
+    def test_the_startup_scan_survives_create_app(self):
+        bp = BeamProfiler(camera="simulated")
+        dash_app.create_app(bp)
+        expected = [o.key for o in dash_layout._camera_options(bp)[0]]
+        assert [o.key for o in dash_app._known_options] == expected
+
+    def test_a_switch_resolves_without_rescanning(self):
+        bp = BeamProfiler(camera="simulated")
+        app = dash_app.create_app(bp)
+        assert bp.camera is not None
+        current = discovery.describe_open_camera(bp.camera).key
+        target = next(o.key for o in dash_app._known_options if o.key != current)
+
+        with patch.object(dash_layout, "discover_cameras", side_effect=AssertionError("rescan")):
+            status = _registered(app, "switch_camera")(target)[0]
+
+        assert "ready" in status
+
+    def test_a_rescan_refreshes_what_a_switch_can_find(self):
+        bp = BeamProfiler(camera="simulated")
+        app = dash_app.create_app(bp)
+        new = discovery.CameraOption(key="genicam:4242", label="Acme 4242", kind="genicam")
+        found = [new, *discovery.simulated_options()]
+        with patch.object(dash_layout, "discover_cameras", return_value=found):
+            _registered(app, "refresh_cameras")(1)
+        assert new in dash_app._known_options
+
+        opened = SimulatedCamera(profile_for("sim-2"))
+        opened.open()
+        with (
+            patch.object(dash_layout, "discover_cameras", side_effect=AssertionError("rescan")),
+            patch.object(dash_app, "open_camera", return_value=opened) as open_camera,
+        ):
+            _registered(app, "switch_camera")(new.key)
+        open_camera.assert_called_once_with(new)
+
+
+class TestANewAppStartsFromScratch:
+    """Building a second app in one process kept the first one's frames.
+
+    ``_register_callbacks`` reset the pause flag and the zoom but not the
+    averaging buffer or the fps window, so a relaunched GUI averaged its
+    first frames with the previous session's and reported a frame rate
+    measured across the gap.
+    """
+
+    def test_the_previous_sessions_frames_are_gone(self):
+        dash_app._averaged_image(np.zeros((4, 4), dtype=np.uint8), 4)
+        dash_app._recent_frame_times.extend([1.0, 2.0])
+
+        _callbacks(BeamProfiler(camera="simulated"))
+
+        assert len(dash_app._avg_buffer) == 0
+        assert dash_app._avg_running_sum is None
+        assert len(dash_app._recent_frame_times) == 0
+
+
+class TestAPageLoadShowsWhatIsInForce:
+    """The page used to be one component tree, built at start-up.
+
+    Dash served that same tree on every load, so after a camera switch a
+    reloaded page (or a second tab) named the old camera, showed its pixel
+    pitch in the Scale box and offered Pause on a stopped stream. Checked in
+    Chrome: merely clicking into the Scale box and out again wrote the stale
+    5.0 um/px over the 3.45 um/px camera, inflating every width by 45%.
+    """
+
+    @staticmethod
+    def _switched() -> tuple[BeamProfiler, dash.Dash, str]:
+        bp = BeamProfiler(camera="simulated")
+        app = dash_app.create_app(bp)
+        target = f"{discovery.SIMULATED_PREFIX}sim-2"
+        assert "ready" in _registered(app, "switch_camera")(target)[0]
+        return bp, app, target
+
+    def test_the_page_follows_a_camera_switch(self):
+        bp, app, target = self._switched()
+        page = _by_id(_page_load(app))
+
+        assert page["dropdown-camera"].value == target
+        assert page["input-pixel-scale"].value == 3.45
+        assert page["store-paused"].data is True
+        assert "Play" in str(page["btn-play-pause"].children)
+        assert page["input-roi-w"].value == 1280  # the new sensor's panel
+
+    def test_leaving_the_scale_box_keeps_the_real_pitch(self):
+        bp, app, _ = self._switched()
+        page = _by_id(_page_load(app))
+
+        # What the browser sends on blur: whatever the box shows.
+        _registered(app, "set_pixel_scale")(None, 1, page["input-pixel-scale"].value)
+
+        assert bp.pixel_size == pytest.approx(3.45)
+
+    def test_analysis_settings_come_from_the_profiler(self):
+        bp = BeamProfiler(camera="simulated")
+        app = dash_app.create_app(bp)
+        bp.fit_method, bp.definition = "2d", "d4s"
+
+        page = _by_id(_page_load(app))
+
+        assert page["dropdown-analysis"].value == "2d"
+        assert page["dropdown-definition"].value == "d4s"
+
+    def test_a_paused_page_shows_the_last_frame_and_its_numbers(self):
+        bp = BeamProfiler(camera="simulated")
+        app = dash_app.create_app(bp)
+        _registered(app, "update_live")(
+            1, False, True, "Hot", True, None, None, 0, "1d", "gaussian", True, 1
+        )
+        _registered(app, "toggle_pause")(1, False)
+        assert bp.last_img is not None
+
+        page = _by_id(_page_load(app))
+
+        heatmap = page["live-graph"].figure.data[0]
+        assert np.array_equal(heatmap.z, bp.last_img)
+        assert "μm" in str(page["div-results"].children)
+        assert page["store-paused"].data is True
+
+
+def _ellipse_inside_view(fig: Any) -> float:
+    """Fraction of the drawn beam ellipse that lies inside the axis ranges."""
+    trace = next(t for t in fig.data if t.type == "scatter" and t.line.dash == "dash")
+    x, y = np.asarray(trace.x), np.asarray(trace.y)
+    (x0, x1), (y0, y1) = fig.layout.xaxis.range, fig.layout.yaxis.range
+    return float(np.mean((x >= x0) & (x <= x1) & (y >= y0) & (y <= y1)))
+
+
+class TestAMouseZoomSurvivesTheNextFrame:
+    """A box zoom or pan with the mouse lasted exactly one frame.
+
+    The figure's ``uirevision`` is meant to preserve it, but in Dash 4 the
+    Graph re-plots its own figure with the zoomed range as soon as the user
+    lets go. Plotly takes that as the app setting the range, drops its record
+    of the user's edit (``_preGUI``), and the next tick's explicit
+    full-sensor range wins. Seen in Chrome: zoomed at frame 9, full sensor
+    again by frame 11. The zoom now becomes server state, like Auto-fit.
+    """
+
+    @staticmethod
+    def _streaming() -> tuple[BeamProfiler, dict[str, Any]]:
+        bp = _profiler()
+        cbs = _callbacks(bp)
+        _tick(cbs)
+        return bp, cbs
+
+    def test_a_box_zoom_is_kept_by_the_following_frames(self):
+        bp, cbs = self._streaming()
+        cbs["follow_mouse_zoom"](
+            {
+                "xaxis.range[0]": 1000.0,
+                "xaxis.range[1]": 2000.0,
+                "yaxis.range[0]": 1500.0,
+                "yaxis.range[1]": 2500.0,
+            }
+        )
+        for _ in range(3):
+            fig = _tick(cbs)[0]
+            assert list(fig.layout.xaxis.range) == pytest.approx([1000.0, 2000.0])
+            assert list(fig.layout.yaxis.range) == pytest.approx([1500.0, 2500.0])
+
+    def test_a_drag_along_one_axis_keeps_the_other(self):
+        bp, cbs = self._streaming()
+        cbs["follow_mouse_zoom"]({"xaxis.range": [1000.0, 2000.0]})
+        fig = _tick(cbs)[0]
+        assert list(fig.layout.xaxis.range) == pytest.approx([1000.0, 2000.0])
+        assert list(fig.layout.yaxis.range) == pytest.approx([0.0, 1024 * bp.pixel_size])
+
+    @pytest.mark.parametrize(
+        "event",
+        [
+            {"xaxis.autorange": True, "yaxis.autorange": True},
+            # What a double-click sends: the full extent as explicit ranges.
+            {
+                "xaxis.range[0]": 0.0,
+                "xaxis.range[1]": 5120.0,
+                "yaxis.range[0]": 0.0,
+                "yaxis.range[1]": 5120.0,
+            },
+        ],
+    )
+    def test_autoscale_and_double_click_return_to_the_full_sensor(self, event):
+        bp, cbs = self._streaming()
+        cbs["follow_mouse_zoom"]({"xaxis.range": [1000.0, 2000.0]})
+        cbs["follow_mouse_zoom"](event)
+        assert dash_app._zoom_range is None
+
+    @pytest.mark.parametrize("event", [None, {}, {"autosize": True}, {"dragmode": "pan"}])
+    def test_events_that_move_no_axis_change_nothing(self, event):
+        bp, cbs = self._streaming()
+        cbs["follow_mouse_zoom"]({"xaxis.range": [1000.0, 2000.0]})
+        before = dash_app._zoom_range
+        cbs["follow_mouse_zoom"](event)
+        assert dash_app._zoom_range == before
+
+
+class TestTheZoomStaysOnTheSamePixels:
+    """The zoom box used to be stored in micrometres.
+
+    Correcting the pixel scale while zoomed kept the box's micrometre values
+    while the image's extent changed, so it framed a different part of the
+    sensor: at 5 -> 2.5 um/px none of the beam was left in view.
+    """
+
+    def test_correcting_the_scale_keeps_the_beam_in_view(self):
+        bp = _profiler()
+        cbs = _callbacks(bp)
+        _tick(cbs)
+        cbs["auto_fit_zoom"](1)
+        # The simulated beam jitters by ~17 px a frame, so a later frame's
+        # ellipse can graze the edge of a box fitted to an earlier one.
+        assert _ellipse_inside_view(_tick(cbs)[0]) > 0.9
+
+        cbs["set_pixel_scale"](1, None, 2.5)
+
+        fig = _tick(cbs)[0]
+        assert _ellipse_inside_view(fig) > 0.9  # was 0.0
+        assert dash_app._zoom_range is not None
+        assert list(fig.layout.xaxis.range) == pytest.approx(
+            [v * 2.5 for v in dash_app._zoom_range["x"]]
+        )
+
+
+class _InterleavingLock:
+    """Stands in for ``_callback_lock`` and runs *interloper* at the moment a
+    callback asks for the lock the first time, before it gets it."""
+
+    def __init__(self, interloper: Any) -> None:
+        import threading
+
+        self._lock = threading.Lock()
+        self._interloper = interloper
+
+    def _maybe_interlope(self) -> None:
+        interloper, self._interloper = self._interloper, None
+        if interloper is not None:
+            interloper()
+
+    def __enter__(self) -> _InterleavingLock:
+        self._maybe_interlope()
+        self._lock.acquire()
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self._lock.release()
+
+    def acquire(self, blocking: bool = True, timeout: float = -1) -> bool:
+        self._maybe_interlope()
+        return self._lock.acquire(blocking, timeout)
+
+    def release(self) -> None:
+        self._lock.release()
+
+    def locked(self) -> bool:
+        return self._lock.locked()
+
+
+class TestAutoFitReadsTheFitUnderTheLock:
+    """Auto-fit read the fit and the pixel size before taking the lock and
+    only wrote the zoom under it. A camera switch landing in between was
+    overwritten: the new camera started zoomed onto the old camera's beam."""
+
+    def test_a_switch_in_between_is_not_overwritten(self, monkeypatch):
+        bp = _profiler()
+        cbs = _callbacks(bp)
+        _tick(cbs)
+        target = f"{discovery.SIMULATED_PREFIX}sim-2"
+        switch = lambda: cbs["switch_camera"](target)  # noqa: E731
+        monkeypatch.setattr(dash_app, "_callback_lock", _InterleavingLock(switch))
+
+        cbs["auto_fit_zoom"](1)
+
+        assert bp.camera is not None
+        assert discovery.describe_open_camera(bp.camera).key == target
+        assert dash_app._zoom_range is None
+
+
+def _profiles(fig: Any) -> dict[str, Any]:
+    """The four profile traces, told apart from the dashed/dotted overlays."""
+    plain = [t for t in fig.data if t.type == "scatter" and t.line.dash is None]
+    return dict(zip(["x_data", "x_fit", "y_data", "y_fit"], plain, strict=True))
+
+
+class TestTheProfilesFollowTheZoom:
+    """The projections and their fits were drawn at the sensor's edges, in
+    data coordinates. Any zoom away from those edges -- Auto-fit, a mouse
+    zoom -- left them off screen: after Auto-fit, 0% of either projection or
+    fit curve was inside the view."""
+
+    def test_after_auto_fit_every_profile_hugs_the_view(self):
+        bp = _profiler()
+        cbs = _callbacks(bp)
+        _tick(cbs)
+        cbs["auto_fit_zoom"](1)
+
+        fig = _tick(cbs)[0]
+        (x0, x1), (y0, y1) = fig.layout.xaxis.range, fig.layout.yaxis.range
+        assert x0 > 0 and y0 > 0  # genuinely zoomed away from both edges
+
+        for name in ("x_data", "x_fit"):
+            trace = _profiles(fig)[name]
+            y = np.asarray(trace.y)
+            assert y.min() == pytest.approx(y0, abs=0.01 * (y1 - y0)), name
+            assert y.max() == pytest.approx(y0 + 0.15 * (y1 - y0), rel=0.05), name
+        for name in ("y_data", "y_fit"):
+            trace = _profiles(fig)[name]
+            x = np.asarray(trace.x)
+            assert x.min() == pytest.approx(x0, abs=0.01 * (x1 - x0)), name
+            assert x.max() == pytest.approx(x0 + 0.15 * (x1 - x0), rel=0.05), name
+
+    def test_the_full_view_is_unchanged(self):
+        bp = _profiler()
+        cbs = _callbacks(bp)
+        fig = _tick(cbs)[0]
+        full = 1024 * bp.pixel_size
+        x_data = np.asarray(_profiles(fig)["x_data"].y)
+        y_data = np.asarray(_profiles(fig)["y_data"].x)
+        assert x_data.min() == pytest.approx(0.0)
+        assert x_data.max() == pytest.approx(0.15 * full)
+        assert y_data.min() == pytest.approx(0.0)
+        assert y_data.max() == pytest.approx(0.15 * full)
+
+
+def _ellipse_centre(fig: Any) -> tuple[float, float] | None:
+    """Centre of the drawn beam ellipse, or ``None`` if none is drawn."""
+    traces = [t for t in fig.data if t.type == "scatter" and t.line.dash == "dash"]
+    if not traces:
+        return None
+    x, y = np.asarray(traces[0].x), np.asarray(traces[0].y)
+    return (float(x.max() + x.min()) / 2, float(y.max() + y.min()) / 2)
+
+
+def _crosshair(fig: Any) -> tuple[float, float] | None:
+    """``(x, y)`` of the linecut crosshair, or ``None`` if none is drawn."""
+    lines = [t for t in fig.data if t.type == "scatter" and t.line.dash == "dot"]
+    if not lines:
+        return None
+    vertical, horizontal = lines
+    return float(vertical.x[0]), float(horizontal.y[0])
+
+
+class TestOverlaysStayLiveUnderModelFreeDefinitions:
+    """FWHM and D4σ are read straight off the profiles, so analyze() skips
+    the 2D fit and the linecut. Their last results stayed on screen anyway:
+    on the tilted simulator the 2D ellipse sat at one point for as long as
+    FWHM was selected while the measured centre moved ~100 um a frame, drawn
+    tilted beside "Angle 0.0°", and the crosshair stayed on a peak the beam
+    had left."""
+
+    def test_the_ellipse_does_not_freeze_after_switching_to_fwhm(self):
+        bp = _profiler("sim-2", seed=7)
+        cbs = _callbacks(bp)
+        for _ in range(3):
+            fig = _tick(cbs, analysis="2d")[0]
+        last_2d = _ellipse_centre(fig)
+        assert last_2d is not None
+
+        centres = [
+            _ellipse_centre(_tick(cbs, analysis="2d", definition="fwhm")[0]) for _ in range(4)
+        ]
+
+        drawn = [c for c in centres if c is not None]
+        assert last_2d not in drawn
+        assert len(set(drawn)) == len(drawn), "the ellipse froze"
+
+    def test_the_crosshair_is_only_drawn_through_this_frames_peak(self):
+        bp = _profiler("sim-2", seed=7)
+        cbs = _callbacks(bp)
+        for _ in range(2):
+            fig = _tick(cbs, analysis="linecut")[0]
+        assert _crosshair(fig) is not None
+
+        for _ in range(3):
+            fig = _tick(cbs, analysis="linecut", definition="d4s")[0]
+            cross = _crosshair(fig)
+            if cross is not None:
+                assert bp.last_img is not None
+                py, px = np.unravel_index(int(np.argmax(bp.last_img)), bp.last_img.shape)
+                assert cross == pytest.approx((px * bp.pixel_size, py * bp.pixel_size))
+
+    def test_no_angle_is_reported_unless_the_2d_fit_ran(self):
+        bp = _profiler("sim-2", seed=7)
+        cbs = _callbacks(bp)
+        assert "Angle" in str(_tick(cbs, analysis="2d")[1])
+        assert "Angle" not in str(_tick(cbs, analysis="2d", definition="fwhm")[1])
+
+
+def _feed(bp: BeamProfiler, frames: list[np.ndarray]) -> None:
+    """Make the attached camera deliver *frames*, round and round."""
+    import itertools
+
+    assert bp.camera is not None
+    source = itertools.cycle(frames)
+    bp.camera.get_image = lambda timeout=None: next(source)  # ty: ignore[invalid-assignment]
+
+
+def _saturated(status: Any) -> bool:
+    return "saturated" in str(status)
+
+
+class TestAveragingDoesNotHideSaturation:
+    """The saturation warning was computed on the averaged frame. A jittering
+    beam's clipped core rarely sits at the maximum in every frame of the
+    window, so with averaging on the warning vanished: on the simulator at 14
+    ms it showed in 0 of 20 ticks at N=4 and N=16, while 13-14 of the 20 raw
+    frames were clipped."""
+
+    def test_a_clipped_raw_frame_is_flagged_through_the_average(self):
+        bp = BeamProfiler(camera="simulated")
+        # Two frames clipped in different places: no pixel is at 255 in both,
+        # so their average never reaches it.
+        left = np.full((64, 64), 20, dtype=np.uint8)
+        left[:, :8] = 255
+        right = np.full((64, 64), 20, dtype=np.uint8)
+        right[:, -8:] = 255
+        _feed(bp, [left, right])
+        cbs = _callbacks(bp)
+
+        statuses = [_tick(cbs, avg_n=4)[2] for _ in range(4)]
+
+        assert bp.last_img is not None and bp.last_img.max() < 255
+        assert all(_saturated(s) for s in statuses)
+
+
+class TestSaturationUsesTheSensorsBitDepth:
+    """With only the dtype to go on, a 12-bit sensor packed in uint16 was
+    judged against 65535 and never flagged, however clipped. The camera's
+    reported bit depth now sets the level."""
+
+    @staticmethod
+    def _twelve_bit() -> BeamProfiler:
+        bp = BeamProfiler(camera="simulated")
+        assert bp.camera is not None
+        bp.camera.bit_depth = 12  # ty: ignore[unresolved-attribute]
+        frame = np.full((64, 64), 300, dtype=np.uint16)
+        frame[:4, :] = 4095  # 6% of the sensor clipped
+        _feed(bp, [frame])
+        return bp
+
+    def test_a_clipped_12_bit_frame_is_flagged(self):
+        status = _tick(_callbacks(self._twelve_bit()))[2]
+        assert _saturated(status)
+        assert "(4095)" in str(status)
+
+    def test_the_manual_colour_range_tops_out_at_the_sensor_maximum(self):
+        cbs = _callbacks(self._twelve_bit())
+        with patch("pybeamprofiler.dash_app.build_figure", return_value=go.Figure()) as build:
+            _tick(cbs, auto_range=False)
+        assert build.call_args.kwargs["zmax"] == 4095
+
+    def test_a_narrower_stream_still_clips_at_its_own_maximum(self):
+        """Mono8 from a 12-bit sensor clips at 255, not 4095."""
+        frame = np.full((8, 8), 255, dtype=np.uint8)
+        assert dash_app._saturation_max(frame, 12) == 255
+
+    @pytest.mark.parametrize("depth", [None, True, 0, 64, "12", 12.0])
+    def test_anything_but_a_plausible_integer_is_ignored(self, depth):
+        bp = BeamProfiler(camera="simulated")
+        assert bp.camera is not None
+        bp.camera.bit_depth = depth  # ty: ignore[unresolved-attribute]
+        assert dash_app._camera_bit_depth(bp) is None
+
+
+class TestAFailingCameraIsReportedAndStopped:
+    """A camera that failed mid-stream went unreported. Only a timeout was
+    handled; any other error was logged with a full traceback on every 50 ms
+    tick -- 20 a second, 72,000 an hour -- while every output stayed
+    ``no_update``, so the page kept showing the last good frame, the old
+    status line and a Pause button over a dead device."""
+
+    LOST = "GenTL error: device lost (-1011)"
+
+    def _dying(self) -> tuple[BeamProfiler, dict[str, Any]]:
+        bp = _profiler()
+        cbs = _callbacks(bp)
+        _tick(cbs)
+        assert bp.camera is not None
+        bp.camera.get_image = _raiser(RuntimeError(self.LOST))  # ty: ignore[invalid-assignment]
+        return bp, cbs
+
+    def test_the_status_bar_says_what_went_wrong(self):
+        _, cbs = self._dying()
+        out = _tick(cbs)
+        assert out[0] is dash.no_update  # the last good frame stays up
+        assert f"Camera error: {self.LOST}" in str(out[2])
+        assert dash_app._server_paused is False  # one failure is not a pattern
+
+    def test_repeated_failures_pause_the_stream_and_say_so(self):
+        bp, cbs = self._dying()
+        outs = [_tick(cbs) for _ in range(dash_app._MAX_CAMERA_FAILURES)]
+
+        assert all(o[4] is dash.no_update for o in outs[:-1])
+        paused, children, color = outs[-1][4:]
+        assert paused is True
+        assert "Play" in str(children) and color == "success"
+        assert "press Play to retry" in str(outs[-1][2])
+        assert dash_app._server_paused is True
+        assert bp.camera is not None and not bp.camera.is_acquiring
+
+    def test_the_log_gets_one_traceback_not_one_per_tick(self, caplog):
+        import logging
+
+        _, cbs = self._dying()
+        with caplog.at_level(logging.DEBUG, logger="pybeamprofiler.dash_app"):
+            for _ in range(20):
+                _tick(cbs)
+
+        errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+        assert len(errors) == 1
+        assert errors[0].exc_info is not None
+        warnings_ = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert [r.getMessage() for r in warnings_] == [
+            f"Pausing the stream after {dash_app._MAX_CAMERA_FAILURES} camera errors in a row"
+        ]
+
+    def test_a_good_frame_starts_the_count_again(self):
+        bp, cbs = self._dying()
+        assert bp.camera is not None
+        broken = bp.camera.get_image
+        for _ in range(dash_app._MAX_CAMERA_FAILURES - 1):
+            _tick(cbs)
+        del bp.camera.get_image  # the class's working method again
+        _tick(cbs)
+        bp.camera.get_image = broken  # ty: ignore[invalid-assignment]
+        for _ in range(dash_app._MAX_CAMERA_FAILURES - 1):
+            _tick(cbs)
+        assert dash_app._server_paused is False
+
+    def test_timeouts_are_not_failures(self, caplog):
+        import logging
+
+        bp = _profiler()
+        cbs = _callbacks(bp)
+        assert bp.camera is not None
+        bp.camera.get_image = _raiser(TimeoutError("no frame yet"))  # ty: ignore[invalid-assignment]
+        with caplog.at_level(logging.DEBUG, logger="pybeamprofiler.dash_app"):
+            outs = [_tick(cbs) for _ in range(2 * dash_app._MAX_CAMERA_FAILURES)]
+        assert all(v is dash.no_update for o in outs for v in o)
+        assert dash_app._server_paused is False
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+    def test_play_retries_and_a_camera_that_will_not_start_stays_paused(self):
+        bp, cbs = self._dying()
+        for _ in range(dash_app._MAX_CAMERA_FAILURES):
+            _tick(cbs)
+        assert bp.camera is not None
+
+        with patch.object(bp.camera, "start_acquisition", side_effect=RuntimeError("no device")):
+            paused, children, _, _, status = cbs["toggle_pause"](1, True)
+        assert paused is True and "Play" in str(children)
+        assert "Could not start the camera: no device" in str(status)
+        assert dash_app._server_paused is True
+
+        del bp.camera.get_image  # the device is back
+        paused, *_ = cbs["toggle_pause"](2, True)
+        assert paused is False
+        assert dash_app._camera_failures == 0
+        assert _tick(cbs)[0] is not dash.no_update
+
+
+def _raiser(exc: BaseException) -> Any:
+    def get_image(timeout: float | None = None) -> np.ndarray:
+        raise exc
+
+    return get_image
+
+
+class TestTheButtonFollowsAPauseMadeElsewhere:
+    """Pausing in one tab, or the stream pausing itself, left every other
+    tab's button offering Pause over a stopped stream, so its first click
+    only repeated the pause. A tick from such a page now relabels it."""
+
+    def test_a_page_that_thinks_it_is_playing_is_told(self):
+        bp = _profiler()
+        cbs = _callbacks(bp)
+        cbs["toggle_pause"](1, False)  # paused from "another tab"
+
+        out = _tick(cbs, paused=False)
+
+        assert out[0] is dash.no_update
+        assert out[4] is True
+        assert "Play" in str(out[5]) and out[6] == "success"
+
+
+class TestAPauseRacingATickIsHonoured:
+    """The tick checked the server-side pause flag before taking the lock.
+    A Pause that completed in between went unseen, and the tick fetched a
+    frame anyway -- which on a Harvesters camera restarts the acquisition
+    the Pause had just stopped, leaving a "paused" camera streaming."""
+
+    def test_the_tick_does_not_fetch_after_a_pause_it_raced(self, monkeypatch):
+        from unittest.mock import MagicMock
+
+        bp = _profiler()
+        cbs = _callbacks(bp)
+        assert bp.camera is not None
+        fetch = MagicMock(wraps=bp.camera.get_image)
+        bp.camera.get_image = fetch  # ty: ignore[invalid-assignment]
+        pause = lambda: cbs["toggle_pause"](1, False)  # noqa: E731
+        monkeypatch.setattr(dash_app, "_callback_lock", _InterleavingLock(pause))
+
+        out = _tick(cbs)  # the browser still thinks it is playing
+
+        fetch.assert_not_called()
+        assert not bp.camera.is_acquiring
+        assert out[4] is True  # and the page is told it is paused
+
+
+class TestTheLinecutPlotShowsWhatWasFitted:
+    """In linecut mode the fit is to the single row and column through the
+    peak, but the curve drawn under it was the projection of the whole frame:
+    analyze() caches no projection there, and build_figure fell back to the
+    full sums. On the tilted simulator the data curve was 575 um FWHM under a
+    fit of 327 um."""
+
+    def test_the_data_curves_are_the_row_and_column_through_the_peak(self):
+        bp = _profiler("sim-2", seed=7)
+        cbs = _callbacks(bp)
+        fig = _tick(cbs, analysis="linecut")[0]
+        img = bp.last_img
+        assert img is not None
+        assert bp._linecut_x is not None and bp._linecut_y is not None
+        row = img[bp._linecut_y, :].astype(float)
+        column = img[:, bp._linecut_x].astype(float)
+        height, width = (n * bp.pixel_size for n in img.shape)
+
+        drawn = _profiles(fig)
+        assert np.allclose(drawn["x_data"].y, dash_app._normalize_profile(row, height))
+        assert np.allclose(drawn["y_data"].x, dash_app._normalize_profile(column, width))
+
+
+class TestAFitIsDrawnToTheDatasScale:
+    """Each curve was scaled to its own min and max, so any fit -- however
+    wrong its amplitude or baseline -- filled exactly the same height as the
+    data, and the overlay could not show a bad fit."""
+
+    def test_a_fit_at_half_the_amplitude_is_drawn_at_half_the_height(self):
+        bp = BeamProfiler(camera="simulated")
+        y, x = np.mgrid[0:64, 0:80]
+        img = (200 * np.exp(-((x - 40) ** 2 + (y - 30) ** 2) / (2 * 6.0**2)) + 10).astype(np.uint8)
+        popt_x, popt_y = bp.analyze(img)
+        assert popt_x is not None and popt_y is not None
+        half = [popt_x[0] / 2, popt_x[1], popt_x[2], popt_x[3]]
+
+        fig = dash_app.build_figure(bp, img, half, popt_y)
+
+        drawn = _profiles(fig)
+        data_height = np.max(drawn["x_data"].y)
+        fit_height = np.max(drawn["x_fit"].y)
+        assert fit_height == pytest.approx(data_height / 2, rel=0.1)
+        # A correct fit still sits on its data.
+        assert np.max(drawn["y_fit"].x) == pytest.approx(np.max(drawn["y_data"].x), rel=0.05)
+
+
+def _saved_png(bp: BeamProfiler, frame: np.ndarray) -> np.ndarray:
+    """Press Save PNG with *frame* as the current frame; decode what comes back."""
+    import base64
+    import io
+
+    from PIL import Image
+
+    bp.last_img = frame
+    payload = _callbacks(bp)["save_frame_png"](1)
+    return np.array(Image.open(io.BytesIO(base64.b64decode(payload["content"]))))
+
+
+class TestSavePngHandlesWhatAFileCanHold:
+    """Save PNG handed the frame straight to Pillow. That covers the uint8 and
+    uint16 frames a camera delivers, but a frame loaded with --file can be
+    anything: a float32 TIFF raised "cannot write mode F as PNG" (the
+    callback failed and nothing downloaded), and a 32-bit one was silently
+    clipped at 65535."""
+
+    @staticmethod
+    def _beam(scale: float, dtype: Any) -> np.ndarray:
+        y, x = np.mgrid[0:48, 0:64]
+        return (scale * np.exp(-((x - 32) ** 2 + (y - 24) ** 2) / 50.0)).astype(dtype)
+
+    @pytest.mark.parametrize("dtype", [np.uint8, np.uint16])
+    def test_camera_frames_are_written_exactly(self, dtype):
+        frame = self._beam(200 if dtype == np.uint8 else 4000, dtype)
+        saved = _saved_png(BeamProfiler(camera="simulated"), frame)
+        assert saved.dtype == dtype
+        assert np.array_equal(saved, frame)
+
+    def test_a_float_frame_is_scaled_onto_16_bits(self):
+        frame = self._beam(1000.0, np.float32)
+        saved = _saved_png(BeamProfiler(camera="simulated"), frame)
+        assert saved.dtype == np.uint16
+        expected = np.rint((frame - frame.min()) / (frame.max() - frame.min()) * 65535)
+        assert np.abs(saved.astype(float) - expected).max() <= 1
+
+    def test_a_wide_integer_frame_is_scaled_not_clipped(self):
+        frame = self._beam(100_000, np.int32)
+        saved = _saved_png(BeamProfiler(camera="simulated"), frame)
+        # Clipping made every value above 65535 identical; scaling keeps the
+        # peak unique and the profile's shape.
+        assert int(np.count_nonzero(saved == saved.max())) == int(
+            np.count_nonzero(frame == frame.max())
+        )
+        assert np.unravel_index(np.argmax(saved), saved.shape) == (24, 32)
+
+    def test_an_integer_frame_that_fits_is_written_exactly(self):
+        frame = self._beam(60_000, np.int32)
+        saved = _saved_png(BeamProfiler(camera="simulated"), frame)
+        assert np.array_equal(saved.astype(np.int64), frame.astype(np.int64))
+
+    def test_non_finite_pixels_do_not_break_the_download(self):
+        frame = self._beam(1000.0, np.float32)
+        frame[0, 0], frame[0, 1] = np.nan, np.inf
+        saved = _saved_png(BeamProfiler(camera="simulated"), frame)
+        assert saved.max() == 65535
+        assert saved[0, 0] == saved[0, 1] == 0
+
+
+class _LockedNode:
+    """A GenICam node that refuses writes, as many do while streaming."""
+
+    min = max = None
+
+    def __init__(self, value: Any, symbolics: list[str] | None = None) -> None:
+        self._value = value
+        self.symbolics = symbolics
+
+    @property
+    def value(self) -> Any:
+        return self._value
+
+    @value.setter
+    def value(self, v: Any) -> None:
+        raise RuntimeError("AccessException: node is not writable (TLParamsLocked)")
+
+
+class _ClampingNode:
+    """A numeric node that clamps to its range instead of refusing."""
+
+    symbolics = None
+
+    def __init__(self, value: float, lo: float, hi: float) -> None:
+        self._value, self.min, self.max = value, lo, hi
+
+    @property
+    def value(self) -> float:
+        return self._value
+
+    @value.setter
+    def value(self, v: float) -> None:
+        self._value = min(max(v, self.min), self.max)
+
+
+class TestSettingControlsShowWhatTheCameraHas:
+    """Every setting control echoed the requested value, whatever the camera
+    did with it. A write refused while streaming (PixelFormat is locked on
+    real devices) was logged at DEBUG only, and the dropdown went on showing
+    Mono16 over a camera still in Mono8; a clamped number showed the value
+    asked for, not the one set."""
+
+    @staticmethod
+    def _write(cbs: dict[str, Any], kind: str, feature: str, *args: Any) -> Any:
+        callback = {
+            "genicam-sel": "set_genicam_select",
+            "genicam-sw": "set_genicam_switch",
+            "genicam-num": "set_genicam_numeric",
+            "genicam-num-input": "set_genicam_numeric",
+        }[kind]
+        with patch("pybeamprofiler.dash_app.ctx") as ctx:
+            ctx.triggered_id = {"type": kind, "feature": feature}
+            return cbs[callback](*args)
+
+    @staticmethod
+    def _camera() -> tuple[BeamProfiler, Any, dict[str, Any]]:
+        bp = _profiler()
+        return bp, getattr(bp.camera, "node_map"), _callbacks(bp)
+
+    def test_a_refused_choice_shows_the_cameras_value_and_says_why(self, caplog):
+        import logging
+
+        _, node_map, cbs = self._camera()
+        node_map.PixelFormat = _LockedNode("Mono8", ["Mono8", "Mono12", "Mono16"])
+        with caplog.at_level(logging.WARNING, logger="pybeamprofiler.dash_app"):
+            shown = self._write(cbs, "genicam-sel", "PixelFormat", "Mono16")
+        assert shown == "Mono8"
+        assert any("PixelFormat" in r.getMessage() for r in caplog.records)
+
+    def test_a_refused_switch_shows_the_cameras_state(self):
+        _, node_map, cbs = self._camera()
+        node_map.ReverseX = _LockedNode(False)
+        assert self._write(cbs, "genicam-sw", "ReverseX", True) is False
+
+    def test_a_clamped_number_is_shown_clamped_in_both_controls(self):
+        _, node_map, cbs = self._camera()
+        node_map.Gamma = _ClampingNode(1.0, 0.25, 4.0)
+        assert self._write(cbs, "genicam-num", "Gamma", 9.0, None) == (4.0, 4.0)
+        assert self._write(cbs, "genicam-num-input", "Gamma", None, 0.1) == (0.25, 0.25)
+
+    def test_a_number_taken_as_given_only_updates_the_other_control(self):
+        _, node_map, cbs = self._camera()
+        node_map.Gamma = _ClampingNode(1.0, 0.25, 4.0)
+        assert self._write(cbs, "genicam-num", "Gamma", 2.0, None) == (dash.no_update, 2.0)
+
+    def test_exposure_shows_what_the_camera_set(self):
+        bp, _, cbs = self._camera()
+        assert bp.camera is not None
+        camera = bp.camera
+
+        def clamped(seconds: float) -> None:
+            camera.exposure_time = min(seconds, 0.5)
+
+        with (
+            patch.object(camera, "set_exposure", side_effect=clamped),
+            patch("pybeamprofiler.dash_app.ctx") as ctx,
+        ):
+            ctx.triggered_id = "input-exposure"
+            assert cbs["set_exposure"](None, 900.0) == (500.0, 500.0)
+
+    def test_gain_shows_what_the_camera_set(self):
+        bp, _, cbs = self._camera()
+        assert bp.camera is not None
+        camera = bp.camera
+
+        def quantised(gain: float) -> None:
+            camera.gain = round(gain * 2) / 2  # 0.5 dB steps
+
+        with (
+            patch.object(camera, "set_gain", side_effect=quantised),
+            patch("pybeamprofiler.dash_app.ctx") as ctx,
+        ):
+            ctx.triggered_id = "slider-gain"
+            assert cbs["set_gain"](3.3, None) == (3.5, 3.5)
+
+
+class TestAFrameWithNoPlausibleBeam:
+    """The analysis may now report "no beam" -- a blank frame, a beam off the
+    sensor -- as None fit parameters with NaN widths and centre, and None
+    linecut coordinates. The GUI has to show that as missing, not as "nan
+    um", and draw only what exists."""
+
+    @staticmethod
+    def _no_beam(bp: BeamProfiler, image: np.ndarray) -> tuple[None, None]:
+        """Analyse a frame that really holds no beam, through the real method
+        (the tick test patches ``bp.analyze``), and check what it reports."""
+        popt_x, popt_y = BeamProfiler.analyze(bp, np.full_like(image, 10))
+        assert popt_x is None and popt_y is None
+        assert np.isnan(bp.width_x) and np.isnan(bp.center_x)
+        return None, None
+
+    def test_the_results_show_dashes_not_nan(self):
+        bp = BeamProfiler(camera="simulated")
+        self._no_beam(bp, np.full((8, 8), 10, dtype=np.uint8))
+        text = str(dash_app._format_results(bp))
+        assert "—" in text
+        assert "nan" not in text.lower()
+        assert "Peak" in text  # the frame itself was still measured
+
+    def test_the_figure_draws_the_frame_and_nothing_it_cannot_know(self):
+        bp = BeamProfiler(camera="simulated")
+        bp.fit_method = "linecut"
+        image = np.full((64, 64), 10, dtype=np.uint8)
+        self._no_beam(bp, image)
+        assert bp._linecut_x is None and bp._linecut_y is None
+
+        fig = dash_app.build_figure(bp, image, None, None)
+
+        assert fig.data[0].type == "heatmap"
+        assert _ellipse_centre(fig) is None
+        assert _crosshair(fig) is None
+        assert len([t for t in fig.data if t.type == "scatter"]) == 2  # the two profiles
+
+    def test_a_tick_on_a_blank_frame_still_draws(self):
+        bp = BeamProfiler(camera="simulated")
+        cbs = _callbacks(bp)
+        with patch.object(bp, "analyze", side_effect=lambda img: self._no_beam(bp, img)):
+            out = _tick(cbs)
+        assert out[0] is not dash.no_update
+        assert "—" in str(out[1])
+        assert "error" not in str(out[2]).lower()
+
+
+class TestDefensiveEdges:
+    """The unhappy paths of the fixes above, each a line or two."""
+
+    def test_a_boolean_frame_saves_as_black_and_white(self):
+        frame = np.zeros((4, 4), dtype=bool)
+        frame[0, 0] = True
+        saved = _saved_png(BeamProfiler(camera="simulated"), frame)
+        assert saved.dtype == np.uint8
+        assert saved[0, 0] == 255 and saved[1, 1] == 0
+
+    def test_an_entirely_non_finite_frame_saves_as_black(self):
+        saved = _saved_png(BeamProfiler(camera="simulated"), np.full((4, 4), np.nan))
+        assert saved.max() == 0
+
+    def test_without_a_camera_the_request_is_mirrored(self):
+        assert dash_app._paired_values(5.0, None, from_slider=True) == (dash.no_update, 5.0)
+
+    def test_a_feature_the_camera_lacks_is_left_alone(self):
+        bp = _profiler()
+        cbs = _callbacks(bp)
+        with patch("pybeamprofiler.dash_app.ctx") as ctx:
+            ctx.triggered_id = {"type": "genicam-sel", "feature": "NoSuchFeature"}
+            assert cbs["set_genicam_select"]("On") == "On"
+
+    def test_a_node_that_cannot_be_read_back_mirrors_the_request(self):
+        class WriteOnly:
+            min = max = symbolics = None
+
+            @property
+            def value(self) -> Any:
+                raise RuntimeError("not readable")
+
+            @value.setter
+            def value(self, v: Any) -> None:
+                pass
+
+        bp = _profiler()
+        getattr(bp.camera, "node_map").TriggerSoftware = WriteOnly()
+        cbs = _callbacks(bp)
+        with patch("pybeamprofiler.dash_app.ctx") as ctx:
+            ctx.triggered_id = {"type": "genicam-sw", "feature": "TriggerSoftware"}
+            assert cbs["set_genicam_switch"](True) is True
+
+    def test_a_camera_that_cannot_even_be_stopped_is_still_paused(self):
+        bp = _profiler()
+        cbs = _callbacks(bp)
+        assert bp.camera is not None
+        bp.camera.get_image = _raiser(RuntimeError("gone"))  # ty: ignore[invalid-assignment]
+        with patch.object(bp.camera, "stop_acquisition", side_effect=RuntimeError("also gone")):
+            outs = [_tick(cbs) for _ in range(dash_app._MAX_CAMERA_FAILURES)]
+        assert outs[-1][4] is True
+        assert dash_app._server_paused is True
+
+
+class TestHeatmapOnlyModeIsHonoured:
+    """``--heatmap-only`` ("Draw only the heatmap, without the profile
+    curves") was stored on the profiler by plot() and then ignored by the
+    Dash figure, so from the command line the flag did nothing."""
+
+    @staticmethod
+    def _curves(fig: Any) -> list[Any]:
+        """Profile and fit traces: the scatters that are neither the dashed
+        ellipse nor the dotted crosshair."""
+        return [t for t in fig.data if t.type == "scatter" and t.line.dash is None]
+
+    def test_the_profiles_and_their_fits_are_left_out(self):
+        bp = _profiler()
+        bp._heatmap_only = True
+        fig = _tick(_callbacks(bp))[0]
+
+        assert fig.data[0].type == "heatmap"
+        assert self._curves(fig) == []
+        assert _ellipse_centre(fig) is not None  # the ellipse stays
+
+    def test_the_linecut_crosshair_stays(self):
+        bp = _profiler()
+        bp._heatmap_only = True
+        fig = _tick(_callbacks(bp), analysis="linecut")[0]
+
+        assert self._curves(fig) == []
+        assert _crosshair(fig) is not None
+
+    def test_the_curves_are_drawn_by_default(self):
+        bp = _profiler()
+        fig = _tick(_callbacks(bp))[0]
+        assert len(self._curves(fig)) == 4
+
+
+class TestFileModeSurvivesARestartOfTheFits:
+    """A static file's frame lives in ``bp.last_img``, and nothing can fetch
+    it again. Resetting the analysis on a definition or fit-method change
+    used to clear it, and the view froze on the old figure for good."""
+
+    @staticmethod
+    def _file_profiler(tmp_path: Any) -> BeamProfiler:
+        from PIL import Image
+
+        y, x = np.mgrid[0:64, 0:80]
+        img = (200 * np.exp(-((x - 40) ** 2 + (y - 30) ** 2) / (2 * 6.0**2)) + 10).astype(np.uint8)
+        path = tmp_path / "beam.png"
+        Image.fromarray(img).save(path)
+        return BeamProfiler(file=str(path), pixel_size=5.0)
+
+    @pytest.mark.parametrize("change", [{"definition": "fwhm"}, {"analysis": "2d"}])
+    def test_the_image_is_still_drawn_after_the_change(self, tmp_path, change):
+        bp = self._file_profiler(tmp_path)
+        cbs = _callbacks(bp)
+        assert isinstance(_tick(cbs)[0], go.Figure)
+        figure = _tick(cbs, **change)[0]
+        assert isinstance(figure, go.Figure), "the tick found no image to draw"
+        assert bp.last_img is not None
+        assert np.isfinite(bp.width_x)

@@ -35,6 +35,12 @@ dependencies = [
     "ipywidgets",
     "Pillow",
     "harvesters>=1.4.0",
+    # harvesters itself only asks for genicam>=1.2. The floor keeps pip
+    # installs on the version the test suite runs against, rather than
+    # whatever older genicam happens to be in the environment. It skips Intel
+    # Macs because no genicam since 1.3.0 ships an x86_64 macOS wheel, and a
+    # floor there would make the whole package uninstallable.
+    "genicam>=1.6 ; sys_platform != 'darwin' or platform_machine == 'arm64'",
 ]
 requires-python = ">=3.10"
 
@@ -43,43 +49,25 @@ requires-python = ">=3.10"
 "Bug Tracker" = "https://github.com/acechenx/pybeamprofiler/issues"
 
 [project.scripts]
-pybeamprofiler = "pybeamprofiler.beamprofiler:main"
+pybeamprofiler = "pybeamprofiler.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/pybeamprofiler"]
 
-[tool.uv]
-# Override harvesters' ``genicam>=1.2`` dep per platform. The version
-# constraints below are deliberately *disjoint* per platform: this forces
-# uv's resolver to fork by marker rather than unifying to a single version
-# (which would otherwise pin 1.5.0 globally and break Python 3.14 on
-# Linux/Windows, where 1.5.0 has no cp314 wheel).
-#
-# * macOS Python <3.14: pin 1.5.0 — the last release with macOS wheels
-#   (``macosx_13_0_arm64``, cp310–cp313). 1.5.1+ dropped all macOS wheels.
-# * macOS Python 3.14+: no wheel exists for any genicam release on macOS.
-#   No override matches; uv excludes genicam here and ``harvesters`` will
-#   import-fail at runtime — handled gracefully by the package.
-# * Linux / Windows: pin 1.5.1+ (the first release with cp314 wheels;
-#   cp310–cp313 wheels for 1.5.1 still exist for older Pythons too).
-override-dependencies = [
-    "genicam==1.5.0 ; sys_platform == 'darwin' and python_version < '3.14'",
-    "genicam>=1.5.1 ; sys_platform != 'darwin'",
-]
-
 [project.optional-dependencies]
 test = [
-    "pytest>=9.0",
-    "pytest-cov>=7.0",
+    "pytest>=9.1",
+    "pytest-cov>=7.1",
+    # Used by tests/test_headless_app.py to drive a real Dash server over
+    # HTTP. It arrives transitively today, but relying on that would leave
+    # the end-to-end tests at the mercy of an unrelated resolution change.
+    "requests>=2.32",
 ]
 dev = [
     "pybeamprofiler[test]",
-    "ruff>=0.15",
-    "ty>=0.0.30",
-    "pre-commit>=4.5",
-]
-matplotlib = [
-    "matplotlib>=3.10",  # Optional fallback for command-line streaming
+    "ruff>=0.16.9",
+    "ty>=0.0.84",
+    "pre-commit>=4.6",
 ]
 
 [tool.pytest.ini_options]
@@ -88,6 +76,9 @@ python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
 addopts = "-v --cov=pybeamprofiler --cov-report=term-missing"
+markers = [
+    "real_cti: exercise the real GenTL search tables instead of the hermetic blank ones",
+]
 
 [tool.ruff]
 target-version = "py310"

@@ -1,9 +1,14 @@
-"""FLIR camera interface using Harvesters/GenICam."""
+"""FLIR cameras (Spinnaker).
+
+Only locating the GenTL producer differs from the generic GenICam path, and
+that is delegated to :mod:`pybeamprofiler.cti`. Spinnaker ships a single
+producer per toolchain, so the first one found is enough.
+"""
 
 import logging
 import os
-import platform
 
+from .cti import SPINNAKER, cti_files_for
 from .gen_camera import HarvesterCamera
 
 logger = logging.getLogger(__name__)
@@ -50,42 +55,13 @@ class FlirCamera(HarvesterCamera):
 
     @staticmethod
     def _find_flir_cti() -> str | None:
-        """Search for FLIR Spinnaker CTI in platform-specific SDK installation paths.
+        """Return the first Spinnaker GenTL producer found, if any.
 
-        Searches common Spinnaker SDK installation locations by platform.
-        Dynamically scans directories to support any Spinnaker version.
+        Search paths live in :mod:`pybeamprofiler.cti`; a single producer is
+        enough here because Spinnaker ships one ``.cti`` per toolchain.
 
         Returns:
-            Path to first found CTI file, or None if not found
+            Path to the first ``.cti`` found, or ``None``.
         """
-        system = platform.system()
-        search_dirs = []
-
-        if system == "Windows":
-            base = r"C:\Program Files\Teledyne\Spinnaker\cti64"
-            if os.path.exists(base):
-                try:
-                    for subdir in os.listdir(base):
-                        dir_path = os.path.join(base, subdir)
-                        if os.path.isdir(dir_path):
-                            search_dirs.append(dir_path)
-                except OSError:
-                    pass
-        elif system == "Linux":
-            search_dirs = ["/opt/spinnaker/lib/flir-gentl"]
-        elif system == "Darwin":
-            search_dirs = [
-                "/usr/local/lib/spinnaker-gentl",
-                "/Library/Application Support/FLIR/Spinnaker/lib",
-            ]
-
-        for d in search_dirs:
-            if os.path.isdir(d):
-                try:
-                    for f in os.listdir(d):
-                        if f.endswith(".cti"):
-                            return os.path.join(d, f)
-                except OSError:
-                    continue
-
-        return None
+        found = cti_files_for(SPINNAKER)
+        return found[0] if found else None
