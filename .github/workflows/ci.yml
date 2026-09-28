@@ -27,10 +27,11 @@ jobs:
     steps:
     - uses: actions/checkout@v7
 
-    # ``python-version`` makes setup-uv export UV_PYTHON, and that is what
-    # selects the interpreter. Installing one with ``uv python install`` does
-    # not: ``uv sync`` would still follow .python-version, so every job in the
-    # matrix used to test 3.13.
+    # ``python-version`` makes setup-uv export UV_PYTHON, so every uv command
+    # after it uses that interpreter. ``uv python install`` alone selects
+    # nothing: ``uv sync`` takes the newest managed interpreter it finds, which
+    # is the matrix's one only as long as no other is installed. The check
+    # step below asserts the version either way.
     - name: Install uv and Python ${{ matrix.python-version }}
       uses: astral-sh/setup-uv@v10.2.0
       with:
