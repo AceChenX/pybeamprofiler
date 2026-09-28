@@ -87,6 +87,29 @@ class TestSimulatedCamera:
         assert np.max(img2) > np.max(img1)
         cam.close()
 
+    def test_consecutive_frames_differ(self):
+        """The jitter is what makes the live view look live."""
+        cam = SimulatedCamera(seed=1)
+        assert not np.array_equal(cam.get_image(), cam.get_image())
+
+    def test_a_seed_reproduces_the_frames(self):
+        a, b = SimulatedCamera(seed=7), SimulatedCamera(seed=7)
+        for _ in range(3):
+            np.testing.assert_array_equal(a.get_image(), b.get_image())
+
+    def test_a_long_exposure_does_not_slow_the_frames(self):
+        """Exposure scales the signal and nothing else. The first simulator
+        slept for it, up to 0.1 s a frame, which capped the frame rate and
+        hid how fast the rest of the pipeline was. Five frames took at least
+        0.5 s then; they take about 35 ms now."""
+        cam = SimulatedCamera(seed=3)
+        cam.set_exposure(1.0)
+        cam.get_image()
+        start = time.perf_counter()
+        for _ in range(5):
+            cam.get_image()
+        assert time.perf_counter() - start < 0.4
+
 
 class TestSimulatedExposureContract:
     """The simulator clamps like a camera, and each profile keeps its own
