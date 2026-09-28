@@ -59,18 +59,28 @@ the 2D fit can both be exercised with no hardware attached.
 pip install pybeamprofiler
 ```
 
-For real hardware (FLIR or Basler), also install the corresponding SDK and set the CTI path:
+For real hardware (FLIR or Basler), also install the vendor's SDK
+([Spinnaker](https://www.teledynevisionsolutions.com/products/spinnaker-sdk/) or
+[Pylon](https://www.baslerweb.com/en-us/software/pylon/sdk/)). It provides the
+GenTL producer, a `.cti` file, that the camera is reached through. Its standard
+install location is searched automatically, and so is everything listed in
+`GENICAM_GENTL64_PATH`, which the Spinnaker installer sets:
 
-| Vendor | SDK | `GENICAM_GENTL64_PATH` |
-|--------|-----|------------------------|
-| FLIR | [Spinnaker](https://www.teledynevisionsolutions.com/products/spinnaker-sdk/) | `/usr/local/lib/spinnaker-gentl` (macOS/Linux) |
-| Basler (macOS) | [Pylon](https://www.baslerweb.com/en-us/software/pylon/sdk/) | `/Library/Frameworks/pylon.framework/Libraries/gentlproducer/gtl` |
-| Basler (Linux) | [Pylon](https://www.baslerweb.com/en-us/software/pylon/sdk/) | `/opt/pylon/lib64/gentlproducer/gtl` |
-| Basler (Windows) | [Pylon](https://www.baslerweb.com/en-us/software/pylon/sdk/) | `C:\Program Files\Basler\pylon\Runtime\x64` |
+| | FLIR (Spinnaker) | Basler (Pylon) |
+|---|---|---|
+| Windows | `C:\Program Files\Teledyne\Spinnaker\cti64\*` (`FLIR Systems` for `Teledyne` on older installs) | `C:\Program Files\Basler\pylon\Runtime\x64`, or `pylon 8` … `pylon 5` for `pylon` |
+| Linux | `/opt/spinnaker/lib/flir-gentl` | `/opt/pylon/lib64/gentlproducer/gtl` (or `lib`; also `/opt/pylon5`) |
+| macOS | `/usr/local/lib/spinnaker-gentl` | `/Library/Frameworks/pylon.framework/Libraries/gentlproducer/gtl` |
+
+The complete list is in `src/pybeamprofiler/cti.py`. For a producer
+anywhere else, add its directory (or the `.cti` itself) to the variable,
+separating entries with `;` on Windows and `:` elsewhere:
 
 ```bash
 export GENICAM_GENTL64_PATH=/path/to/cti/files
 ```
+
+or hand it to the camera directly, as shown under [Python API](#python-api).
 
 > **Note:** GenICam cameras allow only one application to connect at a time — close Spinnaker GUI / Pylon Viewer first.
 

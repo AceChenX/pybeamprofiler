@@ -8,7 +8,9 @@ bug that prompted this module was the tables drifting apart between vendors.
 
 from __future__ import annotations
 
+import ntpath
 import os
+import posixpath
 from unittest.mock import patch
 
 import pytest
@@ -77,6 +79,21 @@ class TestVendorPathTables:
     def test_macos_pylon_includes_the_producer_subdirectory(self):
         paths = [d.path for d in cti._VENDOR_DIRS["Darwin"][cti.PYLON]]
         assert "/Library/Frameworks/pylon.framework/Libraries/gentlproducer/gtl" in paths
+
+    def test_windows_pylon_covers_folders_with_and_without_the_version(self):
+        paths = [d.path for d in cti._VENDOR_DIRS["Windows"][cti.PYLON]]
+        assert r"C:\Program Files\Basler\pylon\Runtime\x64" in paths
+        assert r"C:\Program Files\Basler\pylon 7\Runtime\x64" in paths
+
+    @pytest.mark.parametrize("system", ["Windows", "Linux", "Darwin"])
+    def test_every_root_contains_its_directory(self, system):
+        """``_scan`` quietly replaces a root that doesn't contain its
+        directory with the directory itself, which would hide a typo here."""
+        path_rules = ntpath if system == "Windows" else posixpath
+        for entries in cti._VENDOR_DIRS[system].values():
+            for entry in entries:
+                if entry.root is not None:
+                    assert path_rules.commonpath([entry.root, entry.path]) == entry.root
 
     def test_windows_spinnaker_recurses_into_toolchain_subdirs(self):
         entries = cti._VENDOR_DIRS["Windows"][cti.SPINNAKER]

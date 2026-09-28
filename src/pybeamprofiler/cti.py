@@ -62,12 +62,15 @@ _VENDOR_DIRS: dict[str, dict[str, tuple[_SearchDir, ...]]] = {
                 root=r"C:\Program Files\FLIR Systems\Spinnaker",
             ),
         ),
+        # Installs have been seen both with the major version in the folder
+        # name and without it (a MathWorks Answers thread from October 2025
+        # found both producers in the unversioned one).
         PYLON: tuple(
             _SearchDir(
-                rf"C:\Program Files\Basler\pylon {v}\Runtime\x64",
-                root=rf"C:\Program Files\Basler\pylon {v}",
+                rf"C:\Program Files\Basler\{name}\Runtime\x64",
+                root=rf"C:\Program Files\Basler\{name}",
             )
-            for v in ("8", "7", "6", "5")
+            for name in ("pylon", "pylon 8", "pylon 7", "pylon 6", "pylon 5")
         ),
     },
     "Linux": {
