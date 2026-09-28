@@ -128,7 +128,7 @@ bp.setting(exposure_time=0.05, Gain=10.0)
 bp.setting()
 ```
 
-See [the API docs](https://github.com/acechenx/pybeamprofiler) for fitting methods (`1d`, `2d`, `linecut`), width definitions (`gaussian`, `fwhm`, `d4s`), ROI control, and more.
+The docstrings (`help(BeamProfiler)`, `help(bp.analyze)`) cover the rest: fitting methods (`1d`, `2d`, `linecut`), width definitions (`gaussian`, `fwhm`, `d4s`; also below), ROI control (`bp.set_roi(offset_x, offset_y, width, height)`), and more.
 
 ### Width definitions
 
