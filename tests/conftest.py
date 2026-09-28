@@ -17,9 +17,9 @@ os.environ["PYBEAMPROFILER_NO_BROWSER"] = "1"
 REAL_VENDOR_DIRS = cti._VENDOR_DIRS
 
 # The GenICam bindings ship as binary wheels and are not available on every
-# platform/interpreter combination the project supports -- notably macOS on
-# Python 3.14, where no genicam release has a wheel. Tests that genuinely need
-# the real enums skip rather than fail there.
+# platform the project supports -- notably Intel Macs, where no genicam after
+# 1.3.0 has a wheel and pyproject leaves it out. Tests that genuinely need the
+# real enums skip rather than fail there.
 try:  # pragma: no cover - depends on what is installed
     import genicam.genapi  # noqa: F401
 

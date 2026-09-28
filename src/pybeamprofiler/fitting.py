@@ -159,7 +159,8 @@ def gaussian_2d(
 # Fraction of each edge used as the "beam-free" border ring.
 _BORDER_FRACTION = 0.05
 
-# Most border-ring pixels the background estimate looks at (see
+# How many border-ring pixels the background estimate looks at: every n-th,
+# n = ring size // this, so between this many and twice it (see
 # estimate_background).
 _BACKGROUND_SAMPLES = 20_000
 
@@ -211,9 +212,9 @@ def estimate_background(image: np.ndarray) -> tuple[float, float]:
         )
     # The ring of a megapixel frame holds some 200k pixels, and the two
     # medians over all of them were two thirds of the cost of measuring a
-    # frame (4 of 6 ms). A regular subsample of 20k agrees with the full ring
-    # to about a tenth of a count at 10 counts of noise, in a seventh of the
-    # time.
+    # frame (4 of 6 ms). A regular subsample (22k pixels there) agrees with
+    # the full ring to about a tenth of a count at 10 counts of noise, in a
+    # seventh of the time.
     step = max(1, ring.size // _BACKGROUND_SAMPLES)
     return _robust_mean(ring[::step].astype(float))
 
@@ -708,7 +709,7 @@ def _plausible_1d(popt: np.ndarray, n: int, noise: float) -> bool:
 
     A solver that reports success has only found *a* minimum. A warm start
     left behind by a beam that moved will happily settle on a dip (negative
-    amplitude), run its centre off to 1e10 px, or lock onto a bump in the
+    amplitude), run its centre off to 3e10 px, or lock onto a bump in the
     noise, and caching that result as the next frame's start keeps the fit
     there indefinitely.
 
